@@ -474,13 +474,20 @@ class SpanCallTrainer(BaseTrainer):
                 out[k] = torch.stack(vals)
                 continue
             if vals[0].dim() == 1:
-                out[k] = torch.nn.utils.rnn.pad_sequence(vals, batch_first=True, padding_value=-1)
+                # input_ids must pad with a valid vocab id (-1 indexes the embedding
+                # out of range -> CUDA device-side assert); attention_mask hides it.
+                pad_val = 0 if k in ("attention_mask", "cue_mask", "input_ids", "token_type_ids") else -1
+                out[k] = torch.nn.utils.rnn.pad_sequence(vals, batch_first=True, padding_value=pad_val)
             elif vals[0].dim() == 2:
-                # (C,) per row -> stack with -1 pad along first dim
-                C = max(v.size(0) for v in vals)
+                # 2D tensors (e.g. cand_starts/ends (K, C), pos_indices (K, P)):
+                # Pad both dimensions (dim 0 = K, dim 1 = C/P) to batch max
+                max_0 = max(v.size(0) for v in vals)
+                max_1 = max(v.size(1) for v in vals)
                 out[k] = torch.stack([
-                    torch.nn.functional.pad(v, (0, 0, 0, C - v.size(0)), value=-1)
-                    if v.size(0) < C else v for v in vals
+                    torch.nn.functional.pad(
+                        v, (0, max_1 - v.size(1), 0, max_0 - v.size(0)), value=-1
+                    )
+                    for v in vals
                 ])
             else:
                 out[k] = torch.stack(vals)

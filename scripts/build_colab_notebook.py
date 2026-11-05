@@ -14,13 +14,52 @@ OUT = Path(__file__).resolve().parent / ".." / "notebooks" / "spancall_train_eva
 
 MARKDOWN_TITLE = """# SpanCall — Train / Eval / Test Notebook
 
-This notebook runs the **full SpanCall workflow**: **env + HF dataset pull → tensorize → staged training (T0/T1/T2/C) → prediction → calibration → offline eval → test splits**.
+This notebook runs the **full SpanCall workflow**: **git clone/pull → env + HF dataset pull → tensorize → staged training (T0/T1/T2/C) → prediction → calibration → offline eval → test splits**.
 
-> The package (`spancall`, `span_template`) is imported directly as normal, and the canonical dataset splits are pulled automatically from the Hugging Face Hub (`DATASET_NAME` in `.env`, default `convoicon/spancall`) when not already present in `DATA_DIR`.
+> The public code repository (`https://github.com/eleluong/spancall.git`) is cloned or pulled from Git, dependencies are installed, and canonical dataset splits are pulled automatically from the Hugging Face Hub (`DATASET_NAME` in `.env`, default `convoicon/spancall`) when not already present in `DATA_DIR`.
 """
 
-MARKDOWN_CONFIG_INTRO = """---
-## 0. Configuration & Environment
+MARKDOWN_SETUP = """---
+## 0. Setup — Pull Code from Git & Install
+
+Clones the public SpanCall repository (`https://github.com/eleluong/spancall.git`) or pulls the latest updates from `origin/main` if already cloned (e.g. running in Google Colab), enters the repository directory, adds it to `sys.path`, and installs dependencies in editable mode."""
+
+CODE_SETUP = '''# 0a. Pull latest code from public GitHub repository and install dependencies
+import os, sys
+from pathlib import Path
+
+GIT_REPO_URL = "https://github.com/eleluong/spancall.git"
+GIT_BRANCH   = "main"
+
+# Locate or clone repository
+cwd = Path.cwd().resolve()
+if (cwd / "spancall" / "__init__.py").is_file():
+    PROJECT_ROOT = cwd
+elif (cwd.parent / "spancall" / "__init__.py").is_file():
+    PROJECT_ROOT = cwd.parent
+elif (cwd / "spancall" / "spancall" / "__init__.py").is_file():
+    PROJECT_ROOT = cwd / "spancall"
+else:
+    print(f"Cloning public repository from {GIT_REPO_URL}...")
+    !git clone --branch {GIT_BRANCH} {GIT_REPO_URL}
+    PROJECT_ROOT = cwd / "spancall"
+
+# Change directory to project root and ensure it is on sys.path
+os.chdir(PROJECT_ROOT)
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+# Pull latest code from git
+if (PROJECT_ROOT / ".git").is_dir():
+    print(f"Pulling latest code from {GIT_BRANCH}...")
+    !git pull origin {GIT_BRANCH} || echo "git pull note: continuing with local files"
+
+print(f"SpanCall project root: {PROJECT_ROOT}")
+
+# Install package in editable mode along with optional dependencies
+%pip install -q -e ".[model,data,agent,dev]" huggingface_hub'''
+
+MARKDOWN_CONFIG_INTRO = """### 0b. Configuration & Environment
 
 Reads `.env` (or environment variables) for `DATASET_NAME` (`convoicon/spancall`), `HUGGING_FACE_TOKEN`, and LLM credentials (`BASE_URL`, `API_KEY`, `BASE_LLM_MODEL`), auto-discovers `PROJECT_ROOT` so `spancall` and `span_template` import directly, and configures device & paths.
 """
@@ -28,10 +67,13 @@ Reads `.env` (or environment variables) for `DATASET_NAME` (`convoicon/spancall`
 CODE_CONFIG = '''import os, sys
 from pathlib import Path
 
-# Auto-discover project root (works whether cwd is repo root or notebooks/)
+# Auto-discover project root (works whether cwd is repo root, notebooks/, or /content/spancall)
 PROJECT_ROOT = Path.cwd().resolve()
-if not (PROJECT_ROOT / "spancall").is_dir() and (PROJECT_ROOT.parent / "spancall").is_dir():
-    PROJECT_ROOT = PROJECT_ROOT.parent
+if not (PROJECT_ROOT / "spancall" / "__init__.py").is_file():
+    if (PROJECT_ROOT.parent / "spancall" / "__init__.py").is_file():
+        PROJECT_ROOT = PROJECT_ROOT.parent
+    elif (PROJECT_ROOT / "spancall" / "spancall" / "__init__.py").is_file():
+        PROJECT_ROOT = PROJECT_ROOT / "spancall"
 os.chdir(PROJECT_ROOT)
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -429,12 +471,20 @@ dev_path = os.path.join(TENSOR_DIR, "dev.jsonl")
 if os.path.exists(dev_path):
     with open(dev_path) as fh:
         rows = [json.loads(l) for l in fh if l.strip()]
-    n_hit = sum(1 for r in rows if any(pi >= 0 for pi in r["pos_indices"][0]))
-    print(f"dev.jsonl: {len(rows)} rows; rows with ≥1 positive target: {n_hit} ({n_hit/len(rows):.1%})")
-    r = rows[0]
-    print("sample row keys:", sorted(r.keys()))
-    print("input_ids:", len(r["input_ids"]), "seq_len; params K =", len(r["param_positions"]),
-          "cand (K,C) =", len(r["cand_starts"]), "x", len(r["cand_starts"][0]))
+    if not rows:
+        print("dev.jsonl found but is empty (0 rows)")
+    else:
+        # A positive target is a candidate span index > 0 (0 is abstain, -1 is padding)
+        n_hit = sum(
+            1 for r in rows
+            if any(pi > 0 for p_pos in r.get("pos_indices", []) for pi in p_pos)
+        )
+        print(f"dev.jsonl: {len(rows)} rows; rows with ≥1 positive target: {n_hit} ({n_hit/len(rows):.1%})")
+        r = rows[0]
+        print("sample row keys:", sorted(r.keys()))
+        c_len = len(r["cand_starts"][0]) if r.get("cand_starts") and len(r["cand_starts"]) > 0 else 0
+        print("input_ids:", len(r.get("input_ids", [])), "seq_len; params K =", len(r.get("param_positions", [])),
+              "cand (K,C) =", len(r.get("cand_starts", [])), "x", c_len)
 else:
     print("dev.jsonl not found — run the tensorizer cell first")'''
 
@@ -473,10 +523,10 @@ else:
 print("config =", out)
 CONFIG_PATH = out'''
 
-CODE_TRAIN_RUN = '''import subprocess, sys
+CODE_TRAIN_RUN = '''# Direct in-notebook training execution (provides live logging and full native tracebacks)
+from scripts.train import main as train_main
 
-subprocess.run([
-    sys.executable, "scripts/train.py",
+train_main([
     "--config", CONFIG_PATH,
     "--experiment_name", EXPERIMENT_NAME,
     "--output_dir", RESULTS_DIR,
@@ -484,7 +534,7 @@ subprocess.run([
     "--stages", "T0,T1,T2,C",
     "--device", DEVICE,
     "--seed", str(SEED),
-], check=True)'''
+])'''
 
 MARKDOWN_PICK_CP = """### Pick the best checkpoint
 
@@ -822,6 +872,23 @@ CODE_PERSIST = '''if DRIVE_MOUNT:
             print(f"mirrored {src} → {dst}")
     print("\\nartifacts persisted to", DRIVE_OUT)'''
 
+MARKDOWN_LONG_TRAJ = """---
+## 9b. Long-trajectory agent check (context plumbing)
+
+Runs `scripts/eval_agent.py --benchmark long_trajectory` at 8k/20k/32k context budgets with the checkpoint-free scripted resolver (validates trajectory → `recent_context` feeding, per-turn stats, and LLM-path trimming). With a trained `CHECKPOINT_DIR`, drop `--scripted_resolver` and pass `--spancall_checkpoint` to measure real hit-rate (needs calibration first)."""
+
+CODE_LONG_TRAJ = '''import subprocess, sys, json, os
+for ctx, budget in [(8192, 4096), (20480, 10240), (32768, 16384)]:
+    out = f"{RESULTS_DIR}/long_{ctx // 1024}k_nb.json"
+    subprocess.run([
+        sys.executable, "scripts/eval_agent.py", "--benchmark", "long_trajectory",
+        "--scripted_resolver", "--max_context_tokens", str(ctx),
+        "--context_budget_tokens", str(budget), "--output", out,
+    ], check=False)
+    if os.path.exists(out):
+        r = json.load(open(out))
+        print(ctx, {k: v.get("spancall_hits") for k, v in r.get("per_turn_stats", {}).items()})'''
+
 MARKDOWN_TESTS = """---
 ## 10. Test suite (repo unit tests)
 
@@ -833,6 +900,7 @@ CODE_SUMMARY = '''print(f"""
 == SpanCall pipeline complete ==
 
 What ran:
+  0. git clone/pull + editable pip install
   1. env setup (.env loaded) + direct imports check
   2. HF dataset ({HF_DATASET_ID}) → {DATA_DIR}
   3. tensorizer → {TENSOR_DIR} (closes P7 gap)
@@ -842,6 +910,7 @@ What ran:
   7. offline eval: b1a + model on {EVAL_SPLIT}
   8. test splits: {TEST_SPLITS}
   9. optional Drive mirror @ {DRIVE_OUT}
+  9b. long-trajectory agent check
  10. repo unit tests
 """)'''
 
@@ -851,6 +920,8 @@ What ran:
 
 cells = [
     new_markdown_cell(MARKDOWN_TITLE),
+    new_markdown_cell(MARKDOWN_SETUP),
+    new_code_cell(CODE_SETUP),
     new_markdown_cell(MARKDOWN_CONFIG_INTRO),
     new_code_cell(CODE_CONFIG),
     new_markdown_cell(MARKDOWN_ENV),
@@ -888,6 +959,8 @@ cells = [
     new_code_cell(CODE_TEST_TABLE),
     new_markdown_cell(MARKDOWN_PERSIST),
     new_code_cell(CODE_PERSIST),
+    new_markdown_cell(MARKDOWN_LONG_TRAJ),
+    new_code_cell(CODE_LONG_TRAJ),
     new_markdown_cell(MARKDOWN_TESTS),
     new_code_cell(CODE_TESTS),
     new_code_cell(CODE_SUMMARY),
