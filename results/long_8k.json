@@ -1,0 +1,213 @@
+{
+  "baseline_metrics": {
+    "total_tasks": 12,
+    "task_success_rate": 1.0,
+    "average_turns_per_task": 1.75,
+    "tool_call_accuracy_per_step": 1.0,
+    "recovery_rate_after_bad_call": 0.0,
+    "spancall_hit_rate": 0.0,
+    "wrong_hit_rate": 0.0,
+    "side_effecting_error_count": 0,
+    "total_llm_calls_saved": 0
+  },
+  "spancall_metrics": {
+    "total_tasks": 12,
+    "task_success_rate": 1.0,
+    "average_turns_per_task": 1.75,
+    "tool_call_accuracy_per_step": 1.0,
+    "recovery_rate_after_bad_call": 0.0,
+    "spancall_hit_rate": 0.0,
+    "wrong_hit_rate": 0.0,
+    "side_effecting_error_count": 0,
+    "total_llm_calls_saved": 0
+  },
+  "task_success_delta": 0.0,
+  "non_inferiority_passed": true,
+  "bootstrap_ci_95": [
+    0.0,
+    0.0
+  ],
+  "p_value": 0.0,
+  "speedup_ratio": 1.8375265065003634,
+  "token_savings_percent": 0.0,
+  "theoretical_cost_saving_percent": -7.000000000000006,
+  "empirical_cost_saving_percent": 0.0,
+  "theoretical_cost_note": "hit_rate=0: theoretical formula charges the per-call attempt cost c_s=0.07 on every turn (E[cost] = 1.070 vs baseline 1.0), while the empirical side only bills executed fast-path/LLM calls (ROUTER-mode abstains bill nothing). See docs/mechanism.md \u00a71.",
+  "num_tasks": 12,
+  "per_task_comparisons": [
+    {
+      "task_id": "long_f001",
+      "baseline_success": 1.0,
+      "spancall_success": 1.0,
+      "delta": 0.0,
+      "baseline_latency_ms": 0.5654999986290932,
+      "spancall_latency_ms": 0.10791599925141782,
+      "speedup_ratio": 5.240186835611065,
+      "baseline_llm_calls": 2,
+      "spancall_llm_calls": 2,
+      "spancall_hits": 0
+    },
+    {
+      "task_id": "long_f002",
+      "baseline_success": 1.0,
+      "spancall_success": 1.0,
+      "delta": 0.0,
+      "baseline_latency_ms": 0.13733400555793196,
+      "spancall_latency_ms": 0.10025000665336847,
+      "speedup_ratio": 1.3699151764925837,
+      "baseline_llm_calls": 2,
+      "spancall_llm_calls": 2,
+      "spancall_hits": 0
+    },
+    {
+      "task_id": "long_f003",
+      "baseline_success": 1.0,
+      "spancall_success": 1.0,
+      "delta": 0.0,
+      "baseline_latency_ms": 0.11750000703614205,
+      "spancall_latency_ms": 0.10945800750050694,
+      "speedup_ratio": 1.0734710937945575,
+      "baseline_llm_calls": 2,
+      "spancall_llm_calls": 2,
+      "spancall_hits": 0
+    },
+    {
+      "task_id": "long_direct",
+      "baseline_success": 1.0,
+      "spancall_success": 1.0,
+      "delta": 0.0,
+      "baseline_latency_ms": 0.02387499262113124,
+      "spancall_latency_ms": 0.020791994757018983,
+      "speedup_ratio": 1.148278118580782,
+      "baseline_llm_calls": 1,
+      "spancall_llm_calls": 1,
+      "spancall_hits": 0
+    },
+    {
+      "task_id": "long_f001",
+      "baseline_success": 1.0,
+      "spancall_success": 1.0,
+      "delta": 0.0,
+      "baseline_latency_ms": 0.3366670134710148,
+      "spancall_latency_ms": 0.0974160066107288,
+      "speedup_ratio": 3.455972228633075,
+      "baseline_llm_calls": 2,
+      "spancall_llm_calls": 2,
+      "spancall_hits": 0
+    },
+    {
+      "task_id": "long_f002",
+      "baseline_success": 1.0,
+      "spancall_success": 1.0,
+      "delta": 0.0,
+      "baseline_latency_ms": 0.11891699978150427,
+      "spancall_latency_ms": 0.09608299296814948,
+      "speedup_ratio": 1.2376487878653408,
+      "baseline_llm_calls": 2,
+      "spancall_llm_calls": 2,
+      "spancall_hits": 0
+    },
+    {
+      "task_id": "long_f003",
+      "baseline_success": 1.0,
+      "spancall_success": 1.0,
+      "delta": 0.0,
+      "baseline_latency_ms": 0.10716699762269855,
+      "spancall_latency_ms": 0.0965409999480471,
+      "speedup_ratio": 1.1100672012965451,
+      "baseline_llm_calls": 2,
+      "spancall_llm_calls": 2,
+      "spancall_hits": 0
+    },
+    {
+      "task_id": "long_direct",
+      "baseline_success": 1.0,
+      "spancall_success": 1.0,
+      "delta": 0.0,
+      "baseline_latency_ms": 0.020374995074234903,
+      "spancall_latency_ms": 0.018999999156221747,
+      "speedup_ratio": 1.0723682094250462,
+      "baseline_llm_calls": 1,
+      "spancall_llm_calls": 1,
+      "spancall_hits": 0
+    },
+    {
+      "task_id": "long_f001",
+      "baseline_success": 1.0,
+      "spancall_success": 1.0,
+      "delta": 0.0,
+      "baseline_latency_ms": 0.10695800301618874,
+      "spancall_latency_ms": 0.09679098729975522,
+      "speedup_ratio": 1.105040934079399,
+      "baseline_llm_calls": 2,
+      "spancall_llm_calls": 2,
+      "spancall_hits": 0
+    },
+    {
+      "task_id": "long_f002",
+      "baseline_success": 1.0,
+      "spancall_success": 1.0,
+      "delta": 0.0,
+      "baseline_latency_ms": 0.09841599967330694,
+      "spancall_latency_ms": 0.09599998884368688,
+      "speedup_ratio": 1.025166782399881,
+      "baseline_llm_calls": 2,
+      "spancall_llm_calls": 2,
+      "spancall_hits": 0
+    },
+    {
+      "task_id": "long_f003",
+      "baseline_success": 1.0,
+      "spancall_success": 1.0,
+      "delta": 0.0,
+      "baseline_latency_ms": 0.10399999155197293,
+      "spancall_latency_ms": 0.09412498911842704,
+      "speedup_ratio": 1.1049137166020946,
+      "baseline_llm_calls": 2,
+      "spancall_llm_calls": 2,
+      "spancall_hits": 0
+    },
+    {
+      "task_id": "long_direct",
+      "baseline_success": 1.0,
+      "spancall_success": 1.0,
+      "delta": 0.0,
+      "baseline_latency_ms": 0.019042010535486042,
+      "spancall_latency_ms": 0.02112500078510493,
+      "speedup_ratio": 0.9013969149252015,
+      "baseline_llm_calls": 1,
+      "spancall_llm_calls": 1,
+      "spancall_hits": 0
+    }
+  ],
+  "integration_variant": "s_skip",
+  "mode": "router",
+  "num_seeds": 3,
+  "spancall_checkpoint": null,
+  "max_context_tokens": 8192,
+  "context_budget_tokens": 4096,
+  "k_recent": 32,
+  "legacy_context": false,
+  "calibration_status": "pending_model_retraining",
+  "per_turn_stats": {
+    "turn_0": {
+      "turns_observed": 12,
+      "spancall_hits": 0,
+      "spancall_abstains": 0,
+      "llm_fallbacks": 12,
+      "n_recent_rows_sum": 0,
+      "recent_tokens_sum": 0,
+      "context_trimmed_sum": 0
+    },
+    "turn_1": {
+      "turns_observed": 9,
+      "spancall_hits": 0,
+      "spancall_abstains": 0,
+      "llm_fallbacks": 9,
+      "n_recent_rows_sum": 63,
+      "recent_tokens_sum": 630,
+      "context_trimmed_sum": 0
+    }
+  },
+  "abstain_reasons": {}
+}

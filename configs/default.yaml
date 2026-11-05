@@ -1,0 +1,112 @@
+# Default SpanCall Configuration Boilerplate
+
+experiment:
+  name: "spancall_baseline"
+  seed: 42
+  output_dir: "results"
+
+data:
+  # D5: default pipeline packs ONE tool per input (build_input). The multi-tool
+  # form (build_input_multi, [NONE] anchor, T=4/J=3 slots) stays implemented and
+  # tested but is NOT invoked until a measured tool-ambiguity slice > ~10% of
+  # stratum F (E0/E7 telemetry) flips this to > 1 (docs/remediation_plan.md D5).
+  pack_tools: 1
+  recent:
+    k_recent: 32
+    context_budget_tokens: 16384
+  sources:
+    - name: "xlam"
+      path: null
+    - name: "glaive"
+      path: null
+    - name: "hermes"
+      hub_id: "NousResearch/hermes-function-calling-v1"
+      configs:
+        - "func_calling_singleturn"
+        - "func_calling"
+        - "glaive_func_calling"
+        - "json_mode_agentic"
+        - "json_mode_singleturn"
+      local_path: null
+  stratum_mix:
+    natural_f: 0.55
+    paraphrase_f: 0.20
+    swap_distractor_f: 0.10
+    abstention_a: 0.15
+  # 4-way schema-disjoint partition: train 80% / dev 5% / calib 5% /
+  # test_ood_schema 10% (plan §2.3). dev/calib/OOD stay schema-disjoint from
+  # train; test_id is a 10% utterance holdout within train schemas.
+  schema_split:
+    train_ratio: 0.80
+    dev_ratio: 0.05
+    calib_ratio: 0.05
+    test_ood_schema_ratio: 0.10
+    seed: 42
+    id_holdout_ratio: 0.10
+
+model:
+  # Phase 2 backbone: Qwen3-0.6B embedding model, 32k context window, run with
+  # bidirectional unmasked attention (encoder.is_causal=False, long_context_fix.md
+  # Phase 2). max_seq_len is now backbone-driven — this config value is the
+  # resolver/trainer's guard, NOT a hardcoded 512 cap. 32768 = the model's
+  # full window; the R6 recent-context budget (model.data.recent.*) manages
+  # what actually fills it.
+  backbone_name: "Qwen/Qwen3-Embedding-0.6B"
+  head_dim: 256
+  max_seq_len: 32768
+  max_span_width: 16
+  dropout: 0.1
+  # v1 minimal head set (D4): H1 (tool) + H3 (pointer) + H4 (abstain_reason) +
+  # H8 (correctness) + call-accept head. H2/H5/H6/H7 are spec-only and are
+  # constructed only when flipped on (docs/remediation_plan.md D4, heads.md).
+  heads: { tool: true, count: false, pointer: true, abstain_reason: true,
+           source: false, list_size: false, swap: false, correctness: true }
+
+optimization:
+  learning_rate_encoder: 3.0e-5
+  learning_rate_head: 1.0e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.06
+  batch_size: 64
+  num_epochs: 4
+  mixed_precision: "bf16"
+
+training:
+  gradient_accumulation_steps: 1
+  checkpoint_every_n_steps: 500
+
+calibration:
+  target_precision: 0.95
+  confidence_level: 0.95
+  temperature_scaling: true
+
+clock:
+  timezone: "UTC"              # IANA name; per-tenant default (D3). The template
+                               # API itself never reads this or the wall clock —
+                               # the caller resolves the user-local date via
+                               # spancall.infer.clock.local_today and passes it
+                               # as `now`, so a per-session override is free.
+                               # "UTC" here is a documented fallback, NOT a silent
+                               # guess: a caller with no known timezone must
+                               # abstain on date params instead of calling
+                               # local_today at all.
+
+gate:
+  mode: "single_tau"   # single_tau (v1 default, D4) | conjunction (ablation)
+  tau_p: 0.90
+  tau_delta: 2.0       # joint margin — used only in conjunction mode
+  tau_a: 0.85
+
+probe:                        # E0 traffic probe (D7)
+  f_floor: 0.5                # provisional; derived from cost model: h_min / 0.6
+  h_min: 0.3                  # smallest hit rate still giving >= 5x (E6 target)
+  coverage_of_f: 0.6          # E2 coverage target over stratum F
+  retriever_top_n: 5          # R@T top-N for the schema-selection mode in play (D6)
+
+agent:
+  mode: "router"               # llm_only, spancall_only, router, shadow
+  integration: "s_skip"         # s_skip, s_inject, s_hint
+  llm_model: "google/gemma-4"
+  max_turns: 15
+  max_context_tokens: 32768
+  keep_last_tool_turns: 8

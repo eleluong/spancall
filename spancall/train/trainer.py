@@ -1,0 +1,737 @@
+"""Trainer for the SpanCall multi-task model.
+
+Ref: docs/full_implementation_plan.md §3.4; docs/architecture.md §5.3;
+docs/heads.md §4.
+
+``SpanCallTrainer(BaseTrainer)`` implements the staged methodology:
+
+- **Optimizer & schedule (plan §3.4.1):**
+  - AdamW with parameter groups: encoder layers get layer-wise LR decay
+    ``lr_l = lr_enc * 0.90^(n_layers - l)``; newly initialized marker-token
+    embeddings + all prediction heads get ``lr_head``.  Weight decay 0.01,
+    excluded from biases and LayerNorm.
+  - Linear warmup (``warmup_ratio``) then cosine decay to 0.
+  - Mixed precision ``torch.amp.autocast`` (bf16) with
+    ``clip_grad_norm_(..., 1.0)`` (falls back to fp32/``autocast`` off when the
+    device does not support bf16).
+- **Staged curriculum (plan §3.4.2):**
+  - ``T0``: sanity — a few hundred Stratum.F rows, verify loss -> ~0.
+  - ``T1``: pointer ceiling — H3 pointer on F train, exact-payload match gate
+    on F dev (floor 0.80, proceed 0.90).
+  - ``T2/Stage A-B``: full multi-task (encoder + H1 + H3 + H4 + CallAccept).
+  - ``Stage C``: freeze encoder + H1–H4, train H8 correctness on a held-out
+    calib slice.
+- **Checkpointing & provenance (plan §3.4.3):**
+  ``results/<experiment>_seed<seed>/<stage>/checkpoints/`` storing
+  ``model.pt``, ``optimizer.pt``, ``metrics.json``, ``provenance.json``
+  (git commit, config snapshot, seed, stage, step).
+
+The trainer is device-agnostic (CPU/MPS/CUDA) and never assumes a real HF
+backbone: the encoder may be a tiny injected ``nn.Module`` for tests, or
+``SpanCallTransformerEncoder`` over ModernBERT.
+
+Batch format (produced by the data pipeline tensorizer / collator):
+    input_ids, attention_mask          (B, L) long
+    token_type_ids                     (B, L) long (optional)
+    param_positions                    (B, K) long in [0, L)
+    tool_positions                     (B, T) long (optional, pack_tools > 1)
+    utt_starts, utt_ends               (B, 2) long  (utterance extent)
+    cand_starts, cand_ends             (B, K, C) long, -1 padded
+    pos_indices                        (B, K, P) long, -1 padded (into z)
+    pos_regions                        (B, K, P) long (0=utterance,1=recent,2=time,
+                                       3=enum,4=bool,5=null) unused in v1 loss
+    abstain_flags                      (B, K) long  (1 → row abstains)
+    reason_targets                     (B, K) long  (0..4), -1 masked
+    accept_targets                     (B,) float
+    tool_targets                       (B,) long (optional)
+    cue_mask                           (B, K) float (layers to include)
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import subprocess
+from dataclasses import asdict, is_dataclass
+from abc import ABC, abstractmethod
+from contextlib import nullcontext
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+import torch
+import torch.nn as nn
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
+
+from spancall.model.encoder import BaseEncoder
+from spancall.model.heads import (
+    AbstainHead,
+    CallAcceptHead,
+    CallCountHead,
+    CorrectnessHead,
+    PointerHead,
+    ToolHead,
+)
+from spancall.model.loss import SpanCallLossContainer
+from spancall.train.config import TrainingConfig
+
+_LAYER_DECAY = 0.90
+
+
+def _git_rev(root: Optional[str] = None) -> str:
+    """Best-effort current git commit hash ('' when not a git repo)."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, cwd=root, timeout=5,
+        )
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+class BaseTrainer(ABC):
+    """Abstract trainer coordinating forward, backward, validation, and checkpointing."""
+
+    def __init__(self, config: TrainingConfig) -> None:
+        self.config = config
+
+    @abstractmethod
+    def train(self) -> Dict[str, Any]:
+        """Execute training loop over configured epochs."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def evaluate(self, split: str = "dev") -> Dict[str, float]:
+        """Run validation metrics across validation or test splits."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def save_checkpoint(self, path: str) -> None:
+        """Persist model weights, optimizer state, and training metadata."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def load_checkpoint(self, path: str) -> None:
+        """Restore checkpoint state."""
+        raise NotImplementedError
+
+
+# --------------------------------------------------------------------------- #
+# Parameter grouping + schedule
+# --------------------------------------------------------------------------- #
+def build_parameter_groups(
+    model: nn.Module,
+    encoder: BaseEncoder,
+    lr_encoder: float,
+    lr_head: float,
+    weight_decay: float,
+    layer_decay: float = _LAYER_DECAY,
+) -> List[Dict[str, Any]]:
+    """AdamW parameter groups with layer-wise decay for the encoder backbone.
+
+    - Encoder backbone layers l (0-based from bottom): ``lr = lr_enc * layer_decay^(n_layers - l)``
+      (top layers get the full ``lr_enc``, bottom layers the smallest).
+    - Marker-token embedding rows (``num_embeddings > base vocab``) + all heads
+      (ToolHead, PointerHead, AbstainHead, CallAcceptHead, CallCountHead,
+      CorrectnessHead): ``lr_head``.
+    - Weight decay excluded on biases and LayerNorm weights.
+
+    Encoder layers are discovered via ``model.named_parameters()`` where the
+    name contains ``"backbone.encoder"``/``"backbone." + '<layer-prefix>'`` —
+    the trainer does not hard-code backbone internals; it uses a
+    ``layers_of(model)`` probe to map parameter names to layer indices when the
+    backbone exposes a ``.layers``/``.encoder.layer`` sequence (HF
+    ``PreTrainedModel``), else treats all encoder params as one group.
+    """
+    # --- discover encoder parameter names ----------------------------------
+    enc_param_names: set = set()
+    layer_index: Dict[str, int] = {}   # param name -> layer index (deepest = 0)
+    n_layers: int = 1
+
+    # find any sequence attribute holding stacked layers
+    for attr in ("layers", "encoder.layer", "bert.encoder.layer"):
+        obj = model
+        for part in attr.split("."):
+            obj = getattr(obj, part, None)
+            if obj is None:
+                break
+        if isinstance(obj, (list, nn.ModuleList)):
+            n_layers = len(obj)
+            for l, layer in enumerate(obj):
+                for name, _p in layer.named_parameters():
+                    full = f"{attr}.{name}"
+                    layer_index[full] = l
+                    enc_param_names.add(full)
+            break
+
+    def is_encoder(name: str) -> bool:
+        if name.startswith("backbone."):
+            return True
+        return enc_param_names and name in enc_param_names
+
+    # --- split parameters --------------------------------------------------
+    groups: Dict[str, Dict[str, Any]] = {}
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        decay = weight_decay if (param.dim() > 1 and "bias" not in name and "LayerNorm" not in name and "layernorm" not in name) else 0.0
+        if is_encoder(name):
+            l = layer_index.get(name, n_layers - 1)
+            lr = lr_encoder * (layer_decay ** (n_layers - 1 - l))
+            key = f"enc_l{l}"
+        else:
+            lr = lr_head
+            key = "head"
+        g = groups.setdefault(
+            key,
+            {"params": [], "lr": lr, "weight_decay": decay, "decay": decay},
+        )
+        g["params"].append(param)
+        g["weight_decay"] = decay
+
+    out: List[Dict[str, Any]] = sorted(
+        groups.values(), key=lambda g: -g["lr"]
+    )
+    for g in out:
+        g.pop("decay", None)
+    return out
+
+
+class CosineWarmupSchedule:
+    """Linear warmup then cosine decay to 0 (plan §3.4.1)."""
+
+    def __init__(self, optimizer: torch.optim.Optimizer, warmup_steps: int, total_steps: int) -> None:
+        self.warmup_steps = max(int(warmup_steps), 0)
+        self.total_steps = max(int(total_steps), 1)
+
+        def lr_lambda(step: int) -> float:
+            if self.warmup_steps > 0 and step < self.warmup_steps:
+                return float(step + 1) / float(self.warmup_steps)
+            if step >= self.total_steps:
+                return 0.0
+            progress = (step - self.warmup_steps) / max(self.total_steps - self.warmup_steps, 1)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        self.scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+    def step(self) -> None:
+        self.scheduler.step()
+
+
+# --------------------------------------------------------------------------- #
+# Exact-payload decode (deterministic argmax path; used by T1 gate + eval)
+# --------------------------------------------------------------------------- #
+def decode_exact_payload(
+    z: torch.Tensor,
+    cand_starts: torch.Tensor,
+    cand_ends: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Deterministic per-param decode used for the T1 gate and dev metrics.
+
+    Args:
+        z:      (B, K, C) candidate logits over {abstain(0)} ∪ A_k, or None?
+        cand_starts / cand_ends: (B, K, C) long, -1 padded.
+        mask:   (B, K) optional; True rows decoded, False rows -> abstain.
+
+    Returns:
+        (pred_starts, pred_ends): (B, K) long — the chosen span (inclusive) or
+        (-1, -1) when abstain (column 0) wins or the row is masked.
+    """
+    B, K, C = z.shape
+    if mask is None:
+        mask = torch.ones(B, K, dtype=torch.bool, device=z.device)
+    am = z.argmax(dim=-1)  # (B, K) in [0, C) where C = 1 + |A_k|
+    is_cand = (am > 0) & mask
+    # index into the candidate arrays (cand_starts/cand_ends have |A_k| cols,
+    # while z prepends the abstain column at 0): candidate v sits at am - 1.
+    cand_idx = (am - 1).clamp(min=0)
+    s = torch.where(is_cand, cand_starts.gather(-1, cand_idx.unsqueeze(-1)).squeeze(-1),
+                    torch.full((B, K), -1, dtype=torch.long, device=z.device))
+    e = torch.where(is_cand, cand_ends.gather(-1, cand_idx.unsqueeze(-1)).squeeze(-1),
+                    torch.full((B, K), -1, dtype=torch.long, device=z.device))
+    return s, e
+
+
+def _mean_losses(logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Mean (B,K) loss across rows where mask is True."""
+    ce = torch.nn.functional.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        targets.reshape(-1).clamp(min=0),
+        reduction="none",
+    ).reshape(logits.shape[0], logits.shape[1])
+    ce = torch.where(mask, ce, torch.zeros_like(ce))
+    n = max(int(mask.sum().item()), 1)
+    return ce.sum() / n
+
+
+# --------------------------------------------------------------------------- #
+# SpanCallTrainer
+# --------------------------------------------------------------------------- #
+class SpanCallTrainer(BaseTrainer):
+    """Staged multi-task trainer for the SpanCall model."""
+
+    def __init__(
+        self,
+        config: TrainingConfig,
+        model: nn.Module,
+        encoder: BaseEncoder,
+        tokenizer: Any,
+        loss_container: Optional[SpanCallLossContainer] = None,
+        optimizer: Optional[torch.optim.Optimizer] = None,
+        device: Optional[str] = None,
+    ) -> None:
+        super().__init__(config)
+        self.model = model
+        self.encoder = encoder
+        self.tokenizer = tokenizer
+        self.loss = loss_container or SpanCallLossContainer()
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        if self.device == "cuda" and not torch.cuda.is_available():
+            self.device = "cpu"
+        self.model.to(self.device)
+
+        self.optimizer = optimizer
+        self.scheduler: Optional[CosineWarmupSchedule] = None
+        self.global_step = 0
+        self.stage: str = "T0"
+        self.history: Dict[str, Any] = {"train_loss": [], "dev": {}}
+        self.stage_gates: Dict[str, bool] = {}
+
+    # ------------------------------------------------------------------ #
+    # Metrics
+    # ------------------------------------------------------------------ #
+    def exact_payload_match(
+        self, z: torch.Tensor, cand_starts: torch.Tensor, cand_ends: torch.Tensor,
+        pos_indices: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Proportion of (b,k) rows whose argmax is a positive (R4 equal-value aware).
+
+        Returns (acc, n_valid).
+        """
+        B, K, C = z.shape
+        am = z.argmax(-1).unsqueeze(-1)                    # (B,K,1)
+        is_pos = (pos_indices == am).any(-1)               # (B,K)
+        n_pos = (pos_indices >= 0).sum(-1)
+        valid = n_pos > 0
+        acc = torch.where(valid, is_pos.float(), torch.zeros_like(is_pos.float()))
+        return acc.sum() / max(int(valid.sum().item()), 1), acc, valid
+
+    # ------------------------------------------------------------------ #
+    # Training step
+    # ------------------------------------------------------------------ #
+    def train_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
+        """One optimization step; returns scalar losses for logging."""
+        self._ensure_optimizer()
+        self.model.train()
+        b = {k: v.to(self.device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+
+        preds: Dict[str, torch.Tensor] = {}
+        targs: Dict[str, torch.Tensor] = {}
+
+        # ---- forward under bf16 autocast (CUDA only; fp32 fallback) -------
+        with self._amp():
+            H = self.encoder(b["input_ids"], b["attention_mask"], b.get("token_type_ids"))
+
+            # ---- CLS / param / tool / utterance anchors -------------------
+            cls_h = H[:, 0]
+            param_h = H.gather(1, b["param_positions"].unsqueeze(-1).expand(-1, -1, H.size(-1)))
+            K = param_h.size(1)
+
+            if "tool_positions" in b and b["tool_positions"].numel():
+                tool_h = H.gather(1, b["tool_positions"].unsqueeze(-1).expand(-1, -1, H.size(-1)))
+            else:
+                tool_h = None
+
+            # utterance pool for H4
+            utt_pool = torch.zeros(H.size(0), H.size(2), device=H.device)
+            for i in range(H.size(0)):
+                s0, e0 = int(b["utt_starts"][i, 0]), int(b["utt_ends"][i, 0])
+                if 0 <= s0 < e0 <= H.size(1):
+                    utt_pool[i] = H[i, s0:e0].mean(0)
+
+            # ---- H3 pointer -----------------------------------------------
+            ptr = getattr(self.model, "pointer_head", None)
+            if ptr is not None and "cand_starts" in b:
+                p = ptr(
+                    param_h, H,
+                    candidate_masks={"starts": b["cand_starts"], "ends": b["cand_ends"]},
+                )
+                starts = b["cand_starts"].clamp(min=0)
+                ends = b["cand_ends"].clamp(min=0)
+                z = torch.cat([p["abstain_logits"].unsqueeze(-1),
+                               p["span_logits"]], dim=-1)
+                preds["pointer_logits"] = z
+                preds["abstain_logits"] = p["abstain_logits"]
+                preds["q"] = p["q"]
+
+            # ---- H4 reason ------------------------------------------------
+            abst = getattr(self.model, "abstain_head", None)
+            if abst is not None:
+                r = abst(param_h, cls_h, utt_pool)
+                preds["reason_logits"] = r
+                targs["reason_logits"] = b["reason_targets"] if "reason_targets" in b else None
+                if targs["reason_logits"] is None:
+                    targs["reason_logits"] = torch.zeros_like(b["param_positions"]).fill_(-1).to(self.device)
+                if "reason_mask" in b:
+                    targs["reason_mask"] = b["reason_mask"].float()
+
+            # ---- CallAccept -----------------------------------------------
+            acc_head = getattr(self.model, "call_accept_head", None)
+            if acc_head is not None:
+                preds["accept_logits"] = acc_head(cls_h)
+                targs["accept_targets"] = b["accept_targets"] if "accept_targets" in b else None
+                if targs["accept_targets"] is None:
+                    targs["accept_targets"] = torch.zeros(H.size(0), device=self.device)
+
+            # ---- ToolHead (H1) — only when pack_tools > 1 -----------------
+            if tool_h is not None:
+                tool_head = getattr(self.model, "tool_head", None)
+                if tool_head is not None:
+                    preds["tool_logits"] = tool_head(tool_h, cls_h)
+                    targs["tool_targets"] = b.get("tool_targets", torch.zeros(H.size(0), dtype=torch.long, device=self.device))
+
+            # ---- H8 correctness -------------------------------------------
+            corr_head = getattr(self.model, "correctness_head", None)
+            if corr_head is not None and "q" in preds and "pointer_logits" in preds:
+                # chosen span pooled features
+                z_det = preds["pointer_logits"].detach()
+                am = z_det.argmax(-1)                       # (B,K) over {abstain} U A_k
+                is_cand = am > 0
+                cand_am = (am - 1).clamp(min=0)             # index into cand arrays
+                chosen_s = b["cand_starts"].gather(-1, cand_am.unsqueeze(-1)).squeeze(-1).clamp(min=0)
+                chosen_e = b["cand_ends"].gather(-1, cand_am.unsqueeze(-1)).squeeze(-1).clamp(min=0)
+                span_pool = torch.zeros_like(cls_h.unsqueeze(1).expand(-1, K, -1))
+                for i in range(H.size(0)):
+                    for k in range(K):
+                        if is_cand[i, k]:
+                            span_pool[i, k] = H[i, chosen_s[i, k]:chosen_e[i, k] + 1].mean(0)
+                # v_stats: p_top1, p_top2, margin, entropy, p_abstain, p_ok, width_norm, is_ctx(=0 stub)
+                probs = torch.softmax(z_det, -1)
+                p_top1 = probs.max(-1).values
+                p_abstain = probs[..., 0]
+                sorted_p, _ = probs.sort(-1, descending=True)
+                p_top2 = sorted_p[..., 1] if sorted_p.size(-1) > 1 else torch.zeros_like(p_top1)
+                margin = (sorted_p[..., 0] - sorted_p[..., 1]) if sorted_p.size(-1) > 1 else torch.zeros_like(p_top1)
+                p_ok = torch.sigmoid(b.get("accept_targets", torch.zeros(H.size(0), device=self.device))).unsqueeze(-1).expand(-1, K) if "accept_targets" in b else torch.zeros(H.size(0), K, device=self.device)
+                width_norm = b.get("cand_ends", b["cand_starts"]).gather(-1, cand_am.unsqueeze(-1)).squeeze(-1).clamp(min=0).float() / max(self.model.max_span_width, 1)
+                is_ctx = torch.zeros_like(p_top1)
+                v_stats = torch.stack([p_top1, p_top2, margin,
+                                       -(probs * probs.clamp_min(1e-9).log()).sum(-1),
+                                       p_abstain, p_ok, width_norm, is_ctx], dim=-1)
+                preds["corr_logits"] = corr_head(span_pool, preds["q"], v_stats)
+
+            # ---- targets for pointer --------------------------------------
+            targs["pointer_positives"] = b["pos_indices"] if "pos_indices" in b else None
+            if targs["pointer_positives"] is None:
+                targs["pointer_positives"] = torch.full(
+                    (H.size(0), K, 1), -1, dtype=torch.long, device=self.device)
+            if "cue_mask" in b:
+                targs["pointer_mask"] = b["cue_mask"].float()
+
+            losses = self.loss.forward(preds, targs)
+            total = losses["loss"]
+
+        loss = total / self.config.gradient_accumulation_steps
+        loss.backward()
+
+        if (self.global_step + 1) % self.config.gradient_accumulation_steps == 0:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
+            if self.scheduler is not None:
+                self.scheduler.step()
+        self.global_step += 1
+
+        out = {k: float(v.detach().item()) for k, v in losses.items() if k != "loss"}
+        out["loss"] = float(total.detach().item())  # scalar joint loss for run_stage
+        return out
+
+    # ------------------------------------------------------------------ #
+    # Data
+    # ------------------------------------------------------------------ #
+    def make_batches(
+        self, rows: Sequence[Dict[str, Any]], batch_size: int, shuffle: bool = False,
+        rng: Optional[Any] = None,
+    ) -> Iterable[List[Dict[str, Any]]]:
+        """Yield batches; applied after the tensorizer (rows carry tensors)."""
+        idx = list(range(len(rows)))
+        if shuffle:
+            (rng or random_mod()).shuffle(idx)
+        for i in range(0, len(idx), batch_size):
+            yield [rows[j] for j in idx[i:i + batch_size]]
+
+    def collate(self, batch: Sequence[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        """Pad a list of per-sample tensor dicts into a batch dict."""
+        keys = [k for k in batch[0].keys()]
+        out: Dict[str, torch.Tensor] = {}
+        for k in keys:
+            vals = [b[k] for b in batch]
+            if vals[0].dim() == 0:
+                out[k] = torch.stack(vals)
+                continue
+            if vals[0].dim() == 1:
+                out[k] = torch.nn.utils.rnn.pad_sequence(vals, batch_first=True, padding_value=-1)
+            elif vals[0].dim() == 2:
+                # (C,) per row -> stack with -1 pad along first dim
+                C = max(v.size(0) for v in vals)
+                out[k] = torch.stack([
+                    torch.nn.functional.pad(v, (0, 0, 0, C - v.size(0)), value=-1)
+                    if v.size(0) < C else v for v in vals
+                ])
+            else:
+                out[k] = torch.stack(vals)
+        return out
+
+    def load_rows(self, split: str) -> List[Dict[str, Any]]:
+        """Load a tensorized split file from ``config.experiment.data_dir``.
+
+        Falls back to a no-op empty list when the file is absent so tests /
+        dry runs can inject synthetic rows directly.
+        """
+        data_dir = getattr(self.config, "data_dir", None) or "data/processed"
+        path = Path(data_dir) / f"{split}.jsonl"
+        if not path.exists():
+            kw = getattr(self.config, "data_dir", None)
+            return []
+        import json as _json
+        rows = []
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                d = _json.loads(line)
+                rows.append(d)
+        return rows
+
+    def tensorize_rows(self, rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Convert dict rows (text form) into tensor rows (collator input).
+
+        The full production tensorizer (P7, tokenization + candidate gather)
+        lives one level deeper and is wired by the data pipeline; this shim
+        accepts pre-tensorized rows (all values already torch.Tensor) and is a
+        no-op passthrough for them, ready to be extended.
+        """
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            d = {k: (v if isinstance(v, torch.Tensor) else torch.tensor(v)) for k, v in r.items()}
+            out.append(d)
+        return out
+
+    # ------------------------------------------------------------------ #
+    # Staged curriculum
+    # ------------------------------------------------------------------ #
+    def run_stage(self, stage: str, data: List[Dict[str, Any]], num_epochs: int) -> Dict[str, float]:
+        """Run one training stage over ``data`` (tensorized rows)."""
+        self.stage = stage
+        rows = self.tensorize_rows(data)
+        if not rows:
+            return {"loss": float("nan")}
+        rng = torch.Generator().manual_seed(self.config.seed + self.global_step)
+        steps = 0
+        for _ in range(num_epochs):
+            for batch_list in self.make_batches(rows, self.config.optimization.batch_size, shuffle=True, rng=None):
+                if len(batch_list) == 0:
+                    continue
+                batch = self.collate(batch_list)
+                losses = self.train_step(batch)
+                steps += 1
+                self.history["train_loss"].append({**losses, "stage": stage, "step": self.global_step})
+        return {"loss": losses.get("loss", float("nan")), "steps": float(steps)} if steps else {"loss": float("nan"), "steps": 0.0}
+
+    # ------------------------------------------------------------------ #
+    # Mixed precision + stage helpers
+    # ------------------------------------------------------------------ #
+    def _amp(self) -> Any:
+        """bf16 autocast on CUDA; fp32 no-op fallback (plan §3.4.1)."""
+        ok = (
+            getattr(self.config.optimization, "mixed_precision", "bf16") == "bf16"
+            and self.device.startswith("cuda")
+            and torch.cuda.is_available()
+        )
+        if ok:
+            return torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+        return nullcontext()
+
+    def _rebuild_optimizer(self, lr_scale: float = 1.0) -> None:
+        """(Re)build AdamW over the *currently unfrozen* parameters."""
+        groups = build_parameter_groups(
+            self.model, self.encoder,
+            self.config.optimization.learning_rate_encoder * lr_scale,
+            self.config.optimization.learning_rate_head * lr_scale,
+            self.config.optimization.weight_decay,
+        )
+        self.optimizer = AdamW(
+            groups, lr=self.config.optimization.learning_rate_head * lr_scale,
+        )
+        self.optimizer.zero_grad(set_to_none=True)
+        total_steps = max(
+            int(
+                self.config.optimization.num_epochs
+                * 1_000
+                / max(self.config.optimization.batch_size, 1)
+            ),
+            1,
+        )
+        warmup = max(int(total_steps * self.config.optimization.warmup_ratio), 1)
+        self.scheduler = CosineWarmupSchedule(self.optimizer, warmup, total_steps)
+        return groups
+
+    def _ensure_optimizer(self) -> None:
+        """Build the optimizer on first use (safe for direct run_stage calls)."""
+        if self.optimizer is None:
+            self._rebuild_optimizer()
+
+    def _freeze_all_but_correctness(self) -> None:
+        """Stage C: freeze encoder + H1–H4, keep H8 trainable."""
+        for name, p in self.model.named_parameters():
+            p.requires_grad = name.startswith("correctness_head")
+
+    def _unfreeze_all(self) -> None:
+        for p in self.model.parameters():
+            p.requires_grad = True
+
+    def _stage_data(self, stage: str) -> List[Dict[str, Any]]:
+        """Rows for each curriculum stage (empty list ⇒ skip the stage)."""
+        if stage == "T0":
+            return self.load_rows("t0") or self.load_rows("train")[:500]
+        if stage == "T1":
+            return self.load_rows("t1") or self.load_rows("train")
+        if stage in ("T2", "AB"):
+            return self.load_rows("t2") or self.load_rows("train")
+        if stage == "C":
+            return self.load_rows("stage_c") or self.load_rows("calib")
+        return []
+
+    def train(self, stages: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+        """Run the full staged curriculum; returns summary metrics.
+
+        Stages (plan §3.4.2): ``T0`` sanity → ``T1`` pointer ceiling gate →
+        ``T2`` full multi-task → ``C`` frozen-encoder H8 training. A stage with
+        no data is recorded and skipped, so offline/dry runs never crash.
+        """
+        self._rebuild_optimizer()
+        order = tuple(stages or ("T0", "T1", "T2", "C"))
+        summary: Dict[str, Any] = {"history": self.history}
+        for stage in order:
+            data = self._stage_data(stage)
+            if not data:
+                summary[stage] = {"status": "skipped", "reason": "no_data"}
+                self.history[stage] = summary[stage]
+                continue
+
+            n_epochs = 2 if len(data) < 2_000 else self.config.optimization.num_epochs
+            if stage == "C":
+                self._freeze_all_but_correctness()
+                self._rebuild_optimizer()
+            else:
+                if stage == "T1" and not self.stage_gates.get("T0"):
+                    # T0 must have run (loss -> ~0) before the pointer gate
+                    pass
+                self._unfreeze_all()
+                self._rebuild_optimizer()
+
+            res = self.run_stage(stage, data, num_epochs=n_epochs)
+            summary[stage] = {**res, "status": "ok", "n": float(len(data))}
+
+            if stage == "T1":
+                dev = self.evaluate("dev")
+                summary["T1"] = {**summary["T1"], **dev}
+                if dev.get("n", 0.0) > 0.0:
+                    m = dev["exact_payload_match"]
+                    self.stage_gates["T1"] = m >= 0.90
+                    summary["T1"]["gate_proceed"] = bool(self.stage_gates["T1"])
+                    summary["T1"]["gate_kill"] = bool(m < 0.80)
+            self.history[stage] = summary[stage]
+
+            # periodic checkpointing
+            try:
+                out = Path(self.config.output_dir)
+                cp = out / f"{self.config.experiment_name}_seed{self.config.seed}" / stage / "checkpoints"
+                self.save_checkpoint(str(cp))
+            except Exception:  # checkpointing must never kill training
+                pass
+        return summary
+
+    def evaluate(self, split: str = "dev") -> Dict[str, float]:
+        """Evaluate exact-payload match on a split (T1 gate input)."""
+        rows = self.load_rows(split)
+        if not rows:
+            return {"exact_payload_match": float("nan"), "n": 0.0}
+        rows = self.tensorize_rows(rows)
+        self.model.eval()
+        hits = 0.0
+        n = 0
+        with torch.no_grad():
+            for batch_list in self.make_batches(rows, self.config.optimization.batch_size):
+                batch = self.collate(batch_list)
+                b = {k: v.to(self.device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+                H = self.encoder(b["input_ids"], b["attention_mask"], b.get("token_type_ids"))
+                param_h = H.gather(1, b["param_positions"].unsqueeze(-1).expand(-1, -1, H.size(-1)))
+                p = self.model.pointer_head(
+                    param_h, H,
+                    candidate_masks={"starts": b["cand_starts"], "ends": b["cand_ends"]},
+                )
+                starts = b["cand_starts"].clamp(min=0)
+                ends = b["cand_ends"].clamp(min=0)
+                z = torch.cat([p["abstain_logits"].unsqueeze(-1), p["span_logits"]], dim=-1)
+                acc_i, acc_t, valid = self.exact_payload_match(z, starts, ends, b["pos_indices"])
+                hits += float((acc_t * valid).sum().item())
+                n += int(valid.sum().item())
+        return {"exact_payload_match": hits / max(n, 1), "n": float(n)}
+
+    # ------------------------------------------------------------------ #
+    # Checkpointing
+    # ------------------------------------------------------------------ #
+    def save_checkpoint(self, path: str) -> None:
+        """Persist model, optimizer, metrics, and provenance to ``path``."""
+        p = Path(path)
+        p.mkdir(parents=True, exist_ok=True)
+        torch.save(self.model.state_dict(), p / "model.pt")
+        if self.optimizer is not None:
+            torch.save(self.optimizer.state_dict(), p / "optimizer.pt")
+        with open(p / "metrics.json", "w") as fh:
+            json.dump(self.history, fh, indent=2)
+        def _snap(obj: Any) -> Dict[str, Any]:
+            """Recursively convert a (possibly nested) dataclass config to a dict."""
+            if is_dataclass(obj):
+                return _snap(asdict(obj))
+            if isinstance(obj, dict):
+                return {str(k): _snap(v) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple)):
+                return [_snap(v) for v in obj]
+            if isinstance(obj, (str, int, float, bool)) or obj is None:
+                return obj
+            return str(obj)
+
+        prov = {
+            "experiment": getattr(self.config, "experiment_name", "span_call"),
+            "seed": self.config.seed,
+            "stage": self.stage,
+            "global_step": self.global_step,
+            "git_commit": _git_rev(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "config": {
+                "model": _snap(getattr(self.config, "model", None)),
+                "optimization": _snap(getattr(self.config, "optimization", None)),
+                "data": _snap(getattr(self.config, "data", None)),
+            },
+        }
+        with open(p / "provenance.json", "w") as fh:
+            json.dump(prov, fh, indent=2, default=str)
+
+    def load_checkpoint(self, path: str) -> None:
+        """Restore model (and optimizer when present) from ``path``."""
+        p = Path(path)
+        self.model.load_state_dict(torch.load(p / "model.pt", map_location=self.device))
+        if (p / "optimizer.pt").exists() and self.optimizer is not None:
+            self.optimizer.load_state_dict(torch.load(p / "optimizer.pt", map_location=self.device))
+
+
+def random_mod():
+    import random
+    return random

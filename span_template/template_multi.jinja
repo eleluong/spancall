@@ -1,0 +1,46 @@
+{#
+  SpanCall multi-tool packing template (docs/pipeline_io.md Part A P5, heads.md §2)
+
+  Renders up to T candidate tools with a shared context/utterance pool, plus the
+  <|none|> "no tool applies" anchor. Parsed back by span_template/parser.py; the
+  legend tags every <|tool|>/<|param|> anchor with the (tool, param) it belongs to.
+
+  Markers use the Qwen-native <|...|> convention — atomic special tokens
+  registered on the tokenizer (span_template/sanitize.py SPECIAL_MARKER_TOKENS),
+  matching Qwen3's own <|im_start|>-style ids (docs/pipeline_io.md P6.3,
+  long-context R8 validation gate). Plain ' | ' layout separators and R1
+  double-quote quoting are layout grammar (R5/D2 keeps the pool non-fragmenting).
+
+  Marker grammar (see parser.py):
+    <|tool|>  name (desc)                              bridge (schema anchor)
+    <|param|> name (desc)                              bridge (question vector q_{t,k})
+    <|none|>                                           bridge (no-tool anchor, H1)
+    <|ctx_meta|> <|null|> | true | false | <|unresolved|>   targets (meta values)
+    <|ctx_time|> key=iso | ...                         key=bridge, iso=target
+    <|ctx_enum|> v1 | v2 | ...                         targets (enum values)
+    {{ utterance }}                                    targets (user tokens)
+    <|ctx_recent|> key="escaped value" | ...           key=bridge, quoted value=target
+-#}
+<|cls|>
+{%- for tool in tools %}
+<|tool|> {{ tool.name }}{% if tool.description %} ({{ tool.description }}){% endif %}
+{%- for p in tool.params %}
+<|param|> {{ p.name }}{% if p.description %} ({{ p.description }}){% endif %}
+{%- endfor %}
+{%- endfor %}
+<|none|>
+<|sep|>
+<|ctx_meta|> <|null|> | true | false | <|unresolved|>
+{%- if time_window %}
+<|ctx_time|> {% for entry in time_window %}{{ entry.key }}={{ entry.iso }}{{ ' | ' if not loop.last }}{% endfor %}
+{%- endif %}
+{%- if enums %}
+<|ctx_enum|> {{ enums | map('enum_token') | join(' | ') }}
+{%- endif %}
+<|sep|>
+{{ utterance }}
+{%- if recent_context %}
+<|sep|>
+<|ctx_recent|> {% for row in recent_context %}{{ row.key }}={{ quote(row.value) }}{{ ' | ' if not loop.last }}{% endfor %}
+{%- endif %}
+<|eos|>

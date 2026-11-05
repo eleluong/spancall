@@ -1,0 +1,26 @@
+{
+  "workload": "smoke",
+  "n": 4,
+  "F_share": 0.5,
+  "abstain_reason_mix": {
+    "ABSENT": 2
+  },
+  "scope_cut_deltas": {},
+  "retriever_RatT": {
+    "recall_at_top_n": 1.0,
+    "hits": 4,
+    "total": 4,
+    "top_n": 5
+  },
+  "decision_gate": {
+    "f_floor": 0.5,
+    "h_min": 0.3,
+    "coverage_of_f": 0.6,
+    "passed": true,
+    "notes": "F-share is a coverage upper bound on h, not h itself; achievable h \u2248 F_share \u00d7 coverage_of_F = 0.300"
+  },
+  "clock": {
+    "zone": "UTC",
+    "now": "2026-10-27"
+  }
+}
