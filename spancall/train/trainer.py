@@ -307,15 +307,20 @@ class SpanCallTrainer(BaseTrainer):
     def exact_payload_match(
         self, z: torch.Tensor, cand_starts: torch.Tensor, cand_ends: torch.Tensor,
         pos_indices: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Proportion of (b,k) rows whose argmax is a positive (R4 equal-value aware).
 
-        Returns (acc, n_valid).
+        Returns (acc, acc_tensor, valid).
         """
         B, K, C = z.shape
+        if K == 0 or C == 0:
+            empty = torch.zeros((B, K), dtype=torch.float32, device=z.device)
+            valid = torch.zeros((B, K), dtype=torch.bool, device=z.device)
+            return torch.tensor(0.0, device=z.device), empty, valid
         am = z.argmax(-1).unsqueeze(-1)                    # (B,K,1)
-        is_pos = (pos_indices == am).any(-1)               # (B,K)
-        n_pos = (pos_indices >= 0).sum(-1)
+        in_range = (pos_indices >= 0) & (pos_indices < C)
+        is_pos = ((pos_indices == am) & in_range).any(-1)  # (B,K)
+        n_pos = in_range.sum(-1)
         valid = n_pos > 0
         acc = torch.where(valid, is_pos.float(), torch.zeros_like(is_pos.float()))
         return acc.sum() / max(int(valid.sum().item()), 1), acc, valid
@@ -338,11 +343,14 @@ class SpanCallTrainer(BaseTrainer):
 
             # ---- CLS / param / tool / utterance anchors -------------------
             cls_h = H[:, 0]
-            param_h = H.gather(1, b["param_positions"].unsqueeze(-1).expand(-1, -1, H.size(-1)))
+            max_tok_idx = max(H.size(1) - 1, 0)
+            safe_param_pos = b["param_positions"].clamp(min=0, max=max_tok_idx)
+            param_h = H.gather(1, safe_param_pos.unsqueeze(-1).expand(-1, -1, H.size(-1)))
             K = param_h.size(1)
 
             if "tool_positions" in b and b["tool_positions"].numel():
-                tool_h = H.gather(1, b["tool_positions"].unsqueeze(-1).expand(-1, -1, H.size(-1)))
+                safe_tool_pos = b["tool_positions"].clamp(min=0, max=max_tok_idx)
+                tool_h = H.gather(1, safe_tool_pos.unsqueeze(-1).expand(-1, -1, H.size(-1)))
             else:
                 tool_h = None
 
@@ -355,7 +363,7 @@ class SpanCallTrainer(BaseTrainer):
 
             # ---- H3 pointer -----------------------------------------------
             ptr = getattr(self.model, "pointer_head", None)
-            if ptr is not None and "cand_starts" in b:
+            if ptr is not None and "cand_starts" in b and K > 0:
                 p = ptr(
                     param_h, H,
                     candidate_masks={"starts": b["cand_starts"], "ends": b["cand_ends"]},
@@ -370,7 +378,7 @@ class SpanCallTrainer(BaseTrainer):
 
             # ---- H4 reason ------------------------------------------------
             abst = getattr(self.model, "abstain_head", None)
-            if abst is not None:
+            if abst is not None and K > 0:
                 r = abst(param_h, cls_h, utt_pool)
                 preds["reason_logits"] = r
                 targs["reason_logits"] = b["reason_targets"] if "reason_targets" in b else None
@@ -396,19 +404,32 @@ class SpanCallTrainer(BaseTrainer):
 
             # ---- H8 correctness -------------------------------------------
             corr_head = getattr(self.model, "correctness_head", None)
-            if corr_head is not None and "q" in preds and "pointer_logits" in preds:
+            if corr_head is not None and "q" in preds and "pointer_logits" in preds and K > 0:
                 # chosen span pooled features
                 z_det = preds["pointer_logits"].detach()
                 am = z_det.argmax(-1)                       # (B,K) over {abstain} U A_k
-                is_cand = am > 0
-                cand_am = (am - 1).clamp(min=0)             # index into cand arrays
-                chosen_s = b["cand_starts"].gather(-1, cand_am.unsqueeze(-1)).squeeze(-1).clamp(min=0)
-                chosen_e = b["cand_ends"].gather(-1, cand_am.unsqueeze(-1)).squeeze(-1).clamp(min=0)
+                C_cand = b["cand_starts"].size(-1) if "cand_starts" in b and b["cand_starts"].dim() == 3 else 0
+                is_cand = (am > 0) & (C_cand > 0)
                 span_pool = torch.zeros_like(cls_h.unsqueeze(1).expand(-1, K, -1))
-                for i in range(H.size(0)):
-                    for k in range(K):
-                        if is_cand[i, k]:
-                            span_pool[i, k] = H[i, chosen_s[i, k]:chosen_e[i, k] + 1].mean(0)
+                if C_cand > 0:
+                    cand_am = (am - 1).clamp(min=0, max=C_cand - 1)  # index into cand arrays
+                    chosen_s = b["cand_starts"].gather(-1, cand_am.unsqueeze(-1)).squeeze(-1).clamp(min=0, max=max_tok_idx)
+                    chosen_e = b["cand_ends"].gather(-1, cand_am.unsqueeze(-1)).squeeze(-1).clamp(min=0, max=max_tok_idx)
+                    for i in range(H.size(0)):
+                        for k in range(K):
+                            if is_cand[i, k]:
+                                s_ik = int(chosen_s[i, k].item())
+                                e_ik = int(chosen_e[i, k].item())
+                                if 0 <= s_ik <= e_ik < H.size(1):
+                                    span_pool[i, k] = H[i, s_ik:e_ik + 1].mean(0)
+                    width_raw = (chosen_e - chosen_s).clamp(min=0)
+                    width_norm = torch.where(
+                        is_cand,
+                        width_raw.float() / max(self.model.max_span_width, 1),
+                        torch.zeros_like(width_raw, dtype=torch.float),
+                    )
+                else:
+                    width_norm = torch.zeros(H.size(0), K, device=self.device)
                 # v_stats: p_top1, p_top2, margin, entropy, p_abstain, p_ok, width_norm, is_ctx(=0 stub)
                 probs = torch.softmax(z_det, -1)
                 p_top1 = probs.max(-1).values
@@ -417,7 +438,6 @@ class SpanCallTrainer(BaseTrainer):
                 p_top2 = sorted_p[..., 1] if sorted_p.size(-1) > 1 else torch.zeros_like(p_top1)
                 margin = (sorted_p[..., 0] - sorted_p[..., 1]) if sorted_p.size(-1) > 1 else torch.zeros_like(p_top1)
                 p_ok = torch.sigmoid(b.get("accept_targets", torch.zeros(H.size(0), device=self.device))).unsqueeze(-1).expand(-1, K) if "accept_targets" in b else torch.zeros(H.size(0), K, device=self.device)
-                width_norm = b.get("cand_ends", b["cand_starts"]).gather(-1, cand_am.unsqueeze(-1)).squeeze(-1).clamp(min=0).float() / max(self.model.max_span_width, 1)
                 is_ctx = torch.zeros_like(p_top1)
                 v_stats = torch.stack([p_top1, p_top2, margin,
                                        -(probs * probs.clamp_min(1e-9).log()).sum(-1),
@@ -525,7 +545,12 @@ class SpanCallTrainer(BaseTrainer):
         """
         out: List[Dict[str, Any]] = []
         for r in rows:
-            d = {k: (v if isinstance(v, torch.Tensor) else torch.tensor(v)) for k, v in r.items()}
+            d: Dict[str, torch.Tensor] = {}
+            for k, v in r.items():
+                t = v if isinstance(v, torch.Tensor) else torch.tensor(v)
+                if k in ("cand_starts", "cand_ends", "pos_indices") and t.dim() == 1:
+                    t = t.reshape(0, 0).long()
+                d[k] = t
             out.append(d)
         return out
 
@@ -678,7 +703,11 @@ class SpanCallTrainer(BaseTrainer):
                 batch = self.collate(batch_list)
                 b = {k: v.to(self.device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
                 H = self.encoder(b["input_ids"], b["attention_mask"], b.get("token_type_ids"))
-                param_h = H.gather(1, b["param_positions"].unsqueeze(-1).expand(-1, -1, H.size(-1)))
+                if b["param_positions"].size(1) == 0:
+                    continue
+                max_tok_idx = max(H.size(1) - 1, 0)
+                safe_param_pos = b["param_positions"].clamp(min=0, max=max_tok_idx)
+                param_h = H.gather(1, safe_param_pos.unsqueeze(-1).expand(-1, -1, H.size(-1)))
                 p = self.model.pointer_head(
                     param_h, H,
                     candidate_masks={"starts": b["cand_starts"], "ends": b["cand_ends"]},

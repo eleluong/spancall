@@ -13,7 +13,7 @@ data:
   pack_tools: 1
   recent:
     k_recent: 32
-    context_budget_tokens: 16384
+    context_budget_tokens: 4096
   sources:
     - name: "xlam"
       path: null
@@ -53,7 +53,7 @@ model:
   # what actually fills it.
   backbone_name: "Qwen/Qwen3-Embedding-0.6B"
   head_dim: 256
-  max_seq_len: 32768
+  max_seq_len: 4096
   max_span_width: 16
   dropout: 0.1
   # v1 minimal head set (D4): H1 (tool) + H3 (pointer) + H4 (abstain_reason) +
@@ -108,5 +108,5 @@ agent:
   integration: "s_skip"         # s_skip, s_inject, s_hint
   llm_model: "google/gemma-4"
   max_turns: 15
-  max_context_tokens: 32768
+  max_context_tokens: 16384
   keep_last_tool_turns: 8

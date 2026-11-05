@@ -204,13 +204,17 @@ class PointerHead(BaseHead, nn.Module):
         Returns:
             (B, K, C) span logits; padded slots are set to a large negative.
         """
-        safe_s = cand_starts.clamp(min=0)
-        safe_e = cand_ends.clamp(min=0)
+        B, K, L = start_logits.shape
+        if cand_starts.size(-1) == 0 or L == 0:
+            return start_logits.new_empty(cand_starts.shape)
+        max_l = max(L - 1, 0)
+        safe_s = cand_starts.clamp(min=0, max=max_l)
+        safe_e = cand_ends.clamp(min=0, max=max_l)
         s_ij = torch.gather(start_logits, -1, safe_s)  # (B, K, C)
         e_ij = torch.gather(end_logits, -1, safe_e)    # (B, K, C)
         width = (cand_ends - cand_starts).clamp(min=0, max=self.max_span_width)
         r = self.width_bias(width).squeeze(-1)         # (B, K, C)
-        valid = (cand_starts >= 0) & (cand_ends >= 0)
+        valid = (cand_starts >= 0) & (cand_ends >= 0) & (cand_starts < L) & (cand_ends < L)
         scores = s_ij + e_ij + r
         return torch.where(valid, scores, torch.full_like(scores, -1e4))
 

@@ -63,6 +63,7 @@ class SpanCallLossContainer:
         self.lambda_corr = lambda_corr
         self.abstain_weight = abstain_weight
         self.reason_mse_weight = reason_mse_weight
+        self._reason_weights: Tuple[float, ...] = tuple(float(w) for w in reason_class_weights)
 
         self._reason_ce = torch.nn.CrossEntropyLoss(
             weight=torch.tensor(list(reason_class_weights), dtype=torch.float32),
@@ -98,15 +99,24 @@ class SpanCallLossContainer:
         """
         z = candidate_logits
         B, K, C = z.shape
+        if K == 0 or C == 0:
+            return z.new_zeros((B, K))
         P = positive_indices
-        valid = P >= 0  # (B, K, P)
+        valid = (P >= 0) & (P < C)  # (B, K, P)
 
-        safe = P.clamp(min=0)
+        safe = P.clamp(min=0, max=max(C - 1, 0))
         pos_logits = torch.gather(z, -1, safe)  # (B, K, P)
-        pos_logits = torch.where(
-            valid, pos_logits, torch.full_like(pos_logits, float("-inf"))
-        )
         n_pos = valid.sum(-1)  # (B, K)
+        has_pos = (n_pos > 0).unsqueeze(-1)
+        pos_logits = torch.where(
+            valid,
+            pos_logits,
+            torch.where(
+                has_pos,
+                torch.full_like(pos_logits, float("-inf")),
+                torch.zeros_like(pos_logits),
+            ),
+        )
 
         numerator = torch.logsumexp(pos_logits, dim=-1)  # (B, K)
         denominator = torch.logsumexp(z, dim=-1)          # (B, K)
@@ -200,10 +210,15 @@ class SpanCallLossContainer:
             else:
                 mask = mask.float()
 
-            r_valid = (rt >= 0) & mask.bool()
-            ce = self._reason_ce(
+            r_valid = (rt >= 0) & (rt < rlogits.size(-1)) & mask.bool()
+            weight = torch.tensor(
+                self._reason_weights, dtype=rlogits.dtype, device=rlogits.device
+            )
+            ce = F.cross_entropy(
                 rlogits.reshape(-1, rlogits.size(-1)),
-                rt.reshape(-1).clamp(min=0),
+                rt.reshape(-1).clamp(min=0, max=max(rlogits.size(-1) - 1, 0)),
+                weight=weight,
+                reduction="none",
             ).reshape(B, K)
             ce = torch.where(r_valid, ce, torch.zeros_like(ce))
             n_reason = max(int(r_valid.sum().item()), 1)
@@ -236,8 +251,9 @@ class SpanCallLossContainer:
             z_det = z.detach()
             am = z_det.argmax(dim=-1)  # (B, K)
             pos = targets["pointer_positives"]
-            member = (pos == am.unsqueeze(-1)).any(dim=-1)  # (B, K)
-            n_pos = (pos >= 0).sum(-1) > 0
+            valid_pos = (pos >= 0) & (pos < z.size(-1))
+            member = ((pos == am.unsqueeze(-1)) & valid_pos).any(dim=-1)  # (B, K)
+            n_pos = valid_pos.sum(-1) > 0
             y_corr = (member & n_pos).float()
 
             clogits = predictions["corr_logits"].reshape(-1, 1)
@@ -257,7 +273,12 @@ class SpanCallLossContainer:
             out["count"] = count_loss.detach()
 
         # ---- total --------------------------------------------------------
-        total = torch.zeros((), dtype=torch.float32)
+        active_losses = [
+            t for t in (ptr_loss, accept_loss, reason_loss, tool_loss, corr_loss, count_loss)
+            if t is not None
+        ]
+        dev = active_losses[0].device if active_losses else torch.device("cpu")
+        total = torch.zeros((), dtype=torch.float32, device=dev)
         if ptr_loss is not None:
             total = total + self.lambda_pointer * ptr_loss
         if accept_loss is not None:

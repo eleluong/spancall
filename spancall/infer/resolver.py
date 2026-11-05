@@ -598,11 +598,17 @@ class SpanCallResolver:
         }
 
         heads = self._heads_map()
+        acc = heads.get("call_accept_head")
+        if acc is not None:
+            acc_logit = acc(cls_h)
+            outcome["accept_score"] = float(torch.sigmoid(acc_logit).squeeze().detach())
+
         ptr = heads.get("pointer_head")
-        if ptr is None:
+        if ptr is None or K == 0:
             return anchors, outcome
 
-        param_pos = torch.tensor([[a[1] for a in anchors]], dtype=torch.long, device=device)
+        max_tok_idx = max(H.size(1) - 1, 0)
+        param_pos = torch.tensor([[a[1] for a in anchors]], dtype=torch.long, device=device).clamp(min=0, max=max_tok_idx)
         param_h = H.gather(1, param_pos.unsqueeze(-1).expand(-1, -1, H.size(-1)))  # (1,K,d)
 
         # ---- utterance pool for H4 -----------------------------------------
@@ -647,16 +653,10 @@ class SpanCallResolver:
 
         # ---- H4 reason -----------------------------------------------------
         abst = heads.get("abstain_head")
-        if abst is not None:
+        if abst is not None and K > 0:
             reason_logits = abst(param_h, cls_h, utt_pool)         # (1,K,R)
             reason_idx = int(torch.softmax(reason_logits.detach(), dim=-1).argmax(-1)[0, 0])
             outcome["reason_index"] = reason_idx
-
-        # ---- CallAccept ----------------------------------------------------
-        acc = heads.get("call_accept_head")
-        if acc is not None:
-            acc_logit = acc(cls_h)
-            outcome["accept_score"] = float(torch.sigmoid(acc_logit).squeeze().detach())
 
         return anchors, outcome
 

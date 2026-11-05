@@ -233,12 +233,12 @@ H4_REASONS = ("OK", "ABSENT", "AMBIGUOUS", "NEEDS_REASONING", "OFF_WINDOW")
 STRATUM_ABSTAIN = {Stratum.A}                       # absent/unresolvable → abstain row
 
 BACKBONE = "Qwen/Qwen3-Embedding-0.6B"
-MAX_SEQ_LEN, MAX_SPAN_WIDTH = 32768, 16
+MAX_SEQ_LEN, MAX_SPAN_WIDTH = 4096, 16
 
 tokenizer = AutoTokenizer.from_pretrained(BACKBONE, use_fast=True)
 tokenizer.add_special_tokens({"additional_special_tokens": list(SPECIAL_MARKER_TOKENS)})
 mask_builder = CandidateMaskBuilder(max_seq_len=MAX_SEQ_LEN, max_span_width=MAX_SPAN_WIDTH)
-print('tokenizer ready; vocab =', len(tokenizer))'''
+print('tokenizer ready; vocab =', len(tokenizer), '| MAX_SEQ_LEN =', MAX_SEQ_LEN)'''
 
 CODE_TENSOR_HELPERS = '''def _now_iso(s: UnifiedSample) -> date:
     """Deterministic clock from the sample (R4): current_time_iso else fallback."""
@@ -302,14 +302,40 @@ def _param_anchors(entries, offsets: List[tuple], n_params: int) -> List[int]:
     return (anchors + [0] * n_params)[:n_params]
 
 
+def _sample_seq_len(s: UnifiedSample, tokenizer) -> int:
+    """Compute tokenized sequence length of a sample (with fast char lower-bound)."""
+    raw_chars = len(s.utterance or "") + sum(
+        len(str(r.get("key", ""))) + len(str(r.get("value", ""))) + 16
+        for r in (s.recent_context or [])
+    )
+    if raw_chars < (MAX_SEQ_LEN // 2):
+        return raw_chars
+    tool = s.tools[0] if s.tools else None
+    if s.ground_truth_calls and s.tools:
+        gt_name = s.ground_truth_calls[0].tool_name
+        tool = next((t for t in s.tools if t.name == gt_name), tool)
+    if tool is not None:
+        try:
+            out = build_input(
+                tooldef_to_template_tool(tool),
+                s.utterance,
+                recent_context=_recent_rows(s),
+                now=_now_iso(s),
+            )
+            return len(tokenizer(out.text, add_special_tokens=False)["input_ids"])
+        except Exception:
+            pass
+    return len(tokenizer(s.utterance or "", add_special_tokens=False)["input_ids"])
+
+
 def tensorize_sample(s: UnifiedSample, tokenizer, mask_builder) -> Optional[Dict[str, Any]]:
-    """Build one trainer row from a UnifiedSample. Returns None on overflow/R7."""
+    """Build one trainer row from a UnifiedSample. Returns None on overflow/R7/empty-params."""
     if not s.tools or not s.ground_truth_calls:
         return None
     gt_tool_name = s.ground_truth_calls[0].tool_name
     tool = next((t for t in s.tools if t.name == gt_tool_name), None)
-    if tool is None:
-        return None  # GT tool must be in the candidate list (pack_tools=1 training)
+    if tool is None or not tool.parameters:
+        return None  # GT tool must be in the candidate list and have ≥1 parameter
 
     try:
         out = build_input(
@@ -325,7 +351,7 @@ def tensorize_sample(s: UnifiedSample, tokenizer, mask_builder) -> Optional[Dict
     ids: List[int] = enc["input_ids"]
     offsets: List[tuple] = enc["offset_mapping"]
     if len(ids) > MAX_SEQ_LEN:
-        return None   # L_max overflow → skip
+        return None   # > 4K sequence length → remove sample
 
     # utterance extent from the parse (snapped to tokens)
     utt_entry = next((e for e in out.entries if getattr(e, "segment", None) == "utterance"), None)
@@ -348,30 +374,54 @@ def tensorize_sample(s: UnifiedSample, tokenizer, mask_builder) -> Optional[Dict
     MAX_C = 256   # per-param candidate cap (trainer pads a batch to batch-max C)
 
     for idx, param in enumerate(tool.parameters):
-        anchor = anchors[idx] if idx < len(anchors) else 0
-
         masks = mask_builder.build_param_masks(param, out.entries, offsets, out.text)
-        cands = masks["candidates"]
+        cands = list(masks["candidates"])
+
+        # ---- positives: ground-truth spans (char offsets or canonical value) ---
+        targets = (s.target_spans or {}).get(param.name, [])
+        matched_cis: List[int] = []
+        for t in targets:
+            if t.target_type == "unresolved":
+                continue
+            if t.target_type == "null_ctx":
+                for ci, c in enumerate(cands):
+                    if c.region == "null" and ci not in matched_cis:
+                        matched_cis.append(ci)
+                        break
+                continue
+            found = False
+            if t.char_start is not None:
+                for ci, c in enumerate(cands):
+                    if c.char_start == t.char_start and c.char_end == t.char_end:
+                        if ci not in matched_cis:
+                            matched_cis.append(ci)
+                        found = True
+                        break
+            if not found and t.canonical_value is not None:
+                t_str = str(t.canonical_value).strip()
+                for ci, c in enumerate(cands):
+                    if c.canon_value is not None and (
+                        c.canon_value == t.canonical_value or str(c.canon_value).strip() == t_str
+                    ):
+                        if ci not in matched_cis:
+                            matched_cis.append(ci)
+                        break
+
+        # Cap candidates to MAX_C while preserving any matched positive candidates
+        # so pos_indices never exceed C (which would trigger a CUDA gather assert).
+        if len(cands) > MAX_C:
+            keep_pos = matched_cis[:MAX_POS]
+            keep_set = set(keep_pos)
+            other_cis = [ci for ci in range(len(cands)) if ci not in keep_set][: MAX_C - len(keep_pos)]
+            kept_indices = sorted(keep_pos + other_cis)
+            idx_map = {old_ci: new_ci for new_ci, old_ci in enumerate(kept_indices)}
+            cands = [cands[ci] for ci in kept_indices]
+            matched_cis = [idx_map[ci] for ci in keep_pos if ci in idx_map]
+
         cand_start_rows.append([c.tok_start for c in cands])
         cand_end_rows.append([c.tok_end for c in cands])
 
-        # ---- positives: ground-truth spans (char offsets in rendered text) ---
-        targets = (s.target_spans or {}).get(param.name, [])
-        pos_cols: List[int] = []
-        for t in targets:
-            if t.target_type == "unresolved" or t.char_start is None:
-                continue
-            for ci, c in enumerate(cands):
-                if c.char_start == t.char_start and c.char_end == t.char_end:
-                    pos_cols.append(ci + 1)      # 1-based into [abstain | A_k]
-                    break
-            else:
-                # ctx_key targets (recent/time/enum) → match by canonical value
-                for ci, c in enumerate(cands):
-                    if t.canonical_value is not None and c.canon_value == t.canonical_value:
-                        pos_cols.append(ci + 1)
-                        break
-
+        pos_cols = [ci + 1 for ci in matched_cis[:MAX_POS]]  # 1-based into [abstain | A_k]
         if s.stratum in STRATUM_ABSTAIN:
             pos_cols = [0]                        # whole-param abstain
         if not pos_cols:
@@ -381,9 +431,9 @@ def tensorize_sample(s: UnifiedSample, tokenizer, mask_builder) -> Optional[Dict
         reasons.append(_h4(s, param.name))
         cue.append(1.0)
 
-    # ---- pad candidates to a rectangular (K, C) grid -------------------------
+    # ---- pad candidates to a rectangular (K, C) grid (C >= 1) ----------------
     C = max((len(c) for c in cand_start_rows), default=0)
-    C = min(C, MAX_C)
+    C = max(min(C, MAX_C), 1)
     for i in range(len(cand_start_rows)):
         if len(cand_start_rows[i]) < C:
             cand_start_rows[i] += [-1] * (C - len(cand_start_rows[i]))
@@ -407,8 +457,30 @@ def tensorize_sample(s: UnifiedSample, tokenizer, mask_builder) -> Optional[Dict
     }
     return row'''
 
-CODE_TENSOR_RUN = '''# ---- tensorize all splits -----------------------------------------------
+CODE_TENSOR_RUN = '''# ---- filter out samples > 4K tokens & tensorize all splits --------------
 import json, os
+
+# 1. Remove any samples exceeding MAX_SEQ_LEN (4K) from canonical splits in DATA_DIR
+for split_file in CANONICAL_SPLITS:
+    split_path = os.path.join(DATA_DIR, split_file)
+    if not os.path.exists(split_path):
+        continue
+    kept_lines, removed_long = [], 0
+    with open(split_path, "r") as fh:
+        for line in fh:
+            raw = line.strip()
+            if not raw:
+                continue
+            s = UnifiedSample.from_dict(json.loads(raw))
+            if _sample_seq_len(s, tokenizer) > MAX_SEQ_LEN:
+                removed_long += 1
+                continue
+            kept_lines.append(raw)
+    if removed_long > 0:
+        with open(split_path, "w") as fh:
+            for l in kept_lines:
+                fh.write(l + "\\n")
+        print(f"filtered {split_file}: kept {len(kept_lines)}, removed {removed_long} (> {MAX_SEQ_LEN} tokens)")
 
 SPLIT_INPUTS = {
     "t0":       "hermes_train.jsonl",
@@ -875,10 +947,10 @@ CODE_PERSIST = '''if DRIVE_MOUNT:
 MARKDOWN_LONG_TRAJ = """---
 ## 9b. Long-trajectory agent check (context plumbing)
 
-Runs `scripts/eval_agent.py --benchmark long_trajectory` at 8k/20k/32k context budgets with the checkpoint-free scripted resolver (validates trajectory → `recent_context` feeding, per-turn stats, and LLM-path trimming). With a trained `CHECKPOINT_DIR`, drop `--scripted_resolver` and pass `--spancall_checkpoint` to measure real hit-rate (needs calibration first)."""
+Runs `scripts/eval_agent.py --benchmark long_trajectory` at 8k/12k/16k context budgets with the checkpoint-free scripted resolver (validates trajectory → `recent_context` feeding, per-turn stats, and LLM-path trimming). With a trained `CHECKPOINT_DIR`, drop `--scripted_resolver` and pass `--spancall_checkpoint` to measure real hit-rate (needs calibration first)."""
 
 CODE_LONG_TRAJ = '''import subprocess, sys, json, os
-for ctx, budget in [(8192, 4096), (20480, 10240), (32768, 16384)]:
+for ctx, budget in [(8192, 4096), (12288, 6144), (16384, 8192)]:
     out = f"{RESULTS_DIR}/long_{ctx // 1024}k_nb.json"
     subprocess.run([
         sys.executable, "scripts/eval_agent.py", "--benchmark", "long_trajectory",
