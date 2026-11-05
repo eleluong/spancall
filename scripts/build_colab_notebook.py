@@ -495,7 +495,7 @@ Runs [`scripts/train.py`](../scripts/train.py) against the tensorized splits.
 
 - `--data_dir` → `TENSOR_DIR` above.
 - `--config` → `configs/default.yaml` (backbone `answerdotai/ModernBERT-base`, heads H1/H3/H4/H8+accept, lr 3e-5/1e-4, bf16, batch 64, 4 epochs).
-- **Fast / single-GPU overrides** are applied by generating a slim `configs/colab.yaml` (batch 8, 1 epoch, gradient accumulation 4, `data_dir` wired to `TENSOR_DIR`). Set `FULL_CONFIG = True` to use `default.yaml` unmodified."""
+- **Fast / single-GPU overrides** are applied by generating a slim `configs/colab.yaml` (batch 2, 1 epoch, gradient accumulation 16, `data_dir` wired to `TENSOR_DIR`). Set `FULL_CONFIG = True` to use `default.yaml` unmodified."""
 
 CODE_COLAB_CFG = '''import yaml, os
 
@@ -510,9 +510,9 @@ if not FULL_CONFIG:
     cfg["experiment"]["seed"] = SEED
     cfg["experiment"]["output_dir"] = RESULTS_DIR
     cfg["experiment"]["data_dir"] = TENSOR_DIR
-    # Memory/time friendly: batch 8, 1 epoch, grad-accum 4 (effective 32), bf16 on
-    cfg["optimization"] = {**cfg.get("optimization", {}), "batch_size": 8, "num_epochs": 1}
-    cfg["training"] = {**cfg.get("training", {}), "gradient_accumulation_steps": 4}
+    # Memory friendly (T4 15GB): batch 2, 1 epoch, grad-accum 16 (effective 32), bf16 on
+    cfg["optimization"] = {**cfg.get("optimization", {}), "batch_size": 2, "num_epochs": 1}
+    cfg["training"] = {**cfg.get("training", {}), "gradient_accumulation_steps": 16}
     cfg["model"]["max_seq_len"] = MAX_SEQ_LEN
     out = "configs/colab.yaml"
     with open(out, "w") as fh:
