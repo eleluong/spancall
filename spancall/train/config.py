@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
-from typing import Any, Dict, Mapping, Type, TypeVar, Union
+from typing import Any, Dict, List, Mapping, Type, TypeVar, Union
 
 _T = TypeVar("_T")
 
@@ -196,6 +196,11 @@ class TrainingConfig:
     checkpoint_every_n_steps: int = 500
     experiment_name: str = "span_call"
     data_dir: str = "data/processed"
+    # ---- VRAM levers (notebook-friendly; all default OFF so existing
+    # ---- configs/behavior are unchanged unless explicitly enabled) ----------
+    gradient_checkpointing: bool = False   # backbone.gradient_checkpointing_enable
+    freeze_encoder_stages: List[str] = field(default_factory=list)  # e.g. ["T0", "T1"]
+    use_8bit_optimizer: bool = False       # bitsandbytes PagedAdamW8bit (falls back if absent)
 
     @classmethod
     def from_yaml(cls, path: Union[str, Path]) -> "TrainingConfig":
@@ -236,6 +241,15 @@ class TrainingConfig:
             ),
             checkpoint_every_n_steps=training.get(
                 "checkpoint_every_n_steps", cfg.checkpoint_every_n_steps
+            ),
+            gradient_checkpointing=bool(
+                training.get("gradient_checkpointing", cfg.gradient_checkpointing)
+            ),
+            freeze_encoder_stages=list(
+                training.get("freeze_encoder_stages", cfg.freeze_encoder_stages) or []
+            ),
+            use_8bit_optimizer=bool(
+                training.get("use_8bit_optimizer", cfg.use_8bit_optimizer)
             ),
             seed=experiment.get("seed", cfg.seed),
             output_dir=experiment.get("output_dir", cfg.output_dir),

@@ -294,12 +294,82 @@ class SpanCallTrainer(BaseTrainer):
             self.device = "cpu"
         self.model.to(self.device)
 
+        # ---- VRAM levers (default OFF) -------------------------------------
+        if getattr(self.config, "gradient_checkpointing", False):
+            self._enable_gradient_checkpointing()
+        self.scaler: Optional[Any] = None
+        if self._use_fp16():
+            # GradientScaler for fp16: bf16 needs no scaling, fp32 none either.
+            # torch>=2.0 exposes torch.amp.GradScaler; older builds torch.cuda.amp.
+            grad_scaler = getattr(torch.amp, "GradScaler", None)
+            if grad_scaler is None:
+                grad_scaler = getattr(torch.cuda.amp, "GradScaler", None)
+            if grad_scaler is not None:
+                self.scaler = grad_scaler(
+                    enabled=self.device.startswith("cuda") and torch.cuda.is_available()
+                )
+                print("[SpanCallTrainer] fp16 mixed precision enabled (GradScaler)")
+
         self.optimizer = optimizer
         self.scheduler: Optional[CosineWarmupSchedule] = None
         self.global_step = 0
         self.stage: str = "T0"
         self.history: Dict[str, Any] = {"train_loss": [], "dev": {}}
         self.stage_gates: Dict[str, bool] = {}
+
+    # ------------------------------------------------------------------ #
+    # VRAM helpers
+    # ------------------------------------------------------------------ #
+    def _use_fp16(self) -> bool:
+        """True when config requests fp16 mixed precision (needs GradScaler)."""
+        return (
+            getattr(self.config.optimization, "mixed_precision", "bf16") == "fp16"
+            and self.device.startswith("cuda")
+            and torch.cuda.is_available()
+        )
+
+    def _enable_gradient_checkpointing(self) -> None:
+        """Enable HF gradient checkpointing on the backbone (reentrant=False).
+
+        Reentrant checkpointing (``use_reentrant=True``) would break because
+        ``train_step`` calls ``self.encoder(...)`` directly with no reentrant
+        wrapper, and it must also compose with frozen-backbone stages (no
+        backward through the backbone). Tiny injected test backbones without a
+        ``gradient_checkpointing_enable`` method are skipped silently.
+        """
+        backbone = getattr(self.encoder, "backbone", None)
+        enable = getattr(backbone, "gradient_checkpointing_enable", None)
+        if enable is None:
+            print(
+                "[SpanCallTrainer] gradient_checkpointing requested but backbone has no "
+                "gradient_checkpointing_enable — skipping (tiny/test backbone?)"
+            )
+            return
+        try:
+            enable(use_reentrant=False)
+        except TypeError:  # very old transformers: no use_reentrant kwarg
+            enable()
+        cfg = getattr(backbone, "config", None)
+        if cfg is not None and hasattr(cfg, "use_cache"):
+            cfg.use_cache = False  # incompatible with checkpointing (decoder UQ warns)
+
+    def _make_optimizer(self, groups: List[Dict[str, Any]], lr: float) -> torch.optim.Optimizer:
+        """AdamW, or bitsandbytes PagedAdamW8bit when configured.
+
+        Graceful fallback to AdamW when bitsandbytes is not installed, so the
+        package stays optional (no hard dependency added).
+        """
+        if getattr(self.config, "use_8bit_optimizer", False):
+            try:
+                from bitsandbytes.optim import PagedAdamW8bit
+
+                self._optimizer_kind = "PagedAdamW8bit (8-bit)"
+                print("[SpanCallTrainer] using bitsandbytes PagedAdamW8bit (8-bit optimizer)")
+                return PagedAdamW8bit(groups, lr=lr)
+            except Exception as exc:  # pragma: no cover - environment dependent
+                print(f"[SpanCallTrainer] bitsandbytes unavailable ({exc}); falling back to AdamW")
+        self._optimizer_kind = "AdamW"
+        return AdamW(groups, lr=lr)
 
     # ------------------------------------------------------------------ #
     # Metrics
@@ -455,12 +525,25 @@ class SpanCallTrainer(BaseTrainer):
             losses = self.loss.forward(preds, targs)
             total = losses["loss"]
 
+        # ---- backward (scaled for fp16; bf16/fp32 scale by 1 implicitly) ---
         loss = total / self.config.gradient_accumulation_steps
-        loss.backward()
+        if self.scaler is not None:
+            self.scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
         if (self.global_step + 1) % self.config.gradient_accumulation_steps == 0:
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
+            if self.scaler is not None:
+                # unscale so clip_norm sees true gradients; skip the step when
+                # inf/nan gradients were found (scaler.update() grows the scale
+                # back next round).
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)
             if self.scheduler is not None:
                 self.scheduler.step()
@@ -579,26 +662,25 @@ class SpanCallTrainer(BaseTrainer):
     # Mixed precision + stage helpers
     # ------------------------------------------------------------------ #
     def _amp(self) -> Any:
-        """bf16 autocast on CUDA; fp32 no-op fallback (plan §3.4.1)."""
-        ok = (
-            getattr(self.config.optimization, "mixed_precision", "bf16") == "bf16"
-            and self.device.startswith("cuda")
-            and torch.cuda.is_available()
-        )
-        if ok:
-            return torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+        """Autocast on CUDA: bf16 (default) or fp16; fp32 no-op fallback."""
+        mp = getattr(self.config.optimization, "mixed_precision", "bf16")
+        if self.device.startswith("cuda") and torch.cuda.is_available():
+            if mp == "fp16":
+                return torch.amp.autocast(device_type="cuda", dtype=torch.float16)
+            if mp == "bf16":
+                return torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
         return nullcontext()
 
     def _rebuild_optimizer(self, lr_scale: float = 1.0) -> None:
-        """(Re)build AdamW over the *currently unfrozen* parameters."""
+        """(Re)build the optimizer over the *currently unfrozen* parameters."""
         groups = build_parameter_groups(
             self.model, self.encoder,
             self.config.optimization.learning_rate_encoder * lr_scale,
             self.config.optimization.learning_rate_head * lr_scale,
             self.config.optimization.weight_decay,
         )
-        self.optimizer = AdamW(
-            groups, lr=self.config.optimization.learning_rate_head * lr_scale,
+        self.optimizer = self._make_optimizer(
+            groups, self.config.optimization.learning_rate_head * lr_scale,
         )
         self.optimizer.zero_grad(set_to_none=True)
         total_steps = max(
@@ -622,6 +704,17 @@ class SpanCallTrainer(BaseTrainer):
         """Stage C: freeze encoder + H1–H4, keep H8 trainable."""
         for name, p in self.model.named_parameters():
             p.requires_grad = name.startswith("correctness_head")
+
+    def _freeze_encoder(self) -> None:
+        """Freeze only the backbone (``backbone.*``); all heads stay trainable.
+
+        Used for VRAM-friendly head-only stages (T0/T1 sanity + pointer when
+        ``config.freeze_encoder_stages`` lists them): no backbone grads are
+        produced, and AdamW is rebuilt over heads only — dropping the
+        encoder's ~3x optimizer-state footprint for those stages.
+        """
+        for name, p in self.model.named_parameters():
+            p.requires_grad = not name.startswith("backbone.")
 
     def _unfreeze_all(self) -> None:
         for p in self.model.parameters():
@@ -657,8 +750,14 @@ class SpanCallTrainer(BaseTrainer):
                 continue
 
             n_epochs = 2 if len(data) < 2_000 else self.config.optimization.num_epochs
+            frozen_stages = getattr(self.config, "freeze_encoder_stages", None) or []
             if stage == "C":
                 self._freeze_all_but_correctness()
+                self._rebuild_optimizer()
+            elif stage in frozen_stages:
+                # VRAM lever: heads-only stage — no backbone grads, no AdamW
+                # state for the ~0.6B encoder parameters.
+                self._freeze_encoder()
                 self._rebuild_optimizer()
             else:
                 if stage == "T1" and not self.stage_gates.get("T0"):
