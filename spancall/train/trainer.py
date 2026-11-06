@@ -326,6 +326,9 @@ class SpanCallTrainer(BaseTrainer):
         self.optimizer = optimizer
         self.scheduler: Optional[CosineWarmupSchedule] = None
         self.global_step = 0
+        self._accum_i = 0                      # micro-steps since the last optimizer step
+        import random as _random
+        self._rng = _random.Random(int(getattr(config, "seed", 0) or 0))   # seeded batch shuffling
         self.stage: str = "T0"
         self.history: Dict[str, Any] = {"train_loss": [], "dev": {}}
         self.stage_gates: Dict[str, bool] = {}
@@ -520,7 +523,12 @@ class SpanCallTrainer(BaseTrainer):
                 sorted_p, _ = probs.sort(-1, descending=True)
                 p_top2 = sorted_p[..., 1] if sorted_p.size(-1) > 1 else torch.zeros_like(p_top1)
                 margin = (sorted_p[..., 0] - sorted_p[..., 1]) if sorted_p.size(-1) > 1 else torch.zeros_like(p_top1)
-                p_ok = torch.sigmoid(b.get("accept_targets", torch.zeros(H.size(0), device=self.device))).unsqueeze(-1).expand(-1, K) if "accept_targets" in b else torch.zeros(H.size(0), K, device=self.device)
+                # p_ok comes from the PREDICTED accept head (detached), never from the label:
+                # feeding accept_targets here leaked the answer into H8 during Stage C.
+                if "accept_logits" in preds:
+                    p_ok = torch.sigmoid(preds["accept_logits"].detach().float().reshape(-1, 1)).expand(-1, K)
+                else:
+                    p_ok = torch.zeros(H.size(0), K, device=self.device)
                 is_ctx = torch.zeros_like(p_top1)
                 v_stats = torch.stack([p_top1, p_top2, margin,
                                        -(probs * probs.clamp_min(1e-9).log()).sum(-1),
@@ -545,26 +553,37 @@ class SpanCallTrainer(BaseTrainer):
         else:
             loss.backward()
 
-        if (self.global_step + 1) % self.config.gradient_accumulation_steps == 0:
-            if self.scaler is not None:
-                # unscale so clip_norm sees true gradients; skip the step when
-                # inf/nan gradients were found (scaler.update() grows the scale
-                # back next round).
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                self.optimizer.step()
-            self.optimizer.zero_grad(set_to_none=True)
-            if self.scheduler is not None:
-                self.scheduler.step()
+        self._accum_i += 1
+        if self._accum_i % max(self.config.gradient_accumulation_steps, 1) == 0:
+            self._optimizer_step()
         self.global_step += 1
 
         out = {k: float(v.detach().item()) for k, v in losses.items() if k != "loss"}
         out["loss"] = float(total.detach().item())  # scalar joint loss for run_stage
         return out
+
+    def _optimizer_step(self) -> None:
+        """Clip, step, zero grads and advance the LR schedule (one *optimizer* step)."""
+        if self.scaler is not None:
+            # unscale so clip_norm sees true gradients; skip the step when
+            # inf/nan gradients were found (scaler.update() grows the scale
+            # back next round).
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        if self.scheduler is not None:
+            self.scheduler.step()
+        self._accum_i = 0
+
+    def _flush_accumulation(self) -> None:
+        """Apply gradients left over from an incomplete accumulation window (end of stage)."""
+        if self._accum_i > 0 and self.optimizer is not None:
+            self._optimizer_step()
 
     # ------------------------------------------------------------------ #
     # Data
@@ -666,6 +685,7 @@ class SpanCallTrainer(BaseTrainer):
         total_steps = steps_per_epoch * num_epochs
         log_every = max(int(getattr(self.config, "log_every", 0) or 0), 0) or max(total_steps // 100, 1)
         t_start = time.time()
+        self._accum_i = 0
         print(f"[train:{stage}] start: rows={len(rows)} epochs={num_epochs} "
               f"steps/epoch={steps_per_epoch} total_steps={total_steps} bs={bs}", flush=True)
         self._log_event({"event": "stage_start", "stage": stage, "rows": len(rows),
@@ -675,7 +695,7 @@ class SpanCallTrainer(BaseTrainer):
         pbar = tqdm(total=total_steps, desc=f"train[{stage}]", dynamic_ncols=True, leave=True)
         for epoch in range(1, num_epochs + 1):
             ep_sum, ep_n = 0.0, 0
-            for batch_list in self.make_batches(rows, bs, shuffle=True, rng=None):
+            for batch_list in self.make_batches(rows, bs, shuffle=True, rng=self._rng):
                 if len(batch_list) == 0:
                     continue
                 batch = self.collate(batch_list)
@@ -703,7 +723,10 @@ class SpanCallTrainer(BaseTrainer):
             self._log_event({"event": "epoch_end", "stage": stage, "epoch": epoch,
                              "mean_loss": ep_sum / max(ep_n, 1)})
         pbar.close()
-        return {"loss": losses.get("loss", float("nan")), "steps": float(steps)} if steps else {"loss": float("nan"), "steps": 0.0}
+        self._flush_accumulation()
+        # "loss" = mean over the FINAL epoch (the last micro-batch alone is far too noisy to report)
+        return ({"loss": ep_sum / max(ep_n, 1), "steps": float(steps)}
+                if steps else {"loss": float("nan"), "steps": 0.0})
 
     def _log_event(self, rec: Dict[str, Any]) -> None:
         """Append one JSON line to ``<output_dir>/<exp>_seed<seed>/train_log.jsonl`` (never raises)."""
@@ -795,6 +818,7 @@ class SpanCallTrainer(BaseTrainer):
         self._rebuild_optimizer()
         order = tuple(stages or ("T0", "T1", "T2", "C"))
         summary: Dict[str, Any] = {"history": self.history}
+        abort_reason = ""
         for stage in order:
             data = self._stage_data(stage)
             if not data:
@@ -802,10 +826,15 @@ class SpanCallTrainer(BaseTrainer):
                 self.history[stage] = summary[stage]
                 continue
 
-            n_epochs = 2 if len(data) < 2_000 else self.config.optimization.num_epochs
-            # real stage length -> LR warmup/cosine schedule matches the actual run
+            n_cfg = self.config.optimization.num_epochs
+            n_epochs = n_cfg if len(data) >= 2_000 else max(2, n_cfg)
+            # real stage length -> LR warmup/cosine schedule matches the actual run.
+            # The scheduler advances once per OPTIMIZER step, so count those (not micro-batches);
+            # otherwise with grad-accum the LR never leaves warmup and never decays.
             bs_ = max(self.config.optimization.batch_size, 1)
-            self._sched_total_steps = ((len(data) + bs_ - 1) // bs_) * n_epochs
+            accum_ = max(int(self.config.gradient_accumulation_steps), 1)
+            micro_steps = ((len(data) + bs_ - 1) // bs_) * n_epochs
+            self._sched_total_steps = max((micro_steps + accum_ - 1) // accum_, 1)
             frozen_stages = getattr(self.config, "freeze_encoder_stages", None) or []
             if stage == "C":
                 self._freeze_all_but_correctness()
@@ -833,6 +862,13 @@ class SpanCallTrainer(BaseTrainer):
                     self.stage_gates["T1"] = m >= 0.90
                     summary["T1"]["gate_proceed"] = bool(self.stage_gates["T1"])
                     summary["T1"]["gate_kill"] = bool(m < 0.80)
+                    if summary["T1"]["gate_kill"]:
+                        print(f"[train:T1] GATE KILL: exact_payload_match={m:.4f} < 0.80 "
+                              f"(E1 pointer ceiling not met)", flush=True)
+                        if getattr(self.config, "stop_on_gate_kill", False):
+                            abort_reason = "T1 gate kill"
+            elif stage == "T2":
+                summary["T2"] = {**summary["T2"], **self.evaluate("dev")}
             self.history[stage] = summary[stage]
             print(f"[train:{stage}] finished: {summary[stage]}", flush=True)
             self._log_event({"event": "stage_end", "stage": stage, **{k: v for k, v in summary[stage].items()}})
@@ -844,6 +880,10 @@ class SpanCallTrainer(BaseTrainer):
                 self.save_checkpoint(str(cp))
             except Exception as exc:  # checkpointing must never kill training
                 print(f"[train:{stage}] WARNING: checkpoint failed: {exc!r}", flush=True)
+            if abort_reason:
+                summary["aborted"] = abort_reason
+                print(f"[train] ABORTED after {stage}: {abort_reason} (stop_on_gate_kill=True)", flush=True)
+                break
         return summary
 
     def evaluate(self, split: str = "dev") -> Dict[str, float]:
@@ -855,6 +895,7 @@ class SpanCallTrainer(BaseTrainer):
         self.model.eval()
         hits = 0.0
         n = 0
+        n_gold_abs = abs_hits = n_span = span_hits = n_pred_abs = 0
         # Same autocast context as train_step: the encoder emits bf16 hidden
         # states while head params are fp32 -> LayerNorm dtype mismatch otherwise.
         t0 = time.time()
@@ -882,10 +923,27 @@ class SpanCallTrainer(BaseTrainer):
                 acc_i, acc_t, valid = self.exact_payload_match(z, starts, ends, b["pos_indices"])
                 hits += float((acc_t * valid).sum().item())
                 n += int(valid.sum().item())
-        res = {"exact_payload_match": hits / max(n, 1), "n": float(n)}
+                # abstain-vs-span breakdown: a model that always abstains can look fine on a
+                # mixed set, so report accuracy on gold-abstain and gold-span params separately.
+                gold_abs = (b["pos_indices"][..., 0] == 0) & valid
+                gold_span = valid & ~gold_abs
+                correct = acc_t > 0
+                n_gold_abs += int(gold_abs.sum().item())
+                abs_hits += int((correct & gold_abs).sum().item())
+                n_span += int(gold_span.sum().item())
+                span_hits += int((correct & gold_span).sum().item())
+                n_pred_abs += int(((z.argmax(-1) == 0) & valid).sum().item())
+        res = {
+            "exact_payload_match": hits / max(n, 1), "n": float(n),
+            "span_acc": span_hits / max(n_span, 1), "n_span": float(n_span),
+            "abstain_acc": abs_hits / max(n_gold_abs, 1), "n_gold_abstain": float(n_gold_abs),
+            "pred_abstain_rate": n_pred_abs / max(n, 1),
+        }
         self._log_event({"event": "eval", "split": split, "stage": self.stage,
                          "step": self.global_step, **res})
-        print(f"[eval:{split}] exact_payload_match={res['exact_payload_match']:.4f} n={n}", flush=True)
+        print(f"[eval:{split}] exact_payload_match={res['exact_payload_match']:.4f} n={n} | "
+              f"span_acc={res['span_acc']:.4f} (n={n_span}) abstain_acc={res['abstain_acc']:.4f} "
+              f"(n={n_gold_abs}) pred_abstain_rate={res['pred_abstain_rate']:.3f}", flush=True)
         return res
 
     # ------------------------------------------------------------------ #

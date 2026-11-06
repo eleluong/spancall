@@ -201,6 +201,7 @@ class TrainingConfig:
     gradient_checkpointing: bool = False   # backbone.gradient_checkpointing_enable
     freeze_encoder_stages: List[str] = field(default_factory=list)  # e.g. ["T0", "T1"]
     use_8bit_optimizer: bool = False       # bitsandbytes PagedAdamW8bit (falls back if absent)
+    stop_on_gate_kill: bool = False        # abort the curriculum after T1 when the E1 gate says KILL (<0.80)
 
     @classmethod
     def from_yaml(cls, path: Union[str, Path]) -> "TrainingConfig":
@@ -250,6 +251,9 @@ class TrainingConfig:
             ),
             use_8bit_optimizer=bool(
                 training.get("use_8bit_optimizer", cfg.use_8bit_optimizer)
+            ),
+            stop_on_gate_kill=bool(
+                training.get("stop_on_gate_kill", cfg.stop_on_gate_kill)
             ),
             seed=experiment.get("seed", cfg.seed),
             output_dir=experiment.get("output_dir", cfg.output_dir),
