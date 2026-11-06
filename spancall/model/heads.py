@@ -352,7 +352,7 @@ class CorrectnessHead(BaseHead, nn.Module):
             v_stats: fixed statistics vector, (B, K, 8).
         """
         hbar = self.span_proj(self.span_norm(span_pooled.detach()))  # (B, K, d_h)
-        q = query.detach()
-        v = v_stats.float()
+        q = query.detach().to(dtype=hbar.dtype)
+        v = v_stats.to(dtype=hbar.dtype)
         inp = torch.cat([hbar, q, v], dim=-1)  # (B, K, 2 d_h + 8)
         return self.mlp(inp)  # (B, K, 1)

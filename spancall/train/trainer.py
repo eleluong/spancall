@@ -49,6 +49,7 @@ Batch format (produced by the data pipeline tensorizer / collator):
 
 from __future__ import annotations
 
+import gc
 import json
 import math
 import os
@@ -165,7 +166,13 @@ def build_parameter_groups(
     n_layers: int = 1
 
     # find any sequence attribute holding stacked layers
-    for attr in ("layers", "encoder.layer", "bert.encoder.layer"):
+    for attr in (
+        "layers",
+        "encoder.layer",
+        "bert.encoder.layer",
+        "backbone.backbone.layers",
+        "backbone.backbone.encoder.layer",
+    ):
         obj = model
         for part in attr.split("."):
             obj = getattr(obj, part, None)
@@ -384,6 +391,18 @@ class SpanCallTrainer(BaseTrainer):
                 return PagedAdamW8bit(groups, lr=lr)
             except Exception as exc:  # pragma: no cover - environment dependent
                 print(f"[SpanCallTrainer] bitsandbytes unavailable ({exc}); falling back to AdamW")
+        use_fused = (
+            self.device.startswith("cuda")
+            and torch.cuda.is_available()
+            and self.scaler is None
+            and all(p.is_cuda for g in groups for p in g.get("params", []))
+        )
+        if use_fused:
+            try:
+                self._optimizer_kind = "AdamW (fused)"
+                return AdamW(groups, lr=lr, fused=True)
+            except Exception:
+                pass
         self._optimizer_kind = "AdamW"
         return AdamW(groups, lr=lr)
 
@@ -418,12 +437,12 @@ class SpanCallTrainer(BaseTrainer):
         """One optimization step; returns scalar losses for logging."""
         self._ensure_optimizer()
         self.model.train()
-        b = {k: v.to(self.device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+        b = {k: v.to(self.device, non_blocking=True) for k, v in batch.items() if isinstance(v, torch.Tensor)}
 
         preds: Dict[str, torch.Tensor] = {}
         targs: Dict[str, torch.Tensor] = {}
 
-        # ---- forward under bf16 autocast (CUDA only; fp32 fallback) -------
+        # ---- forward under 16-bit autocast (bf16/fp16 on CUDA) ------------
         with self._amp():
             H = self.encoder(b["input_ids"], b["attention_mask"], b.get("token_type_ids"))
 
@@ -440,12 +459,15 @@ class SpanCallTrainer(BaseTrainer):
             else:
                 tool_h = None
 
-            # utterance pool for H4
-            utt_pool = torch.zeros(H.size(0), H.size(2), device=H.device)
-            for i in range(H.size(0)):
-                s0, e0 = int(b["utt_starts"][i, 0]), int(b["utt_ends"][i, 0])
-                if 0 <= s0 < e0 <= H.size(1):
-                    utt_pool[i] = H[i, s0:e0].mean(0)
+            # Vectorized utterance pool for H4 (no .item() CPU-GPU syncs; stays in H.dtype)
+            L_sz = H.size(1)
+            tok_idx = torch.arange(L_sz, device=H.device).unsqueeze(0)          # (1, L)
+            s0 = b["utt_starts"][:, :1]                                         # (B, 1)
+            e0 = b["utt_ends"][:, :1]                                           # (B, 1)
+            valid_utt = (s0 >= 0) & (s0 < e0) & (e0 <= L_sz)                    # (B, 1)
+            in_utt = valid_utt & (tok_idx >= s0) & (tok_idx < e0)               # (B, L)
+            utt_counts = in_utt.sum(dim=1, keepdim=True).clamp(min=1).to(H.dtype)
+            utt_pool = (H * in_utt.unsqueeze(-1).to(H.dtype)).sum(dim=1) / utt_counts
 
             # ---- H3 pointer -----------------------------------------------
             ptr = getattr(self.model, "pointer_head", None)
@@ -491,31 +513,31 @@ class SpanCallTrainer(BaseTrainer):
             # ---- H8 correctness -------------------------------------------
             corr_head = getattr(self.model, "correctness_head", None)
             if corr_head is not None and "q" in preds and "pointer_logits" in preds and K > 0:
-                # chosen span pooled features
+                # chosen span pooled features (vectorized on GPU in H.dtype without .item() syncs)
                 z_det = preds["pointer_logits"].detach()
                 am = z_det.argmax(-1)                       # (B,K) over {abstain} U A_k
                 C_cand = b["cand_starts"].size(-1) if "cand_starts" in b and b["cand_starts"].dim() == 3 else 0
                 is_cand = (am > 0) & (C_cand > 0)
-                span_pool = torch.zeros_like(cls_h.unsqueeze(1).expand(-1, K, -1))
                 if C_cand > 0:
                     cand_am = (am - 1).clamp(min=0, max=C_cand - 1)  # index into cand arrays
                     chosen_s = b["cand_starts"].gather(-1, cand_am.unsqueeze(-1)).squeeze(-1).clamp(min=0, max=max_tok_idx)
                     chosen_e = b["cand_ends"].gather(-1, cand_am.unsqueeze(-1)).squeeze(-1).clamp(min=0, max=max_tok_idx)
-                    for i in range(H.size(0)):
-                        for k in range(K):
-                            if is_cand[i, k]:
-                                s_ik = int(chosen_s[i, k].item())
-                                e_ik = int(chosen_e[i, k].item())
-                                if 0 <= s_ik <= e_ik < H.size(1):
-                                    span_pool[i, k] = H[i, s_ik:e_ik + 1].mean(0)
+                    tok_idx_bk = tok_idx.unsqueeze(1)                                       # (1, 1, L)
+                    s_bk = chosen_s.unsqueeze(-1)                                           # (B, K, 1)
+                    e_bk = chosen_e.unsqueeze(-1)                                           # (B, K, 1)
+                    valid_span = is_cand.unsqueeze(-1) & (s_bk >= 0) & (s_bk <= e_bk) & (e_bk < L_sz)
+                    in_span = valid_span & (tok_idx_bk >= s_bk) & (tok_idx_bk <= e_bk)      # (B, K, L)
+                    span_counts = in_span.sum(dim=-1, keepdim=True).clamp(min=1).to(H.dtype)
+                    span_pool = torch.matmul(in_span.to(H.dtype), H.detach()) / span_counts # (B, K, D)
                     width_raw = (chosen_e - chosen_s).clamp(min=0)
                     width_norm = torch.where(
                         is_cand,
-                        width_raw.float() / max(self.model.max_span_width, 1),
-                        torch.zeros_like(width_raw, dtype=torch.float),
+                        width_raw.to(H.dtype) / max(self.model.max_span_width, 1),
+                        torch.zeros_like(width_raw, dtype=H.dtype),
                     )
                 else:
-                    width_norm = torch.zeros(H.size(0), K, device=self.device)
+                    span_pool = torch.zeros_like(cls_h.unsqueeze(1).expand(-1, K, -1))
+                    width_norm = torch.zeros(H.size(0), K, device=self.device, dtype=H.dtype)
                 # v_stats: p_top1, p_top2, margin, entropy, p_abstain, p_ok, width_norm, is_ctx(=0 stub)
                 probs = torch.softmax(z_det, -1)
                 p_top1 = probs.max(-1).values
@@ -526,13 +548,13 @@ class SpanCallTrainer(BaseTrainer):
                 # p_ok comes from the PREDICTED accept head (detached), never from the label:
                 # feeding accept_targets here leaked the answer into H8 during Stage C.
                 if "accept_logits" in preds:
-                    p_ok = torch.sigmoid(preds["accept_logits"].detach().float().reshape(-1, 1)).expand(-1, K)
+                    p_ok = torch.sigmoid(preds["accept_logits"].detach().to(probs.dtype).reshape(-1, 1)).expand(-1, K)
                 else:
-                    p_ok = torch.zeros(H.size(0), K, device=self.device)
+                    p_ok = torch.zeros(H.size(0), K, device=self.device, dtype=probs.dtype)
                 is_ctx = torch.zeros_like(p_top1)
                 v_stats = torch.stack([p_top1, p_top2, margin,
                                        -(probs * probs.clamp_min(1e-9).log()).sum(-1),
-                                       p_abstain, p_ok, width_norm, is_ctx], dim=-1)
+                                       p_abstain, p_ok, width_norm.to(probs.dtype), is_ctx], dim=-1)
                 preds["corr_logits"] = corr_head(span_pool, preds["q"], v_stats)
 
             # ---- targets for pointer --------------------------------------
@@ -590,14 +612,61 @@ class SpanCallTrainer(BaseTrainer):
     # ------------------------------------------------------------------ #
     def make_batches(
         self, rows: Sequence[Dict[str, Any]], batch_size: int, shuffle: bool = False,
-        rng: Optional[Any] = None,
+        rng: Optional[Any] = None, max_tokens_per_batch: Optional[int] = None,
     ) -> Iterable[List[Dict[str, Any]]]:
-        """Yield batches; applied after the tensorizer (rows carry tensors)."""
-        idx = list(range(len(rows)))
+        """Yield length-bucketed, token-capped batches to minimize padding & prevent OOM spikes.
+
+        Grouping sequences of similar ``input_ids`` length into each batch cuts
+        ``O(B * L_max^2)`` padding overhead by 2x-3x while shuffling both tie-breaks
+        within megabatches and the batch order across the epoch. Capping total padded
+        tokens per micro-batch (default ``batch_size * 1024``) prevents tail buckets
+        of 2K-4K token sequences from packing ``batch_size * 4096`` tokens at once.
+        """
+        n = len(rows)
+        if n == 0:
+            return
+        bs = max(int(batch_size), 1)
+        cfg_cap = getattr(self.config, "max_tokens_per_batch", None)
+        token_cap = int(max_tokens_per_batch or cfg_cap or (bs * 1024))
+        idx = list(range(n))
+
+        def _seq_len(j: int) -> int:
+            ids = rows[j].get("input_ids") if isinstance(rows[j], dict) else None
+            return int(ids.numel()) if isinstance(ids, torch.Tensor) else (len(ids) if ids is not None else 0)
+
+        def _pack_sorted(sorted_indices: Sequence[int]) -> List[List[int]]:
+            packed: List[List[int]] = []
+            cur: List[int] = []
+            cur_max = 0
+            for j in sorted_indices:
+                l = _seq_len(j)
+                new_max = max(cur_max, l)
+                if cur and (len(cur) >= bs or (len(cur) + 1) * new_max > token_cap):
+                    packed.append(cur)
+                    cur = [j]
+                    cur_max = l
+                else:
+                    cur.append(j)
+                    cur_max = new_max
+            if cur:
+                packed.append(cur)
+            return packed
+
         if shuffle:
-            (rng or random_mod()).shuffle(idx)
-        for i in range(0, len(idx), batch_size):
-            yield [rows[j] for j in idx[i:i + batch_size]]
+            r = rng or random_mod()
+            r.shuffle(idx)  # randomize tie-breaking for equal-length rows
+            pool_sz = bs * 32
+            batches: List[List[int]] = []
+            for start in range(0, n, pool_sz):
+                megabatch = sorted(idx[start : start + pool_sz], key=_seq_len)
+                batches.extend(_pack_sorted(megabatch))
+            r.shuffle(batches)
+            for b_idx in batches:
+                yield [rows[j] for j in b_idx]
+        else:
+            idx.sort(key=_seq_len)
+            for b_idx in _pack_sorted(idx):
+                yield [rows[j] for j in b_idx]
 
     def collate(self, batch: Sequence[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         """Pad a list of per-sample tensor dicts into a batch dict."""
@@ -672,6 +741,12 @@ class SpanCallTrainer(BaseTrainer):
     # ------------------------------------------------------------------ #
     # Staged curriculum
     # ------------------------------------------------------------------ #
+    def _release_cuda_cache(self) -> None:
+        """Free unreferenced objects and return cached CUDA allocator blocks between stages."""
+        gc.collect()
+        if self.device.startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def run_stage(self, stage: str, data: List[Dict[str, Any]], num_epochs: int) -> Dict[str, float]:
         """Run one training stage over ``data`` (tensorized rows)."""
         self.stage = stage
@@ -681,7 +756,7 @@ class SpanCallTrainer(BaseTrainer):
         steps = 0
         losses: Dict[str, float] = {}
         bs = self.config.optimization.batch_size
-        steps_per_epoch = max((len(rows) + bs - 1) // bs, 1)
+        steps_per_epoch = max(len(list(self.make_batches(rows, bs, shuffle=False))), 1)
         total_steps = steps_per_epoch * num_epochs
         log_every = max(int(getattr(self.config, "log_every", 0) or 0), 0) or max(total_steps // 100, 1)
         t_start = time.time()
@@ -724,6 +799,7 @@ class SpanCallTrainer(BaseTrainer):
                              "mean_loss": ep_sum / max(ep_n, 1)})
         pbar.close()
         self._flush_accumulation()
+        self._release_cuda_cache()
         # "loss" = mean over the FINAL epoch (the last micro-batch alone is far too noisy to report)
         return ({"loss": ep_sum / max(ep_n, 1), "steps": float(steps)}
                 if steps else {"loss": float("nan"), "steps": 0.0})
@@ -753,6 +829,11 @@ class SpanCallTrainer(BaseTrainer):
 
     def _rebuild_optimizer(self, lr_scale: float = 1.0) -> None:
         """(Re)build the optimizer over the *currently unfrozen* parameters."""
+        if self.optimizer is not None:
+            self.optimizer.zero_grad(set_to_none=True)
+            self.optimizer = None
+            self.scheduler = None
+            self._release_cuda_cache()
         groups = build_parameter_groups(
             self.model, self.encoder,
             self.config.optimization.learning_rate_encoder * lr_scale,
@@ -833,7 +914,8 @@ class SpanCallTrainer(BaseTrainer):
             # otherwise with grad-accum the LR never leaves warmup and never decays.
             bs_ = max(self.config.optimization.batch_size, 1)
             accum_ = max(int(self.config.gradient_accumulation_steps), 1)
-            micro_steps = ((len(data) + bs_ - 1) // bs_) * n_epochs
+            steps_per_ep = max(len(list(self.make_batches(data, bs_, shuffle=False))), 1)
+            micro_steps = steps_per_ep * n_epochs
             self._sched_total_steps = max((micro_steps + accum_ - 1) // accum_, 1)
             frozen_stages = getattr(self.config, "freeze_encoder_stages", None) or []
             if stage == "C":
@@ -904,7 +986,7 @@ class SpanCallTrainer(BaseTrainer):
                     list(self.make_batches(rows, self.config.optimization.batch_size)),
                     desc=f"eval[{split}]", dynamic_ncols=True, leave=False), 1):
                 batch = self.collate(batch_list)
-                b = {k: v.to(self.device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+                b = {k: v.to(self.device, non_blocking=True) for k, v in batch.items() if isinstance(v, torch.Tensor)}
                 with self._amp():
                     H = self.encoder(b["input_ids"], b["attention_mask"], b.get("token_type_ids"))
                     if b["param_positions"].size(1) == 0:
@@ -944,6 +1026,7 @@ class SpanCallTrainer(BaseTrainer):
         print(f"[eval:{split}] exact_payload_match={res['exact_payload_match']:.4f} n={n} | "
               f"span_acc={res['span_acc']:.4f} (n={n_span}) abstain_acc={res['abstain_acc']:.4f} "
               f"(n={n_gold_abs}) pred_abstain_rate={res['pred_abstain_rate']:.3f}", flush=True)
+        self._release_cuda_cache()
         return res
 
     # ------------------------------------------------------------------ #

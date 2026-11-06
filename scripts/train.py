@@ -66,12 +66,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def build_encoder(cfg: TrainingConfig, tokenizer: Any):
     """Construct the backbone encoder, registering the marker tokens."""
+    import torch
     from spancall.model.encoder import SpanCallTransformerEncoder
+
+    pretrained_kw: Dict[str, Any] = {}
+    mp = getattr(cfg.optimization, "mixed_precision", "bf16")
+    if torch.cuda.is_available() and mp == "bf16":
+        pretrained_kw["dtype"] = torch.bfloat16
 
     enc = SpanCallTransformerEncoder(
         model_name_or_path=cfg.model.backbone_name,
         hidden_dropout_prob=cfg.model.dropout,
         tokenizer=tokenizer,
+        **pretrained_kw,
     )
     if tokenizer is not None:
         from span_template.sanitize import SPECIAL_MARKER_TOKENS

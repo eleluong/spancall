@@ -508,7 +508,15 @@ class SpanCallResolver:
         device = next(self.encoder.parameters()).device
         input_ids = torch.tensor([ids], dtype=torch.long, device=device)
         attention_mask = torch.ones_like(input_ids)
-        H = self.encoder(input_ids, attention_mask)                    # (1, L, d)
+        with torch.no_grad():
+            H = self.encoder(input_ids, attention_mask)                # (1, L, d)
+        if self.model is not None:
+            head_p = next(
+                (p for n, p in self.model.named_parameters() if not n.startswith("encoder.")),
+                None,
+            )
+            if head_p is not None and H.dtype != head_p.dtype:
+                H = H.to(dtype=head_p.dtype)
         cls_h = H[:, 0]                                                # (1, 1, d)
         return H, cls_h, input_ids, attention_mask
 
@@ -612,7 +620,7 @@ class SpanCallResolver:
         param_h = H.gather(1, param_pos.unsqueeze(-1).expand(-1, -1, H.size(-1)))  # (1,K,d)
 
         # ---- utterance pool for H4 -----------------------------------------
-        utt_pool = torch.zeros(B, H.size(-1), device=device)
+        utt_pool = torch.zeros(B, H.size(-1), device=device, dtype=H.dtype)
         utt_toks = [i for i, e in enumerate(per_token)
                     if e is not None and e.segment == "utterance"]
         if utt_toks:
