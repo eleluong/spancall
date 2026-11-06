@@ -238,10 +238,12 @@ class SpanCallLossContainer:
         # ---- tool (H1) ----------------------------------------------------
         tool_loss: Optional[torch.Tensor] = None
         if "tool_logits" in predictions and "tool_targets" in targets:
-            tool_loss = F.cross_entropy(
-                predictions["tool_logits"], targets["tool_targets"].long()
-            )
-            out["tool"] = tool_loss.detach()
+            tt = targets["tool_targets"].long()
+            if (tt >= 0).any():
+                tool_loss = F.cross_entropy(
+                    predictions["tool_logits"], tt, ignore_index=-1
+                )
+                out["tool"] = tool_loss.detach()
 
         # ---- correctness (H8) ---------------------------------------------
         corr_loss: Optional[torch.Tensor] = None

@@ -464,30 +464,39 @@ def tokenize_offset_mapping(
     ids = enc["input_ids"]
     offsets = enc["offset_mapping"]
     per_token: List[Optional[Entry]] = [None] * len(ids)
+    text = output.text
 
-    # ownership map: an entry claims ONLY its char_start. Registering char_end
-    # too would mis-attribute a token starting on a shared boundary (entry A
-    # ending exactly where entry B starts) to the ending entry, because
-    # setdefault keeps the first writer.
-    bounds: Dict[int, Entry] = {}
+    # Map each entry to its starting and ending token indices.
+    # Byte-level BPE tokenizers (Qwen3, GPT-2, Llama) attach a preceding space
+    # (' ', Ġ) to the first token of a word/entry (cs < e.char_start < ce with
+    # text[cs:e.char_start].isspace()) and may attach trailing whitespace or a
+    # closing quote after e.char_end (cs < e.char_end < ce). Any token that
+    # straddles non-whitespace/non-quote characters across an entry boundary
+    # still raises SanitizeError("bad_boundary").
     for e in output.entries:
-        bounds.setdefault(e.char_start, e)
-
-    for i, (cs, ce) in enumerate(offsets):
-        # a token is inside an entry iff it starts at an entry boundary
-        if cs in bounds:
-            per_token[i] = bounds[cs]
-
-    # boundary-safety: every entry's char_start must coincide with a token start,
-    # and char_end with a token end (no straddling BPE token).
-    token_starts = {cs for cs, _ in offsets}
-    token_ends = {ce for _, ce in offsets}
-    for e in output.entries:
-        if e.char_start not in token_starts or e.char_end not in token_ends:
+        if e.char_end <= e.char_start:
+            continue
+        start_tok: Optional[int] = None
+        end_tok: Optional[int] = None
+        for i, (cs, ce) in enumerate(offsets):
+            if ce <= cs:
+                continue
+            if start_tok is None and cs <= e.char_start < ce:
+                if cs == e.char_start or text[cs : e.char_start].isspace():
+                    start_tok = i
+            if cs < e.char_end <= ce:
+                if ce == e.char_end or all(ch in ' \t\r\n"' for ch in text[e.char_end : ce]):
+                    end_tok = i
+                    break
+        if start_tok is None or end_tok is None:
             raise SanitizeError(
                 "bad_boundary",
                 f"entry {e.kind}@{e.char_start}:{e.char_end} straddles a token",
             )
+        # Ownership: an entry claims its starting token (preferring exact
+        # char_start match if two entries share a BPE token).
+        if per_token[start_tok] is None or offsets[start_tok][0] == e.char_start:
+            per_token[start_tok] = e
 
     if max_len is not None and len(ids) > max_len:
         raise SanitizeError("overflow", f"{len(ids)} tokens > L_max={max_len}")

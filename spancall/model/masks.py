@@ -82,23 +82,42 @@ def _entry_tok_range(
     token_offsets: Sequence[Tuple[int, int]],
     max_seq_len: int,
 ) -> Optional[Tuple[int, int]]:
-    """R8 snapping: first/last token wholly inside [char_start, char_end].
+    """R8 snapping: first/last token covering [char_start, char_end].
 
-    Returns None when the entry has no fully-inside token (should not happen
-    for legend entries; the template boundary check guarantees alignment).
+    Handles both exact-boundary tokenizers and byte-level BPE tokenizers (e.g.
+    Qwen3) where the first token of an entry may include a leading space
+    (``tcs < cs < tce``) or the last token may include trailing whitespace/quote.
     """
     cs, ce = entry.char_start, entry.char_end
+    if ce <= cs:
+        return None
     first = last = None
     for i, (tcs, tce) in enumerate(token_offsets):
         if i >= max_seq_len:
             break
-        if tcs >= cs and tce <= ce:
+        if tce <= tcs:
+            continue
+        if tce > cs and tcs < ce:
             if first is None:
                 first = i
             last = i
     if first is None:
         return None
     return (first, last)
+
+
+def _normalize_param_type(raw_type: Optional[str]) -> Tuple[str, bool]:
+    """Normalize JSON-schema parameter type (including union strings like ``"['string', 'null']"``).
+
+    Returns ``(primary_type, is_nullable)``.
+    """
+    raw = (raw_type or "string").strip().lower()
+    is_nullable = "null" in raw
+    if raw.startswith("["):
+        for candidate in ("boolean", "integer", "number", "date", "datetime", "time", "array", "object", "string"):
+            if candidate in raw:
+                return candidate, is_nullable
+    return raw, is_nullable
 
 
 class CandidateMaskBuilder:
@@ -146,7 +165,7 @@ class CandidateMaskBuilder:
             canon_value: list aligned to candidates.
         """
         cands: List[Candidate] = []
-        ptype = (param_schema.param_type or "string").lower()
+        ptype, _is_nullable = _normalize_param_type(param_schema.param_type)
         enum_vals = set(param_schema.enum) if param_schema.enum else None
 
         # --- split entries by what they can feed -----------------------------
@@ -159,6 +178,11 @@ class CandidateMaskBuilder:
                     and str(e.kind).lower() in ("null", "unresolved")]
         recent_vals = [e for e in targetable if e.segment == "recent"]
         utterance_entries = [e for e in targetable if e.segment == "utterance"]
+        u_bounds: Optional[Tuple[int, int]] = (
+            (min(e.char_start for e in utterance_entries), max(e.char_end for e in utterance_entries))
+            if utterance_entries
+            else None
+        )
 
         # token offsets grouped per entry for utterance windowing
         tok_by_entry: Dict[int, Tuple[int, int]] = {}
@@ -180,6 +204,7 @@ class CandidateMaskBuilder:
                     continue
                 cands.append(Candidate(
                     r[0], r[1], e.char_start, e.char_end, "bool", str(e.value).lower(), _entry_index(legend_entries, e)))
+            cands.extend(self._null_candidates(ctx_null, legend_entries, tok_by_entry, param_schema))
             return self._pack(cands)
 
         # --- enum (R9: strict membership) ------------------------------------
@@ -204,7 +229,7 @@ class CandidateMaskBuilder:
                 cands.append(Candidate(
                     r[0], r[1], e.char_start, e.char_end, "time", e.value, _entry_index(legend_entries, e)))
             cands.extend(self._regex_candidates(
-                _DATE_RE, utterance_text, token_offsets, "utterance", "time"))
+                _DATE_RE, utterance_text, token_offsets, "utterance", "time", char_bounds=u_bounds))
             # date recent values (whole leaf entries + regex sub-spans in multi-word recent rows)
             for e in recent_vals:
                 if isinstance(e.value, str) and _DATE_RE.fullmatch(e.value.strip()):
@@ -220,7 +245,7 @@ class CandidateMaskBuilder:
         # --- numeric ---------------------------------------------------------
         if ptype in ("integer", "number"):
             cands.extend(self._regex_candidates(
-                _NUMERIC_RE, utterance_text, token_offsets, "utterance", "numeric"))
+                _NUMERIC_RE, utterance_text, token_offsets, "utterance", "numeric", char_bounds=u_bounds))
             # numeric recent value interiors (whole leaf entries + regex sub-spans in multi-word recent rows)
             for e in recent_vals:
                 if not self._looks_numeric(e.value):
@@ -240,7 +265,7 @@ class CandidateMaskBuilder:
             regex = {"email": _EMAIL_RE, "url": _URL_RE,
                      "phone": _PHONE_RE}.get(ptype, _EMAIL_RE)
             cands.extend(self._regex_candidates(
-                regex, utterance_text, token_offsets, "utterance", ptype))
+                regex, utterance_text, token_offsets, "utterance", ptype, char_bounds=u_bounds))
             # recent value interiors + regex sub-spans inside multi-word recent rows
             for e in recent_vals:
                 r = tok_by_entry.get(id(e))
@@ -299,8 +324,9 @@ class CandidateMaskBuilder:
         tok_by_entry: Dict[int, Tuple[int, int]],
         param_schema: ParameterSchema,
     ) -> List[Candidate]:
-        """Optional params get the <|null|> entry appended (plan §3.1, P4)."""
-        if param_schema.required:
+        """Optional or nullable params get the <|null|> entry appended (plan §3.1, P4)."""
+        _, is_nullable = _normalize_param_type(param_schema.param_type)
+        if param_schema.required and not is_nullable:
             return []
         out: List[Candidate] = []
         for e in ctx_null:
@@ -318,12 +344,17 @@ class CandidateMaskBuilder:
         token_offsets: Sequence[Tuple[int, int]],
         region: str,
         canon_prefix: str,
+        char_bounds: Optional[Tuple[int, int]] = None,
     ) -> List[Candidate]:
         """Regex matches → char ranges → (start,end) token pairs (P4)."""
         out: List[Candidate] = []
         if not text:
             return out
-        for m in regex.finditer(text):
+        s_lo = char_bounds[0] if char_bounds is not None else 0
+        s_hi = min(char_bounds[1], len(text)) if char_bounds is not None else len(text)
+        if s_hi <= s_lo:
+            return out
+        for m in regex.finditer(text, s_lo, s_hi):
             cs, ce = m.start(), m.end()
             r = _char_range_to_tokens(cs, ce, token_offsets, self._effective_max_seq_len(token_offsets))
             if r is None:
@@ -397,12 +428,13 @@ class CandidateMaskBuilder:
         text = self._entry_text(utterance_entries)
         word_bounds = {u_start + b for b in _word_boundaries(text)}
 
-        # tokens inside utterance range (window = explicit cap or actual count)
+        # tokens overlapping utterance range (clamped to [u_start, u_end] for BPE
+        # tokens that include leading space or trailing newline)
         max_tok = self._effective_max_seq_len(token_offsets)
         in_toks = [
-            (i, (tcs, tce))
+            (i, (max(tcs, u_start), min(tce, u_end)))
             for i, (tcs, tce) in enumerate(token_offsets)
-            if i < max_tok and tcs >= u_start and tce <= u_end
+            if i < max_tok and tce > u_start and tcs < u_end and max(tcs, u_start) < min(tce, u_end)
         ]
         starts = [i for i, (tcs, tce) in in_toks if tcs in word_bounds or tcs == 0]
         tok_map = dict(in_toks)
@@ -413,25 +445,35 @@ class CandidateMaskBuilder:
                 if j < i or (j - i) >= self.max_span_width:
                     continue
                 if tce_j in word_bounds or tce_j == u_end:
-                    cval = (
-                        utterance_text[tcs_i:tce_j].strip()
-                        if len(utterance_text) >= tce_j
-                        else None
-                    )
+                    cs_i, ce_j = tcs_i, tce_j
+                    cval: Optional[str] = None
+                    if len(utterance_text) >= ce_j:
+                        while cs_i < ce_j and utterance_text[cs_i].isspace():
+                            cs_i += 1
+                        while ce_j > cs_i and utterance_text[ce_j - 1].isspace():
+                            ce_j -= 1
+                        if cs_i >= ce_j:
+                            continue
+                        cval = utterance_text[cs_i:ce_j]
                     cand = Candidate(
-                        i, j, tcs_i, tce_j, "utterance",
-                        cval, _entry_index_for_char(legend_entries, tcs_i))
+                        i, j, cs_i, ce_j, "utterance",
+                        cval, _entry_index_for_char(legend_entries, cs_i))
                     cand_set[(i, j)] = cand
         # also add single-token spans not starting on a word bound (whole tokens)
         for i, (tcs, tce) in in_toks:
             if (i, i) not in cand_set:
-                cval = (
-                    utterance_text[tcs:tce].strip()
-                    if len(utterance_text) >= tce
-                    else None
-                )
+                cs_i, ce_j = tcs, tce
+                cval = None
+                if len(utterance_text) >= ce_j:
+                    while cs_i < ce_j and utterance_text[cs_i].isspace():
+                        cs_i += 1
+                    while ce_j > cs_i and utterance_text[ce_j - 1].isspace():
+                        ce_j -= 1
+                    if cs_i >= ce_j:
+                        continue
+                    cval = utterance_text[cs_i:ce_j]
                 cand_set[(i, i)] = Candidate(
-                    i, i, tcs, tce, "utterance", cval, _entry_index_for_char(legend_entries, tcs))
+                    i, i, cs_i, ce_j, "utterance", cval, _entry_index_for_char(legend_entries, cs_i))
         return list(cand_set.values())
 
     def _free_recent_spans(
@@ -459,9 +501,9 @@ class CandidateMaskBuilder:
             e_idx = _entry_index(legend_entries, e)
             word_bounds = {e.char_start + b for b in _word_boundaries(entry_slice)}
             in_toks = [
-                (i, (tcs, tce))
+                (i, (max(tcs, e.char_start), min(tce, e.char_end)))
                 for i, (tcs, tce) in enumerate(token_offsets)
-                if i < max_tok and tcs >= e.char_start and tce <= e.char_end
+                if i < max_tok and tce > e.char_start and tcs < e.char_end and max(tcs, e.char_start) < min(tce, e.char_end)
             ]
             tok_map = dict(in_toks)
             starts = [i for i, (tcs, tce) in in_toks if tcs in word_bounds or tcs == e.char_start]
@@ -474,16 +516,20 @@ class CandidateMaskBuilder:
                         key = (i, j, "recent")
                         if key in seen:
                             continue
-                        sub_val = (
-                            rendered_text[tcs_i:tce_j].strip()
-                            if len(rendered_text) >= tce_j
-                            else entry_slice[tcs_i - e.char_start:tce_j - e.char_start].strip()
-                        )
+                        cs_i, ce_j = tcs_i, tce_j
+                        if len(rendered_text) >= ce_j:
+                            while cs_i < ce_j and rendered_text[cs_i].isspace():
+                                cs_i += 1
+                            while ce_j > cs_i and rendered_text[ce_j - 1].isspace():
+                                ce_j -= 1
+                            sub_val = rendered_text[cs_i:ce_j]
+                        else:
+                            sub_val = entry_slice[cs_i - e.char_start:ce_j - e.char_start].strip()
                         if not sub_val:
                             continue
                         seen.add(key)
                         out.append(Candidate(
-                            i, j, tcs_i, tce_j, "recent", sub_val, e_idx))
+                            i, j, cs_i, ce_j, "recent", sub_val, e_idx))
         return out
 
     @staticmethod
@@ -523,10 +569,10 @@ class CandidateMaskBuilder:
 
 
 def _word_boundaries(text: str) -> set:
-    """Char offsets that start or end a space-delimited token in ``text``."""
+    """Char offsets at word / non-word transitions in ``text`` (consistent with ReverseAligner)."""
     bounds = {0, len(text)}
     for i, ch in enumerate(text):
-        if ch.isspace():
+        if not (ch.isalnum() or ch == "_"):
             bounds.add(i)
             bounds.add(i + 1)
     return bounds

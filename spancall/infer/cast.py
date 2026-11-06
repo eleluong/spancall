@@ -171,22 +171,41 @@ class StrictTypeCaster(BaseTypeCaster):
         orig: str, s: int, e: int, text: str
     ) -> Tuple[str, Optional[str]]:
         """Q4.2: expand to word boundary when the partial piece is <= 1 char."""
-        # leading partial piece
-        i = s - 1
+        if not orig:
+            return text, None
+        s = max(0, min(s, len(orig)))
+        e = max(s, min(e, len(orig)))
+        # Trim leading/trailing whitespace from the slice first
+        while s < e and orig[s].isspace():
+            s += 1
+        while e > s and orig[e - 1].isspace():
+            e -= 1
+        if s >= e:
+            return "", None
+
+        def _is_word(ch: str) -> bool:
+            return ch.isalnum() or ch == "_"
+
+        # Leading partial piece: only expand if boundary splits inside a word
         lead = 0
-        while i >= 0 and not orig[i].isspace() and orig[i] not in "(),.;:!?\"'":
-            lead += 1
-            i -= 1
-        if lead > 1:
-            return text, "bad_boundary"
-        # trailing partial piece
-        j = e
+        if s > 0 and _is_word(orig[s]) and _is_word(orig[s - 1]):
+            i = s - 1
+            while i >= 0 and _is_word(orig[i]):
+                lead += 1
+                i -= 1
+            if lead > 1:
+                return text, "bad_boundary"
+
+        # Trailing partial piece: only expand if boundary splits inside a word
         trail = 0
-        while j < len(orig) and not orig[j].isspace() and orig[j] not in "(),.;:!?\"'":
-            trail += 1
-            j += 1
-        if trail > 1:
-            return text, "bad_boundary"
+        if e < len(orig) and _is_word(orig[e - 1]) and _is_word(orig[e]):
+            j = e
+            while j < len(orig) and _is_word(orig[j]):
+                trail += 1
+                j += 1
+            if trail > 1:
+                return text, "bad_boundary"
+
         return orig[s - lead : e + trail], None
 
     # ------------------------------------------------------------------ #
@@ -227,7 +246,13 @@ class StrictTypeCaster(BaseTypeCaster):
     # ------------------------------------------------------------------ #
     def cast_canonical(self, value: Any, param_schema: ParameterSchema) -> Tuple[bool, Any]:
         """Q5 over a non-utterance canonical value (legend-resolved)."""
-        ptype = (param_schema.param_type or "string").lower()
+        raw_ptype = (param_schema.param_type or "string").lower()
+        ptype = raw_ptype
+        if ptype.startswith("["):
+            for candidate in ("boolean", "integer", "number", "date", "array", "object", "string"):
+                if candidate in ptype:
+                    ptype = candidate
+                    break
         if value is None:
             return True, None  # caller decides null-emit policy (default/absent)
         # Enums: never emit a value outside the declared pool, even when the
@@ -257,7 +282,13 @@ class StrictTypeCaster(BaseTypeCaster):
         return False, None
 
     def _cast(self, raw_text: str, ps: ParameterSchema) -> Tuple[bool, Any]:
-        ptype = (ps.param_type or "string").lower()
+        raw_ptype = (ps.param_type or "string").lower()
+        ptype = raw_ptype
+        if ptype.startswith("["):
+            for candidate in ("boolean", "integer", "number", "date", "array", "object", "string"):
+                if candidate in ptype:
+                    ptype = candidate
+                    break
         # Enums are declared JSON-Schema style: param_type "string" + enum list.
         if ptype == "enum" or ps.enum is not None:
             return self._enum(_collapse_ws(raw_text), ps)
@@ -344,8 +375,11 @@ class StrictTypeCaster(BaseTypeCaster):
         t = raw_text.strip()
         if t.startswith("[") and t.endswith("]"):
             t = t[1:-1].strip()
+        # Handle natural conjunctions like ", and ", ", or ", " and ", " or "
+        t = re.sub(r",\s*(?:and|or)\s+", ",", t, flags=re.IGNORECASE)
+        t = re.sub(r"\s+(?:and|or)\s+", ",", t, flags=re.IGNORECASE)
         parts = [p.strip() for p in t.split(",")]
-        parts = [p for p in parts if p]
+        parts = [p.strip("'\" \t\r\n") for p in parts if p.strip()]
         if not parts:
             return False, None
         items_type = (ps.items_type or "string").lower()
@@ -441,7 +475,16 @@ class SchemaValidator:
 
     @staticmethod
     def _type_ok(p: ParameterSchema, value: Any) -> bool:
-        ptype = (p.param_type or "string").lower()
+        raw_ptype = (p.param_type or "string").lower()
+        is_nullable = "null" in raw_ptype
+        if is_nullable and value is None:
+            return True
+        ptype = raw_ptype
+        if ptype.startswith("["):
+            for candidate in ("boolean", "integer", "number", "date", "array", "object", "string"):
+                if candidate in ptype:
+                    ptype = candidate
+                    break
         if ptype == "null":
             return value is None
         if ptype == "boolean":

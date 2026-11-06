@@ -203,18 +203,19 @@ pos_indices                 (K, P) long, -1 padded       # positive cand cols (0
 reason_targets              (K,) long 0..4, -1 masked    # H4 reason classes
 accept_targets              ()  float                    # stratum F → 1.0, A → 0.0
 cue_mask                    (K,) float                   # pointer mask (all ones)
+tool_positions              (T,) long in [0, L)          # <|tool|> anchor positions (multi-tool)
+tool_targets                ()  long                     # ground-truth tool index (0..T-1)
 ```
 
 The cell below builds those rows per sample by:
 
 1. Loading the tokenizer + marker tokens (same as `scripts/train.py`).
-2. Rendering the **GT tool** with [`build_input`](../span_template/template.py) using the sample's `current_time_iso` as `now` (deterministic).
-3. Tokenizing with `return_offsets_mapping` and **snapping each legend entry to the wholly-inside token range** (same `_entry_tok_range` logic the mask builder uses — cheaper than `tokenize_offset_mapping`, which is intentionally strict and can raise `bad_boundary` on real hub rows).
-4. Building `CandidateMaskBuilder.build_param_masks` per param (P4) over the snapped offsets.
-5. Mapping each `target_spans[param]` (char offsets / ctx_key) to its positive candidate column; `stratum A` params get the abstain slot (0); `h4_reasons` from `metadata`; cue_mask = ones.
-6. Writing splits `t0/t1/t2/stage_c/dev/calib.jsonl` (graceful downsampling for fast runs).
-
-> Row tensors are stored with `.tolist()` — `SpanCallTrainer.tensorize_rows` turns the JSON lists back into tensors."""
+2. For multi-tool training/dev (`t2` and `dev`), rendering candidate tools with `build_input_multi` to produce `tool_positions` and `tool_targets`. For single-tool stages (`t0`/`t1`), rendering `build_input(gt_tool)`.
+3. Tokenizing with `return_offsets_mapping` and BPE-aware entry snapping (`_snap`).
+4. Building `CandidateMaskBuilder.build_param_masks` per param (P4) over the rendered text and offsets.
+5. Matching ground-truth positive spans by verifying `canonical_value` against candidate canonical values.
+6. Capping candidates to `MAX_C = 512` by sampling hard negatives near target spans plus a uniform stride (no answer-position leakage).
+7. Writing full splits without destructive downsampling."""
 
 CODE_TENSOR_SETUP = '''import json, os, math
 from datetime import date
@@ -251,18 +252,13 @@ CODE_TENSOR_HELPERS = '''def _now_iso(s: UnifiedSample) -> date:
 
 
 def _recent_rows(s: UnifiedSample) -> List[RecentRow]:
-    """Build RecentRow list, dropping rows whose key/value trips R7 (reserved markers).
-
-    The resolver / B1a baseline both treat such rows as abstain; here we keep the
-    sample but drop only the infected recent rows so the rest still trains.
-    """
     rows_out: List[RecentRow] = []
     for r in (s.recent_context or []):
         try:
             rows_out.append(RecentRow(key=str(r.get("key", "")), value=str(r.get("value", "")),
                                       source=str(r.get("source", "recent"))))
         except ValueError:
-            continue   # R7: marker injection in key or value → drop this row only
+            continue
     return rows_out
 
 
@@ -276,15 +272,16 @@ MAX_POS = 3   # positive slots per param (pointer P in the v1 loss)
 
 
 def _snap(cs: int, ce: int, offsets: List[tuple]) -> Optional[tuple]:
-    """Lenient R8 snapping: first/last token wholly inside [cs, ce).
-
-    Mirrors ``masks._entry_tok_range``; returns None when no token is inside.
-    """
+    """BPE-aware snapping: first/last token overlapping [cs, ce)."""
+    if ce <= cs:
+        return None
     first = last = None
     for i, (tcs, tce) in enumerate(offsets):
         if i >= MAX_SEQ_LEN:
             break
-        if tcs >= cs and tce <= ce:
+        if tce <= tcs:
+            continue
+        if tce > cs and tcs < ce:
             if first is None:
                 first = i
             last = i
@@ -292,10 +289,10 @@ def _snap(cs: int, ce: int, offsets: List[tuple]) -> Optional[tuple]:
 
 
 def _param_anchors(entries, offsets: List[tuple], n_params: int) -> List[int]:
-    """Template-order ``<|param|>`` anchor token indexes (resolver §4.1.3, lenient)."""
+    """Template-order <|param|> anchor token indexes."""
     anchors: List[int] = []
     for e in entries:
-        if getattr(e, "kind", None) != "param_anchor":
+        if getattr(e, "kind", None) != "param_anchor" or getattr(e, "value", None) == "<|none|>":
             continue
         r = _snap(e.char_start, e.char_end, offsets)
         anchors.append(r[0] if r is not None else 0)
@@ -328,42 +325,90 @@ def _sample_seq_len(s: UnifiedSample, tokenizer) -> int:
     return len(tokenizer(s.utterance or "", add_special_tokens=False)["input_ids"])
 
 
-def tensorize_sample(s: UnifiedSample, tokenizer, mask_builder) -> Optional[Dict[str, Any]]:
-    """Build one trainer row from a UnifiedSample. Returns None on overflow/R7/empty-params."""
+def tensorize_sample(
+    s: UnifiedSample,
+    tokenizer,
+    mask_builder,
+    pack_multi_tools: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Build one trainer row from a UnifiedSample. Supports multi-tool packing for H1 tool selection."""
     if not s.tools or not s.ground_truth_calls:
         return None
     gt_tool_name = s.ground_truth_calls[0].tool_name
-    tool = next((t for t in s.tools if t.name == gt_tool_name), None)
-    if tool is None or not tool.parameters:
-        return None  # GT tool must be in the candidate list and have ≥1 parameter
+    gt_idx = next((i for i, t in enumerate(s.tools) if t.name == gt_tool_name), None)
+    if gt_idx is None:
+        return None
+    gt_tool = s.tools[gt_idx]
+    if not gt_tool.parameters:
+        return None
 
+    from span_template import build_input_multi
+
+    # Always pack when requested (even for 1 tool) so every row of a split has
+    # tool_positions/tool_targets -> uniform keys for Trainer.collate.
+    use_multi = pack_multi_tools
     try:
-        out = build_input(
-            tooldef_to_template_tool(tool),
-            s.utterance,
-            recent_context=_recent_rows(s),
-            now=_now_iso(s),
-        )
+        if use_multi:
+            out = build_input_multi(
+                [tooldef_to_template_tool(t) for t in s.tools],
+                s.utterance,
+                recent_context=_recent_rows(s),
+                now=_now_iso(s),
+            )
+        else:
+            out = build_input(
+                tooldef_to_template_tool(gt_tool),
+                s.utterance,
+                recent_context=_recent_rows(s),
+                now=_now_iso(s),
+            )
     except Exception:
-        return None   # R7 / render failure → skip row (resolver would abstain too)
+        return None
 
     enc = tokenizer(out.text, return_offsets_mapping=True, add_special_tokens=False)
     ids: List[int] = enc["input_ids"]
     offsets: List[tuple] = enc["offset_mapping"]
     if len(ids) > MAX_SEQ_LEN:
-        return None   # > 4K sequence length → remove sample
-
-    # utterance extent from the parse (snapped to tokens)
-    utt_entry = next((e for e in out.entries if getattr(e, "segment", None) == "utterance"), None)
-    if utt_entry is None:
         return None
-    usnap = _snap(utt_entry.char_start, utt_entry.char_end, offsets)
+
+    # Utterance extent
+    utt_entries = [e for e in out.entries if getattr(e, "segment", None) == "utterance"]
+    if not utt_entries:
+        return None
+    u_cs = min(e.char_start for e in utt_entries)
+    u_ce = max(e.char_end for e in utt_entries)
+    usnap = _snap(u_cs, u_ce, offsets)
     if usnap is None:
         return None
     utt_starts, utt_ends = usnap
 
-    K = len(tool.parameters)                       # ToolDefinition.parameters, not .params
-    anchors = _param_anchors(out.entries, offsets, K)
+    # Tool anchors (H1)
+    tool_positions: List[int] = []
+    if use_multi:
+        t_entries = [e for e in out.entries if getattr(e, "kind", None) == "bridge_text" and getattr(e, "tool", None) is not None]
+        for e in t_entries:
+            tsnap = _snap(e.char_start, e.char_end, offsets)
+            tool_positions.append(tsnap[0] if tsnap else 0)
+
+    # Param anchors: slice to gt_tool's parameters
+    K = len(gt_tool.parameters)
+    if use_multi:
+        t_entries = [e for e in out.entries if getattr(e, "kind", None) == "bridge_text" and getattr(e, "tool", None) is not None]
+        s_cs = t_entries[gt_idx].char_start
+        s_ce = t_entries[gt_idx + 1].char_start if gt_idx + 1 < len(t_entries) else min(e.char_start for e in utt_entries)
+        p_entries = [
+            e for e in out.entries
+            if getattr(e, "kind", None) == "param_anchor"
+            and getattr(e, "value", None) != "<|none|>"
+            and s_cs <= e.char_start < s_ce
+        ]
+        anchors = []
+        for e in p_entries:
+            psnap = _snap(e.char_start, e.char_end, offsets)
+            anchors.append(psnap[0] if psnap else 0)
+        anchors = (anchors + [0] * K)[:K]
+    else:
+        anchors = _param_anchors(out.entries, offsets, K)
 
     cand_start_rows: List[List[int]] = []
     cand_end_rows: List[List[int]] = []
@@ -371,13 +416,12 @@ def tensorize_sample(s: UnifiedSample, tokenizer, mask_builder) -> Optional[Dict
     reasons: List[int] = []
     cue: List[float] = []
 
-    MAX_C = 256   # per-param candidate cap (trainer pads a batch to batch-max C)
+    MAX_C = 512
 
-    for idx, param in enumerate(tool.parameters):
+    for idx, param in enumerate(gt_tool.parameters):
         masks = mask_builder.build_param_masks(param, out.entries, offsets, out.text)
         cands = list(masks["candidates"])
 
-        # ---- positives: ground-truth spans (char offsets or canonical value) ---
         targets = (s.target_spans or {}).get(param.name, [])
         matched_cis: List[int] = []
         for t in targets:
@@ -390,30 +434,46 @@ def tensorize_sample(s: UnifiedSample, tokenizer, mask_builder) -> Optional[Dict
                         break
                 continue
             found = False
-            if t.char_start is not None:
+            # Verify canonical value first to avoid shifted char offsets
+            if t.canonical_value is not None:
+                t_str = str(t.canonical_value).strip().lower()
+                for ci, c in enumerate(cands):
+                    if c.canon_value is not None:
+                        c_str = str(c.canon_value).strip().lower()
+                        if c.canon_value == t.canonical_value or c_str == t_str:
+                            if ci not in matched_cis:
+                                matched_cis.append(ci)
+                            found = True
+                            break
+            if not found and t.char_start is not None:
                 for ci, c in enumerate(cands):
                     if c.char_start == t.char_start and c.char_end == t.char_end:
                         if ci not in matched_cis:
                             matched_cis.append(ci)
                         found = True
                         break
-            if not found and t.canonical_value is not None:
-                t_str = str(t.canonical_value).strip()
-                for ci, c in enumerate(cands):
-                    if c.canon_value is not None and (
-                        c.canon_value == t.canonical_value or str(c.canon_value).strip() == t_str
-                    ):
-                        if ci not in matched_cis:
-                            matched_cis.append(ci)
-                        break
 
-        # Cap candidates to MAX_C while preserving any matched positive candidates
-        # so pos_indices never exceed C (which would trigger a CUDA gather assert).
+        # Candidate capping: hard negatives near positive spans + uniform stride
         if len(cands) > MAX_C:
             keep_pos = matched_cis[:MAX_POS]
             keep_set = set(keep_pos)
-            other_cis = [ci for ci in range(len(cands)) if ci not in keep_set][: MAX_C - len(keep_pos)]
-            kept_indices = sorted(keep_pos + other_cis)
+            pool = []
+            for pi in keep_pos:
+                for delta in range(-15, 16):
+                    ni = pi + delta
+                    if 0 <= ni < len(cands) and ni not in keep_set:
+                        pool.append(ni)
+                        keep_set.add(ni)
+            rem = MAX_C - len(keep_set)
+            if rem > 0:
+                stride = max(1, len(cands) // rem)
+                for ci in range(0, len(cands), stride):
+                    if ci not in keep_set:
+                        pool.append(ci)
+                        keep_set.add(ci)
+                    if len(pool) + len(keep_pos) >= MAX_C:
+                        break
+            kept_indices = sorted(keep_pos + pool[: MAX_C - len(keep_pos)])
             idx_map = {old_ci: new_ci for new_ci, old_ci in enumerate(kept_indices)}
             cands = [cands[ci] for ci in kept_indices]
             matched_cis = [idx_map[ci] for ci in keep_pos if ci in idx_map]
@@ -421,17 +481,14 @@ def tensorize_sample(s: UnifiedSample, tokenizer, mask_builder) -> Optional[Dict
         cand_start_rows.append([c.tok_start for c in cands])
         cand_end_rows.append([c.tok_end for c in cands])
 
-        pos_cols = [ci + 1 for ci in matched_cis[:MAX_POS]]  # 1-based into [abstain | A_k]
-        if s.stratum in STRATUM_ABSTAIN:
-            pos_cols = [0]                        # whole-param abstain
-        if not pos_cols:
-            pos_cols = [0]                        # safest default: abstain row
+        pos_cols = [ci + 1 for ci in matched_cis[:MAX_POS]]
+        if s.stratum in STRATUM_ABSTAIN or not pos_cols:
+            pos_cols = [0]
 
         pos_rows.append((pos_cols + [-1] * MAX_POS)[:MAX_POS])
         reasons.append(_h4(s, param.name))
         cue.append(1.0)
 
-    # ---- pad candidates to a rectangular (K, C) grid (C >= 1) ----------------
     C = max((len(c) for c in cand_start_rows), default=0)
     C = max(min(C, MAX_C), 1)
     for i in range(len(cand_start_rows)):
@@ -442,7 +499,7 @@ def tensorize_sample(s: UnifiedSample, tokenizer, mask_builder) -> Optional[Dict
             cand_start_rows[i] = cand_start_rows[i][:C]
             cand_end_rows[i] = cand_end_rows[i][:C]
 
-    row = {
+    row: Dict[str, Any] = {
         "input_ids": torch.tensor(ids, dtype=torch.long),
         "attention_mask": torch.ones(len(ids), dtype=torch.long),
         "param_positions": torch.tensor(anchors, dtype=torch.long),
@@ -455,6 +512,9 @@ def tensorize_sample(s: UnifiedSample, tokenizer, mask_builder) -> Optional[Dict
         "accept_targets": torch.tensor(1.0 if s.stratum == Stratum.F else 0.0),
         "cue_mask": torch.tensor(cue, dtype=torch.float),
     }
+    if tool_positions:
+        row["tool_positions"] = torch.tensor(tool_positions, dtype=torch.long)
+        row["tool_targets"] = torch.tensor(gt_idx, dtype=torch.long)
     return row'''
 
 CODE_TENSOR_RUN = '''# ---- filter out samples > 4K tokens & tensorize all splits --------------
@@ -491,8 +551,8 @@ SPLIT_INPUTS = {
     "calib":    "hermes_calib.jsonl",
 }
 
-# Subsampling limits for fast iteration (set to None for the full corpus)
-SAMPLE_LIMITS = {"t0": 500, "t1": 1500, "t2": 4000, "stage_c": 600, "dev": None, "calib": None}
+# Full dataset training without subsampling limits (None)
+SAMPLE_LIMITS = {"t0": None, "t1": None, "t2": None, "stage_c": None, "dev": None, "calib": None}
 
 os.makedirs(TENSOR_DIR, exist_ok=True)
 
@@ -517,8 +577,10 @@ for out_name, in_name in SPLIT_INPUTS.items():
         continue
     limit = SAMPLE_LIMITS.get(out_name)
     rows, dropped = [], 0
+    # Enable pack_multi_tools for t2 and dev so H1 tool head trains and evaluates on candidate selection
+    pack_multi = out_name in ("t2", "dev")
     for s in _iter_samples(src):
-        row = tensorize_sample(s, tokenizer, mask_builder)
+        row = tensorize_sample(s, tokenizer, mask_builder, pack_multi_tools=pack_multi)
         if row is None:
             dropped += 1
             continue
@@ -566,33 +628,35 @@ MARKDOWN_TRAIN = """---
 Runs [`scripts/train.py`](../scripts/train.py) against the tensorized splits.
 
 - `--data_dir` → `TENSOR_DIR` above.
-- `--config` → `configs/default.yaml` (backbone `answerdotai/ModernBERT-base`, heads H1/H3/H4/H8+accept, lr 3e-5/1e-4, bf16, batch 64, 4 epochs).
-- **Fast / single-GPU overrides** are applied by generating a slim `configs/colab.yaml` (batch 2, 1 epoch, gradient accumulation 16, `data_dir` wired to `TENSOR_DIR`). Set `FULL_CONFIG = True` to use `default.yaml` unmodified."""
+- `--config` → `configs/colab.yaml` (5 epochs for full convergence, batch_size 8, gradient_accumulation_steps 4, effective batch 32, bf16 mixed precision, gradient checkpointing, unfreezing all encoder stages)."""
 
 CODE_COLAB_CFG = '''import yaml, os
 
-FULL_CONFIG = False                 # True → use configs/default.yaml untouched
 EXPERIMENT_NAME = "spancall_colab"
 SEED = 42
 
-if not FULL_CONFIG:
-    with open("configs/default.yaml") as fh:
-        cfg = yaml.safe_load(fh)
-    cfg["experiment"]["name"] = EXPERIMENT_NAME
-    cfg["experiment"]["seed"] = SEED
-    cfg["experiment"]["output_dir"] = RESULTS_DIR
-    cfg["experiment"]["data_dir"] = TENSOR_DIR
-    # Memory friendly (T4 15GB): batch 2, 1 epoch, grad-accum 16 (effective 32), bf16 on
-    cfg["optimization"] = {**cfg.get("optimization", {}), "batch_size": 2, "num_epochs": 1}
-    cfg["training"] = {**cfg.get("training", {}), "gradient_accumulation_steps": 16}
-    cfg["model"]["max_seq_len"] = MAX_SEQ_LEN
-    out = "configs/colab.yaml"
-    with open(out, "w") as fh:
-        yaml.safe_dump(cfg, fh)
-    print("wrote", out)
-else:
-    out = "configs/default.yaml"
-print("config =", out)
+with open("configs/default.yaml") as fh:
+    cfg = yaml.safe_load(fh)
+
+cfg["experiment"]["name"] = EXPERIMENT_NAME
+cfg["experiment"]["seed"] = SEED
+cfg["experiment"]["output_dir"] = RESULTS_DIR
+cfg["experiment"]["data_dir"] = TENSOR_DIR
+
+# Train for 5 epochs (user requirement: at least 3, recommended 5)
+NUM_EPOCHS = 5
+cfg["optimization"]["num_epochs"] = NUM_EPOCHS
+cfg["optimization"]["batch_size"] = 8
+cfg["optimization"]["mixed_precision"] = "bf16"
+cfg["training"]["gradient_accumulation_steps"] = 4
+cfg["training"]["gradient_checkpointing"] = True
+cfg["model"]["freeze_encoder_stages"] = []
+cfg["model"]["max_seq_len"] = MAX_SEQ_LEN
+
+out = "configs/colab.yaml"
+with open(out, "w") as fh:
+    yaml.safe_dump(cfg, fh)
+print(f"wrote {out} (epochs={NUM_EPOCHS}, bs=8, accum=4, bf16=True, freeze=[])")
 CONFIG_PATH = out'''
 
 CODE_TRAIN_RUN = '''# Direct in-notebook training execution (provides live logging and full native tracebacks)
@@ -650,14 +714,13 @@ if CHECKPOINT_DIR:
     print("  contains:", sorted(os.listdir(CHECKPOINT_DIR)))'''
 
 MARKDOWN_PREDICT_INTRO = """---
-## 5. Inference — generate model predictions with `SpanCallResolver`
+## 5. Inference & Evaluation
 
-Loads the chosen checkpoint into [`SpanCallResolver`](../spancall/infer/resolver.py) (same encoder + marker-token setup as training, so `load_state_dict` lines up) and emits prediction rows over a split.
-
-Prediction row contract (consumed by `scripts/eval_toolcall.py`):
-```
-{sample_id, hit, payload, tool_name, accept_probability}
-```"""
+To evaluate correctly without conflating failure modes, the evaluation is broken into three distinct, separate parts:
+1. **Eval Part 1 — Parameter Extraction Evaluation (Oracle / Given GT Tool)**: Tests parameter extraction (`resolver.try_resolve(gt_tool, ...)`) independently of tool selection, reporting ungated/partial extraction (`param_precision`, `param_recall`, `param_f1`, `partial_extraction_rate`, `exact_payload_match` on `Stratum.F`, mean `confidence` on `Stratum.F` vs `Stratum.A`).
+2. **Eval Part 2 — Function (Tool) Prediction Evaluation**: Tests H1 tool selection (`resolver.predict_tool(s.tools, ...)`) across candidate tool schemas independently, reporting top-1 tool accuracy overall and on multi-tool samples (`len(s.tools) > 1`), mean winning tool probability, tool margin (`p_top1 - p_top2`), and gated tool coverage/accuracy.
+3. **Eval Part 3 — End-to-End Function Calling Evaluation (General)**: Tests full function calling (`resolver.try_resolve_candidates(s.tools, ...)`: H1 tool selection + H3/H4 parameter extraction & gating) vs the `B1a` baseline on identical data subsets across `hermes_eval` and the 3 OOD/adversarial splits (`hermes_test_ood_schema`, `hermes_test_ood_para`, `hermes_test_adversarial`).
+"""
 
 CODE_RESOLVER = '''import json, os
 from typing import Any, Dict, List, Optional
@@ -709,19 +772,177 @@ if encoder is not None and hasattr(encoder, "eval"):
     encoder.eval()
 print("resolver ready (checkpoint =", CHECKPOINT_DIR, ")")'''
 
+MARKDOWN_EVAL_PART1 = """---
+## 5a. Evaluation Part 1 — Parameter Extraction (Oracle Tool Given)
+
+Evaluates parameter extraction directly on ground-truth tools using `resolver.try_resolve(gt_tool, ...)`, completely decoupling parameter extraction from function/tool prediction."""
+
+CODE_EVAL_PART1 = '''import json, os
+from spancall.data.schema import Stratum, UnifiedSample
+
+def eval_param_extraction(split_name: str, limit: Optional[int] = 500):
+    src = os.path.join(DATA_DIR, f"{split_name}.jsonl")
+    if not os.path.exists(src):
+        print(f"File not found: {src}")
+        return
+    
+    total = 0
+    stratum_f_total = 0
+    stratum_f_exact = 0
+    param_tp = 0
+    param_fp = 0
+    param_fn = 0
+    partial_extracted = 0
+    conf_f = []
+    conf_a = []
+    
+    with open(src) as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            s = UnifiedSample.from_dict(json.loads(line))
+            if not s.ground_truth_calls or not s.tools:
+                continue
+            gt_call = s.ground_truth_calls[0]
+            gt_tool = next((t for t in s.tools if t.name == gt_call.tool_name), None)
+            if not gt_tool:
+                continue
+            
+            total += 1
+            res = resolver.try_resolve(gt_tool, s.utterance, s.recent_context, s.current_time_iso)
+            pred_payload = res.payload_partial or {}
+            gt_args = gt_call.arguments or {}
+            
+            if s.stratum == Stratum.F:
+                stratum_f_total += 1
+                conf_f.append(res.confidence)
+                if pred_payload == gt_args:
+                    stratum_f_exact += 1
+            else:
+                conf_a.append(res.confidence)
+                
+            if pred_payload:
+                partial_extracted += 1
+                
+            # Parameter-level precision/recall
+            for k, v in pred_payload.items():
+                if k in gt_args and str(gt_args[k]).strip() == str(v).strip():
+                    param_tp += 1
+                else:
+                    param_fp += 1
+            for k, v in gt_args.items():
+                if k not in pred_payload:
+                    param_fn += 1
+                    
+            if limit is not None and total >= limit:
+                break
+                
+    p = param_tp / max(1, param_tp + param_fp)
+    r = param_tp / max(1, param_tp + param_fn)
+    f1 = 2 * p * r / max(1e-8, p + r)
+    f_exact = stratum_f_exact / max(1, stratum_f_total)
+    mean_cf = sum(conf_f) / max(1, len(conf_f))
+    mean_ca = sum(conf_a) / max(1, len(conf_a))
+    partial_rate = partial_extracted / max(1, total)
+    
+    print(f"=== Parameter Extraction Evaluation (Oracle Tool) on {split_name} (N={total}) ===")
+    print(f"Param Precision: {p:.4f} | Recall: {r:.4f} | F1: {f1:.4f}")
+    print(f"Exact Payload Match (Stratum F): {f_exact:.4f} ({stratum_f_exact}/{stratum_f_total})")
+    print(f"Partial Extraction Rate: {partial_rate:.4f} ({partial_extracted}/{total})")
+    print(f"Mean Confidence on Stratum F (Solvable): {mean_cf:.4f}")
+    print(f"Mean Confidence on Stratum A (Unsolvable): {mean_ca:.4f}")
+    print("================================================================================")
+
+eval_param_extraction(EVAL_SPLIT, limit=500)'''
+
+MARKDOWN_EVAL_PART2 = """---
+## 5b. Evaluation Part 2 — Function (Tool) Prediction Evaluation
+
+Evaluates H1 tool selection across candidate tool schemas independently, isolating tool choice accuracy from parameter extraction."""
+
+CODE_EVAL_PART2 = '''import json, os
+from spancall.data.schema import UnifiedSample
+
+def eval_tool_prediction(split_name: str, limit: Optional[int] = 500):
+    src = os.path.join(DATA_DIR, f"{split_name}.jsonl")
+    if not os.path.exists(src):
+        print(f"File not found: {src}")
+        return
+        
+    total = 0
+    multi_total = 0
+    top1_correct = 0
+    multi_top1_correct = 0
+    probs = []
+    margins = []
+    gated_correct = 0
+    gated_hits = 0
+    
+    with open(src) as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            s = UnifiedSample.from_dict(json.loads(line))
+            if not s.ground_truth_calls or not s.tools:
+                continue
+            gt_tool_name = s.ground_truth_calls[0].tool_name
+            total += 1
+            is_multi = len(s.tools) > 1
+            if is_multi:
+                multi_total += 1
+                
+            tool_pred = resolver.predict_tool(s.tools, s.utterance, s.recent_context, s.current_time_iso)
+            pred_name = tool_pred["tool_name"]
+            is_correct = (pred_name == gt_tool_name)
+            
+            if is_correct:
+                top1_correct += 1
+                if is_multi:
+                    multi_top1_correct += 1
+                    
+            probs.append(tool_pred["tool_prob"])
+            margins.append(tool_pred["tool_margin"])
+            
+            if tool_pred["gated_hit"]:
+                gated_hits += 1
+                if is_correct:
+                    gated_correct += 1
+                    
+            if limit is not None and total >= limit:
+                break
+                
+    acc_all = top1_correct / max(1, total)
+    acc_multi = multi_top1_correct / max(1, multi_total)
+    mean_p = sum(probs) / max(1, len(probs))
+    mean_m = sum(margins) / max(1, len(margins))
+    gated_cov = gated_hits / max(1, total)
+    gated_prec = gated_correct / max(1, gated_hits)
+    
+    print(f"=== Function / Tool Prediction (H1) on {split_name} (N={total}) ===")
+    print(f"Top-1 Tool Accuracy (Overall): {acc_all:.4f} ({top1_correct}/{total})")
+    print(f"Top-1 Tool Accuracy (Multi-tool subset, N={multi_total}): {acc_multi:.4f} ({multi_top1_correct}/{multi_total})")
+    print(f"Mean Winner Tool Probability: {mean_p:.4f} | Mean Margin: {mean_m:.4f}")
+    print(f"Gated Coverage: {gated_cov:.4f} | Precision@Gated: {gated_prec:.4f}")
+    print("==================================================================")
+
+eval_tool_prediction(EVAL_SPLIT, limit=500)'''
+
 CODE_PREDICT_SPLIT = '''def predict_split(split_name: str, out_path: str, limit: Optional[int] = None) -> None:
     src = os.path.join(DATA_DIR, f"{split_name}.jsonl")
+    sub_src = os.path.join(RESULTS_DIR, f"subset_{split_name}.jsonl")
     if not os.path.exists(src):
         print(f"no source {src} — skipped")
         return
     preds: List[Dict[str, Any]] = []
+    subset_samples: List[Dict[str, Any]] = []
     n = 0
     with open(src) as fh:
         for line in fh:
             line = line.strip()
             if not line:
                 continue
-            s = UnifiedSample.from_dict(json.loads(line))
+            raw_dict = json.loads(line)
+            s = UnifiedSample.from_dict(raw_dict)
             res = resolver.try_resolve_candidates(s.tools, s.utterance, s.recent_context, s.current_time_iso)
             preds.append({
                 "sample_id": s.sample_id,
@@ -736,6 +957,7 @@ CODE_PREDICT_SPLIT = '''def predict_split(split_name: str, out_path: str, limit:
                 "accept_probability": float(res.accept_score),
                 "abstain_reason": res.abstain_reason,
             })
+            subset_samples.append(raw_dict)
             n += 1
             if limit is not None and n >= limit:
                 break
@@ -743,10 +965,13 @@ CODE_PREDICT_SPLIT = '''def predict_split(split_name: str, out_path: str, limit:
     with open(out_path, "w") as fh:
         for p in preds:
             fh.write(json.dumps(p, default=str) + "\\n")
-    print(f"predicted {n} rows → {out_path}")
+    with open(sub_src, "w") as fh:
+        for s_dict in subset_samples:
+            fh.write(json.dumps(s_dict, default=str) + "\\n")
+    print(f"predicted {n} rows → {out_path} and saved subset → {sub_src}")
 
-# In-domain eval split (small for speed)
-predict_split(EVAL_SPLIT, os.path.join(RESULTS_DIR, "preds_eval.jsonl"), limit=300)'''
+# Predict on EVAL_SPLIT (saving exact subset for matching baseline comparison)
+predict_split(EVAL_SPLIT, os.path.join(RESULTS_DIR, "preds_eval.jsonl"), limit=500)'''
 
 MARKDOWN_CALIB_INTRO = """---
 ## 6. Calibration (optional)
@@ -826,19 +1051,20 @@ if os.path.exists(CALIB_REPORT):
           "| tau_a:", rep.get("tau_a"), "| tau_delta:", rep.get("tau_delta"))'''
 
 MARKDOWN_EVAL_INTRO = """---
-## 7. Offline evaluation
+## 7. General Function Calling Evaluation (Eval Part 3)
 
-Two runs of [`scripts/eval_toolcall.py`](../scripts/eval_toolcall.py):
+Two runs of [`scripts/eval_toolcall.py`](../scripts/eval_toolcall.py) on identical subsets:
 
 1. **B1a baseline** — deterministic regex extraction (`--baseline b1a`).
-2. **SpanCall model** — `--predictions preds_eval.jsonl` generated in §5.
+2. **SpanCall model** — `--predictions preds_eval.jsonl` generated with candidate resolution (`try_resolve_candidates`).
 
-If you generate predictions with `calib_thresholds_path` set in §5, the whole-call gate (tau_p/tau_a/tau_delta) is applied at prediction time and `hit` reflects gated agreement."""
+Both systems run against `subset_{EVAL_SPLIT}.jsonl` so metric comparisons are 100% apples-to-apples."""
 
 CODE_EVAL_B1A = '''import subprocess, sys
+# Evaluate B1a against the exact subset predicted by the model
 subprocess.run([
     sys.executable, "scripts/eval_toolcall.py",
-    "--test_data", f"{DATA_DIR}/{EVAL_SPLIT}.jsonl",
+    "--test_data", f"{RESULTS_DIR}/subset_{EVAL_SPLIT}.jsonl",
     "--baseline", "b1a",
     "--output", f"{RESULTS_DIR}/toolcall_metrics_{EVAL_SPLIT}_b1a.json",
 ], check=True)'''
@@ -846,7 +1072,7 @@ subprocess.run([
 CODE_EVAL_MODEL = '''import subprocess, sys
 subprocess.run([
     sys.executable, "scripts/eval_toolcall.py",
-    "--test_data", f"{DATA_DIR}/{EVAL_SPLIT}.jsonl",
+    "--test_data", f"{RESULTS_DIR}/subset_{EVAL_SPLIT}.jsonl",
     "--predictions", f"{RESULTS_DIR}/preds_eval.jsonl",
     "--output", f"{RESULTS_DIR}/toolcall_metrics_{EVAL_SPLIT}_model.json",
 ], check=True)'''
@@ -912,9 +1138,13 @@ CODE_TEST_EVAL = '''import subprocess, sys
 
 def _run_eval(split: str, label: str, extra: list) -> None:
     out = f"{RESULTS_DIR}/toolcall_metrics_{split}_{label}.json"
+    # Match test subset if it exists
+    data_file = f"{RESULTS_DIR}/subset_{split}.jsonl"
+    if not os.path.exists(data_file):
+        data_file = f"{DATA_DIR}/{split}.jsonl"
     cmd = [
         sys.executable, "scripts/eval_toolcall.py",
-        "--test_data", f"{DATA_DIR}/{split}.jsonl",
+        "--test_data", data_file,
         *extra,
         "--output", out,
     ]
@@ -1033,6 +1263,10 @@ cells = [
     new_code_cell(CODE_PICK_CP),
     new_markdown_cell(MARKDOWN_PREDICT_INTRO),
     new_code_cell(CODE_RESOLVER),
+    new_markdown_cell(MARKDOWN_EVAL_PART1),
+    new_code_cell(CODE_EVAL_PART1),
+    new_markdown_cell(MARKDOWN_EVAL_PART2),
+    new_code_cell(CODE_EVAL_PART2),
     new_code_cell(CODE_PREDICT_SPLIT),
     new_markdown_cell(MARKDOWN_CALIB_INTRO),
     new_code_cell(CODE_CALIB_ROWS),

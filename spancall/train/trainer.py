@@ -464,8 +464,8 @@ class SpanCallTrainer(BaseTrainer):
             tok_idx = torch.arange(L_sz, device=H.device).unsqueeze(0)          # (1, L)
             s0 = b["utt_starts"][:, :1]                                         # (B, 1)
             e0 = b["utt_ends"][:, :1]                                           # (B, 1)
-            valid_utt = (s0 >= 0) & (s0 < e0) & (e0 <= L_sz)                    # (B, 1)
-            in_utt = valid_utt & (tok_idx >= s0) & (tok_idx < e0)               # (B, L)
+            valid_utt = (s0 >= 0) & (s0 <= e0) & (e0 < L_sz)                    # (B, 1)
+            in_utt = valid_utt & (tok_idx >= s0) & (tok_idx <= e0)              # (B, L)
             utt_counts = in_utt.sum(dim=1, keepdim=True).clamp(min=1).to(H.dtype)
             utt_pool = (H * in_utt.unsqueeze(-1).to(H.dtype)).sum(dim=1) / utt_counts
 
@@ -507,7 +507,10 @@ class SpanCallTrainer(BaseTrainer):
             if tool_h is not None:
                 tool_head = getattr(self.model, "tool_head", None)
                 if tool_head is not None:
-                    preds["tool_logits"] = tool_head(tool_h, cls_h)
+                    tl = tool_head(tool_h, cls_h)
+                    if "tool_positions" in b:
+                        tl = tl.masked_fill(b["tool_positions"] < 0, -1e4)
+                    preds["tool_logits"] = tl
                     targs["tool_targets"] = b.get("tool_targets", torch.zeros(H.size(0), dtype=torch.long, device=self.device))
 
             # ---- H8 correctness -------------------------------------------
@@ -978,6 +981,8 @@ class SpanCallTrainer(BaseTrainer):
         hits = 0.0
         n = 0
         n_gold_abs = abs_hits = n_span = span_hits = n_pred_abs = 0
+        tool_hits = 0
+        n_tool = 0
         # Same autocast context as train_step: the encoder emits bf16 hidden
         # states while head params are fp32 -> LayerNorm dtype mismatch otherwise.
         t0 = time.time()
@@ -989,6 +994,23 @@ class SpanCallTrainer(BaseTrainer):
                 b = {k: v.to(self.device, non_blocking=True) for k, v in batch.items() if isinstance(v, torch.Tensor)}
                 with self._amp():
                     H = self.encoder(b["input_ids"], b["attention_mask"], b.get("token_type_ids"))
+
+                    # Tool head eval if present
+                    if "tool_positions" in b and b["tool_positions"].numel() and "tool_targets" in b:
+                        tool_head = getattr(self.model, "tool_head", None)
+                        if tool_head is not None:
+                            max_tok_idx = max(H.size(1) - 1, 0)
+                            safe_tool_pos = b["tool_positions"].clamp(min=0, max=max_tok_idx)
+                            tool_h = H.gather(1, safe_tool_pos.unsqueeze(-1).expand(-1, -1, H.size(-1)))
+                            tl = tool_head(tool_h, H[:, 0])
+                            tl = tl.masked_fill(b["tool_positions"] < 0, -1e4)
+                            pred_tools = tl.argmax(-1)
+                            tt = b["tool_targets"]
+                            valid_tool = tt >= 0
+                            if valid_tool.any():
+                                tool_hits += int(((pred_tools == tt) & valid_tool).sum().item())
+                                n_tool += int(valid_tool.sum().item())
+
                     if b["param_positions"].size(1) == 0:
                         continue
                     max_tok_idx = max(H.size(1) - 1, 0)
@@ -1021,11 +1043,15 @@ class SpanCallTrainer(BaseTrainer):
             "abstain_acc": abs_hits / max(n_gold_abs, 1), "n_gold_abstain": float(n_gold_abs),
             "pred_abstain_rate": n_pred_abs / max(n, 1),
         }
+        if n_tool > 0:
+            res["tool_acc"] = tool_hits / n_tool
+            res["n_tool"] = float(n_tool)
         self._log_event({"event": "eval", "split": split, "stage": self.stage,
                          "step": self.global_step, **res})
+        tool_str = f" tool_acc={res.get('tool_acc', 0.0):.4f} (n={n_tool})" if n_tool > 0 else ""
         print(f"[eval:{split}] exact_payload_match={res['exact_payload_match']:.4f} n={n} | "
               f"span_acc={res['span_acc']:.4f} (n={n_span}) abstain_acc={res['abstain_acc']:.4f} "
-              f"(n={n_gold_abs}) pred_abstain_rate={res['pred_abstain_rate']:.3f}", flush=True)
+              f"(n={n_gold_abs}) pred_abstain_rate={res['pred_abstain_rate']:.3f}{tool_str}", flush=True)
         self._release_cuda_cache()
         return res
 

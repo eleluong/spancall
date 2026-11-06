@@ -237,6 +237,75 @@ class SpanCallResolver:
         """Attempts to resolve a fully-specified tool call in a single forward pass."""
         return self._resolve(schema, utterance, recent_context, now)
 
+    def predict_tool(
+        self,
+        candidate_schemas: List[ToolDefinition],
+        utterance: str,
+        recent_context: Optional[List[Dict[str, Any]]] = None,
+        now: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Directly evaluate H1 tool selection across candidate tools.
+
+        Returns a dictionary with:
+            tool_name: winning tool name
+            tool_idx: winning tool index in candidate_schemas
+            tool_prob: winning tool softmax probability
+            tool_margin: p_top1 - p_top2 margin
+            tool_scores: list of (tool_name, prob)
+            gated_hit: whether tool_margin > tau_tool
+            abstain_reason: reason if not gated_hit else None
+        """
+        if not candidate_schemas:
+            return {"tool_name": None, "tool_idx": -1, "tool_prob": 0.0, "tool_margin": 0.0,
+                    "tool_scores": [], "gated_hit": False, "abstain_reason": "no_candidates"}
+        if len(candidate_schemas) == 1:
+            return {"tool_name": candidate_schemas[0].name, "tool_idx": 0, "tool_prob": 1.0,
+                    "tool_margin": 1.0, "tool_scores": [(candidate_schemas[0].name, 1.0)],
+                    "gated_hit": True, "abstain_reason": None}
+
+        eff_budget = min(self.context_budget_tokens, max(64, self.max_seq_len // 2))
+        selected_recent, _ = select_recent_context(
+            recent_context or [],
+            candidate_schemas,
+            k_recent=self.k_recent,
+            context_budget_tokens=eff_budget,
+            tokenizer=self.tokenizer,
+        )
+        try:
+            output = self._build_multi(candidate_schemas, utterance, selected_recent, now)
+            ids, per_token = tokenize_offset_mapping(output, self.tokenizer, max_len=self.max_seq_len)
+            H, cls_h, _ids, _am = self._encode(ids, len(ids))
+        except SanitizeError as exc:
+            return {"tool_name": None, "tool_idx": -1, "tool_prob": 0.0, "tool_margin": 0.0,
+                    "tool_scores": [], "gated_hit": False, "abstain_reason": f"sanitize: {exc}"}
+
+        choices = self._tool_scores(output, H, per_token)
+        if not choices:
+            return {"tool_name": None, "tool_idx": -1, "tool_prob": 0.0, "tool_margin": 0.0,
+                    "tool_scores": [], "gated_hit": False, "abstain_reason": "no_tool_scores"}
+
+        winner_name, winner_p = choices[0]
+        margin = winner_p - (choices[1][1] if len(choices) > 1 else 0.0)
+        tau_tool = float(self._gate_cfg.get("tau_tool", 0.0))
+        gated_hit = margin > tau_tool
+
+        # Locate winner_idx by index in candidate_schemas (handles duplicate names safely)
+        winner_idx = 0
+        for idx, s in enumerate(candidate_schemas):
+            if s.name == winner_name:
+                winner_idx = idx
+                break
+
+        return {
+            "tool_name": winner_name,
+            "tool_idx": winner_idx,
+            "tool_prob": float(winner_p),
+            "tool_margin": float(margin),
+            "tool_scores": choices,
+            "gated_hit": gated_hit,
+            "abstain_reason": None if gated_hit else f"tool_margin_below_tau_tool ({margin:.3f} <= {tau_tool})",
+        }
+
     def try_resolve_candidates(
         self,
         candidate_schemas: List[ToolDefinition],
@@ -294,19 +363,17 @@ class SpanCallResolver:
         winner_name, winner_p = choices[0]
         margin = winner_p - (choices[1][1] if len(choices) > 1 else 0.0)
         tau_tool = float(self._gate_cfg.get("tau_tool", 0.0))
-        if margin <= tau_tool:
-            return ResolveResult(
-                hit=False,
-                status="abstain",
-                abstain_reason=f"tool_margin_below_tau_tool ({margin:.3f} <= {tau_tool})",
-                features=features,
-            )
-        winner = next((s for s in candidate_schemas if s.name == winner_name), None)
-        if winner is None:  # pragma: no cover - schema list and render are in lockstep
-            return ResolveResult(hit=False, status="abstain", abstain_reason="tool_winner_unknown", features=features)
+
+        winner = next((s for s in candidate_schemas if s.name == winner_name), candidate_schemas[0])
 
         res = self._resolve(winner, utterance, selected_recent, now)
         res.features.update(features)
+
+        if margin <= tau_tool:
+            res.hit = False
+            res.status = "partial" if res.payload_partial else "abstain"
+            res.abstain_reason = f"tool_margin_below_tau_tool ({margin:.3f} <= {tau_tool})"
+
         return res
 
     # ------------------------------------------------------------------ #
@@ -406,12 +473,34 @@ class SpanCallResolver:
         for p in schema.parameters:
             choice = chosen.get(p.name)
             p_abs = float(per_param_abstain_p.get(p.name, 0.0))
+            raw_ptype = (p.param_type or "string").lower()
+            is_nullable = "null" in raw_ptype
             if choice is not None:
                 ok, value, reason = self.caster.cast_choice(choice, p, output)
                 if ok:
                     span = getattr(choice, "span", None)
                     raw_prob = float(getattr(choice, "prob", 0.0))
                     conf = raw_prob * max(0.0, 1.0 - p_abs)
+                    if value is None:
+                        # Choice was explicitly <|null|>
+                        if not p.required:
+                            # Optional param: if default is provided materialize it, else omit
+                            if p.default is not None:
+                                payload[p.name] = p.default
+                                payload_partial[p.name] = p.default
+                            else:
+                                missing_optional.append(p.name)
+                        elif is_nullable:
+                            payload[p.name] = None
+                            payload_partial[p.name] = None
+                        else:
+                            # Required non-nullable received null
+                            cast_failures.append(f"{p.name}:null_for_required")
+                            missing_required.append(p.name)
+                    else:
+                        payload_partial[p.name] = value
+                        payload[p.name] = value
+
                     parameters[p.name] = ParameterResolution(
                         name=p.name,
                         value=value,
@@ -421,8 +510,6 @@ class SpanCallResolver:
                         char_span=(int(span[0]), int(span[1])) if span is not None else None,
                         p_abstain=p_abs,
                     )
-                    payload_partial[p.name] = value
-                    payload[p.name] = value
                 else:
                     cast_failures.append(f"{p.name}:{reason or 'cast_fail'}")
                     if p.required:
@@ -475,7 +562,7 @@ class SpanCallResolver:
                 if p.required:
                     c_k = 0.0
                 else:
-                    c_k = max(0.0, 1.0 - p_abs)
+                    c_k = max(p_abs, 1.0 - p_abs)
             param_probs[p.name] = float(c_k)
 
         required_params = [p for p in schema.parameters if p.required]
@@ -702,7 +789,7 @@ class SpanCallResolver:
         # ---- locate <|param|> anchors via per-token ownership --------------
         anchors: List[Tuple[str, int]] = []
         for i, e in enumerate(per_token):
-            if e is not None and e.kind == "param_anchor":
+            if e is not None and e.kind == "param_anchor" and e.value != "<|none|>":
                 anchors.append((str(e.text or ""), i))
         if not anchors:
             # fallback for heads-only tests: schema order, anchor token 0.
@@ -737,8 +824,20 @@ class SpanCallResolver:
 
         # ---- utterance pool for H4 -----------------------------------------
         utt_pool = torch.zeros(B, H.size(-1), device=device, dtype=H.dtype)
-        utt_toks = [i for i, e in enumerate(per_token)
-                    if e is not None and e.segment == "utterance"]
+        # Compute utt_toks using offsets overlapping utterance entries if available
+        u_entries = [e for e in output.entries if e.segment == "utterance"]
+        if u_entries:
+            u_start = min(e.char_start for e in u_entries)
+            u_end = max(e.char_end for e in u_entries)
+            enc = self.tokenizer(output.text, return_offsets_mapping=True, add_special_tokens=False)
+            token_offsets = enc.get("offset_mapping", [])
+            utt_toks = [
+                i for i, (tcs, tce) in enumerate(token_offsets)
+                if i < H.size(1) and tce > u_start and tcs < u_end
+            ]
+        else:
+            utt_toks = [i for i, e in enumerate(per_token)
+                        if e is not None and e.segment == "utterance"]
         if utt_toks:
             utt_pool[0] = H[0, utt_toks].mean(0)
 

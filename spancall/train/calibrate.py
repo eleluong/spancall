@@ -473,7 +473,7 @@ class SpanCallCalibrator(BaseCalibrator):
             "tau_a": float(best["tau_a"]),
             "tau_delta": float(best["tau_delta"]),
             "temperature": float(fitted_temperature),
-            "tau_tool": 0.60,
+            "tau_tool": 0.0,
             "target_precision": float(getattr(self.config, "target_precision", 0.95)),
             "confidence_level": float(getattr(self.config, "confidence_level", 0.95)),
             "n_calib": len(calib_predictions),
