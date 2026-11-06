@@ -53,7 +53,7 @@ flowchart TD
 
 - `stop_on_gate_kill=False` and the T1 E1 gate cell only *prints* — if T1 `exact_payload_match` was low, all downstream numbers are meaningless by design.
 - The "pick best checkpoint" cell falls back to `model_init` (**untrained**) with only a print warning.
-- Section 3 rewrites the canonical split files **in place** (removes >4K-token samples) — eval and training silently see different data than the hub.
+- Section 3 rewrites the canonical split files **in place** (removes >4K-token samples) — eval and training silently see different data than the hub. **Fixed**: the notebook tensorizer cell no longer filters/mutates `DATA_DIR`; >4K samples are dropped during tensorization (reported in the per-split "dropped" counter) and split outputs are cached by source-file mtime + tensorizer settings (bump `TENSORIZE_VERSION` after logic changes).
 - Calibration (§6) re-runs `predict_split` with thresholds — if calibration was skipped/failed, defaults τ_p=0.90/τ_a=0.85 (very strict for an uncalibrated accept head) apply.
 
 ## Diagnostic plan (run in order, all cheap)

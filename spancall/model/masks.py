@@ -439,11 +439,15 @@ class CandidateMaskBuilder:
         starts = [i for i, (tcs, tce) in in_toks if tcs in word_bounds or tcs == 0]
         tok_map = dict(in_toks)
         cand_set: Dict[Tuple[int, int], Candidate] = {}
+        # O(n·W) instead of O(n²): a candidate end j only counts within
+        # max_span_width of the start i, so scan the bounded window [i, i+W).
+        # in_toks is a contiguous subset of token indices — dict lookup is O(1).
         for i in starts:
             tcs_i, _ = tok_map[i]
-            for j, (_tcs_j, tce_j) in in_toks:
-                if j < i or (j - i) >= self.max_span_width:
+            for j in range(i, min(i + self.max_span_width, max_tok)):
+                if j not in tok_map:
                     continue
+                tce_j = tok_map[j][1]
                 if tce_j in word_bounds or tce_j == u_end:
                     cs_i, ce_j = tcs_i, tce_j
                     cval: Optional[str] = None
@@ -507,11 +511,13 @@ class CandidateMaskBuilder:
             ]
             tok_map = dict(in_toks)
             starts = [i for i, (tcs, tce) in in_toks if tcs in word_bounds or tcs == e.char_start]
+            # O(n·W) bounded-window scan (mirror of _free_utterance_spans)
             for i in starts:
                 tcs_i, _ = tok_map[i]
-                for j, (_tcs_j, tce_j) in in_toks:
-                    if j < i or (j - i) >= self.max_span_width:
+                for j in range(i, min(i + self.max_span_width, max_tok)):
+                    if j not in tok_map:
                         continue
+                    tce_j = tok_map[j][1]
                     if tce_j in word_bounds or tce_j == e.char_end:
                         key = (i, j, "recent")
                         if key in seen:
