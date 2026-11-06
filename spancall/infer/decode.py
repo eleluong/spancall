@@ -180,15 +180,19 @@ class ExclusivityJointDecoder(BaseJointDecoder):
             per_param[name] = choices
 
         names = list(per_param.keys())
-        ranked = self._search(names, per_param)
+        active_names = [name for name in names if per_param[name]]
+        if not active_names:
+            return {}, 0.0, {}, 0
+
+        ranked = self._search(active_names, per_param)
         if not ranked:
             return {}, 0.0, {}, 0
 
         best_score, _, best_combo = ranked[0]
         second_score = ranked[1][0] if len(ranked) > 1 else best_score
         delta = best_score - second_score
-        assignment = {name: v.value for name, v in zip(names, best_combo)}
-        chosen = {name: v for name, v in zip(names, best_combo)}
+        assignment = {name: v.value for name, v in zip(active_names, best_combo)}
+        chosen = {name: v for name, v in zip(active_names, best_combo)}
         return assignment, delta, chosen, len(ranked)
 
     # ------------------------------------------------------------------ #

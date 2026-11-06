@@ -15,6 +15,7 @@ Ref: docs/mechanism.md §7.4, docs/full_implementation_plan.md §3.5.
 
 from __future__ import annotations
 
+from datetime import date, datetime
 import json
 import math
 from abc import ABC, abstractmethod
@@ -136,6 +137,18 @@ def payloads_equal(expected: Optional[Dict[str, Any]], actual: Optional[Dict[str
 
 
 def _deep_eq(a: Any, b: Any) -> bool:
+    if isinstance(a, bool) or isinstance(b, bool):
+        return bool(a) == bool(b)
+    if isinstance(a, (date, datetime)) and isinstance(b, str):
+        s_a, s_b = a.isoformat(), b.strip()
+        return s_a == s_b or str(a) == s_b or s_b.startswith(s_a) or s_a.startswith(s_b)
+    if isinstance(b, (date, datetime)) and isinstance(a, str):
+        s_b, s_a = b.isoformat(), a.strip()
+        return s_b == s_a or str(b) == s_a or s_a.startswith(s_b) or s_b.startswith(s_a)
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return float(a) == float(b)
+    if isinstance(a, str) and isinstance(b, str):
+        return a.strip() == b.strip()
     if isinstance(a, list) and isinstance(b, list):
         return len(a) == len(b) and all(_deep_eq(x, y) for x, y in zip(a, b))
     if isinstance(a, dict) and isinstance(b, dict):

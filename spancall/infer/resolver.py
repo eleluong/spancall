@@ -52,6 +52,7 @@ class ParameterResolution:
     margin: float
     source_type: str
     char_span: Optional[tuple[int, int]] = None
+    p_abstain: float = 0.0
 
 
 @dataclass
@@ -66,6 +67,11 @@ class ResolveResult:
     abstain_reason: Optional[str] = None
     latency_ms: float = 0.0
     features: Dict[str, Any] = field(default_factory=dict)
+    status: str = "abstain"  # "hit" | "partial" | "abstain"
+    payload_partial: Dict[str, Any] = field(default_factory=dict)
+    missing_required: List[str] = field(default_factory=list)
+    missing_optional: List[str] = field(default_factory=list)
+    confidence: float = 0.0
 
 
 # --------------------------------------------------------------------------- #
@@ -189,7 +195,7 @@ class SpanCallResolver:
             tau_a=float(self._gate_cfg.get("tau_a", 0.85)),
             tau_delta=float(self._gate_cfg.get("tau_delta", 2.0)),
         )
-        self.decoder = decoder or ExclusivityJointDecoder(top_k=3, normalize_scores=True)
+        self.decoder = decoder or ExclusivityJointDecoder(top_k=3, normalize_scores=False)
         self.caster = caster or StrictTypeCaster()
         self.validator = validator or SchemaValidator()
         self.tokenizer = tokenizer or FakeTokenizer()
@@ -209,6 +215,11 @@ class SpanCallResolver:
             backbone = getattr(self.model, "backbone", None)
             if backbone is not None:
                 self.encoder = backbone
+
+        if self.model is not None and hasattr(self.model, "eval"):
+            self.model.eval()
+        if self.encoder is not None and hasattr(self.encoder, "eval"):
+            self.encoder.eval()
 
         # name -> head module cache
         self._heads: Optional[Dict[str, Any]] = None
@@ -241,13 +252,13 @@ class SpanCallResolver:
         the single-schema pipeline for the winning tool.
         """
         if not candidate_schemas:
-            return ResolveResult(hit=False, abstain_reason="no_candidates")
+            return ResolveResult(hit=False, status="abstain", abstain_reason="no_candidates")
         if len(candidate_schemas) == 1:
             return self.try_resolve(candidate_schemas[0], utterance, recent_context, now)
         if torch is None:  # pragma: no cover
-            return ResolveResult(hit=False, abstain_reason="torch_unavailable")
+            return ResolveResult(hit=False, status="abstain", abstain_reason="torch_unavailable")
         if self.encoder is None:  # pragma: no cover
-            return ResolveResult(hit=False, abstain_reason="no_model_loaded")
+            return ResolveResult(hit=False, status="abstain", abstain_reason="no_model_loaded")
 
         t0 = time.perf_counter()
         eff_budget = min(self.context_budget_tokens, max(64, self.max_seq_len // 2))
@@ -262,12 +273,12 @@ class SpanCallResolver:
             output = self._build_multi(candidate_schemas, utterance, selected_recent, now)
             ids, per_token = tokenize_offset_mapping(output, self.tokenizer, max_len=self.max_seq_len)
         except SanitizeError as exc:
-            return ResolveResult(hit=False, abstain_reason=f"sanitize: {exc}", features=dict(ctx_features))
+            return ResolveResult(hit=False, status="abstain", abstain_reason=f"sanitize: {exc}", features=dict(ctx_features))
 
         try:
             H, cls_h, _ids, _am = self._encode(ids, len(ids))
         except SanitizeError as exc:
-            return ResolveResult(hit=False, abstain_reason=f"sanitize: {exc}", features=dict(ctx_features))
+            return ResolveResult(hit=False, status="abstain", abstain_reason=f"sanitize: {exc}", features=dict(ctx_features))
         t_enc = time.perf_counter()
 
         choices = self._tool_scores(output, H, per_token)
@@ -279,19 +290,20 @@ class SpanCallResolver:
             "temperature": self.temperature,
         }
         if not choices:
-            return ResolveResult(hit=False, abstain_reason="no_tool_scores", features=features)
+            return ResolveResult(hit=False, status="abstain", abstain_reason="no_tool_scores", features=features)
         winner_name, winner_p = choices[0]
         margin = winner_p - (choices[1][1] if len(choices) > 1 else 0.0)
         tau_tool = float(self._gate_cfg.get("tau_tool", 0.0))
         if margin <= tau_tool:
             return ResolveResult(
                 hit=False,
+                status="abstain",
                 abstain_reason=f"tool_margin_below_tau_tool ({margin:.3f} <= {tau_tool})",
                 features=features,
             )
         winner = next((s for s in candidate_schemas if s.name == winner_name), None)
         if winner is None:  # pragma: no cover - schema list and render are in lockstep
-            return ResolveResult(hit=False, abstain_reason="tool_winner_unknown", features=features)
+            return ResolveResult(hit=False, status="abstain", abstain_reason="tool_winner_unknown", features=features)
 
         res = self._resolve(winner, utterance, selected_recent, now)
         res.features.update(features)
@@ -359,8 +371,26 @@ class SpanCallResolver:
         per_param_scores = outcome["per_param_scores"]           # {name: [(Candidate, p)]}
         param_names = [p.name for p in schema.parameters]
         entity_classes = {p.name: p.entity_class for p in schema.parameters if p.entity_class}
+        per_param_abstain_p = outcome.get("per_param_abstain_p", {})
+
+        # Filter out parameters where pointer-level abstain beats all R4-grouped candidates
+        active_param_scores: Dict[str, List[Tuple[Any, float]]] = {}
+        best_unfiltered: Dict[str, Tuple[Optional[Any], float]] = {}
+        abstained_params: set[str] = set()
+        for p in schema.parameters:
+            entries = per_param_scores.get(p.name) or []
+            best_cand, best_raw_p = self._best_group_candidate(entries)
+            best_unfiltered[p.name] = (best_cand, best_raw_p)
+            p_abs = float(per_param_abstain_p.get(p.name, 0.0))
+            if not entries or (p_abs > 0.0 and p_abs >= best_raw_p):
+                active_param_scores[p.name] = []
+                if entries and p_abs >= best_raw_p:
+                    abstained_params.add(p.name)
+            else:
+                active_param_scores[p.name] = entries
+
         _assignment, delta, chosen, n_valid = self.decoder.decode_detailed(
-            per_param_scores, entity_classes=entity_classes, top_k=3)
+            active_param_scores, entity_classes=entity_classes, top_k=3)
         t_post = time.perf_counter()
 
         # per-parameter margins (p_top - p_second after R4 aggregation)
@@ -369,35 +399,100 @@ class SpanCallResolver:
         # ---- 6. cast (Q4/Q5) ----------------------------------------------
         parameters: Dict[str, ParameterResolution] = {}
         payload: Dict[str, Any] = {}
+        payload_partial: Dict[str, Any] = {}
+        missing_required: List[str] = []
+        missing_optional: List[str] = []
         cast_failures: List[str] = []
         for p in schema.parameters:
             choice = chosen.get(p.name)
-            if choice is None:
+            p_abs = float(per_param_abstain_p.get(p.name, 0.0))
+            if choice is not None:
+                ok, value, reason = self.caster.cast_choice(choice, p, output)
+                if ok:
+                    span = getattr(choice, "span", None)
+                    raw_prob = float(getattr(choice, "prob", 0.0))
+                    conf = raw_prob * max(0.0, 1.0 - p_abs)
+                    parameters[p.name] = ParameterResolution(
+                        name=p.name,
+                        value=value,
+                        confidence=conf,
+                        margin=float(margins.get(p.name, 0.0)),
+                        source_type=str(getattr(choice, "region", "value")),
+                        char_span=(int(span[0]), int(span[1])) if span is not None else None,
+                        p_abstain=p_abs,
+                    )
+                    payload_partial[p.name] = value
+                    payload[p.name] = value
+                else:
+                    cast_failures.append(f"{p.name}:{reason or 'cast_fail'}")
+                    if p.required:
+                        missing_required.append(p.name)
+                    else:
+                        missing_optional.append(p.name)
+                    parameters[p.name] = ParameterResolution(
+                        name=p.name,
+                        value=None,
+                        confidence=0.0,
+                        margin=0.0,
+                        source_type="cast_fail",
+                        char_span=None,
+                        p_abstain=p_abs,
+                    )
+            else:
                 if p.required:
                     cast_failures.append(f"missing:{p.name}")
-                continue
-            ok, value, reason = self.caster.cast_choice(choice, p, output)
-            if not ok:
-                cast_failures.append(f"{p.name}:{reason or 'cast_fail'}")
-                continue
-            span = getattr(choice, "span", None)
-            parameters[p.name] = ParameterResolution(
-                name=p.name,
-                value=value,
-                confidence=float(getattr(choice, "prob", 0.0)),
-                margin=float(margins.get(p.name, 0.0)),
-                source_type=str(getattr(choice, "region", "value")),
-                char_span=(int(span[0]), int(span[1])) if span is not None else None,
-            )
-            payload[p.name] = value
+                    missing_required.append(p.name)
+                else:
+                    missing_optional.append(p.name)
+                best_cand, top_score = best_unfiltered.get(p.name, (None, 0.0))
+                cand_val = getattr(best_cand, "canon_value", None) if best_cand is not None else None
+                cs = getattr(best_cand, "char_start", -1) if best_cand is not None else -1
+                ce = getattr(best_cand, "char_end", -1) if best_cand is not None else -1
+                c_span = (int(cs), int(ce)) if (cs is not None and ce is not None and cs >= 0 and ce >= cs) else None
+                src_type = "abstain" if p.name in abstained_params else "unresolved"
+                parameters[p.name] = ParameterResolution(
+                    name=p.name,
+                    value=cand_val,
+                    confidence=float(top_score),
+                    margin=0.0,
+                    source_type=src_type,
+                    char_span=c_span,
+                    p_abstain=p_abs,
+                )
 
         # ---- 6b. schema validation (Q6) + defaults ------------------------
         valid, validation_reason = self.validator.validate(payload, schema)
-        payload = self.validator.apply_defaults(payload, schema)
+        if valid:
+            payload = self.validator.apply_defaults(payload, schema)
+
+        # ---- Continuous confidence (P2) -----------------------------------
+        param_probs: Dict[str, float] = {}
+        for p in schema.parameters:
+            p_abs = parameters[p.name].p_abstain
+            if p.name in payload_partial:
+                c_k = parameters[p.name].confidence
+            else:
+                if p.required:
+                    c_k = 0.0
+                else:
+                    c_k = max(0.0, 1.0 - p_abs)
+            param_probs[p.name] = float(c_k)
+
+        required_params = [p for p in schema.parameters if p.required]
+        if required_params:
+            n_req = len(required_params)
+            resolved_req_c = [param_probs[p.name] for p in required_params if p.name in payload_partial]
+            n_res_req = len(resolved_req_c)
+            min_res_c = min(resolved_req_c) if resolved_req_c else 0.0
+            call_confidence = float(min_res_c * (n_res_req / n_req))
+        elif schema.parameters:
+            resolved_opt_c = [param_probs[p.name] for p in schema.parameters if p.name in payload_partial]
+            call_confidence = float(min(resolved_opt_c)) if resolved_opt_c else 0.0
+        else:
+            call_confidence = 1.0
 
         # ---- 7. gate (Q8) ---------------------------------------------------
         accept_score = float(outcome.get("accept_score") or 0.0)
-        param_probs = {name: r.confidence for name, r in parameters.items()}
         h4_idx = outcome.get("reason_index")
         h4_reason = _H4_REASONS[h4_idx] if h4_idx is not None and 0 <= h4_idx < len(_H4_REASONS) else None
 
@@ -417,6 +512,13 @@ class SpanCallResolver:
         if not is_hit and gate_reason is None and h4_reason not in (None, "OK"):
             gate_reason = f"h4:{h4_reason}"
 
+        if is_hit:
+            status = "hit"
+        elif len(payload_partial) > 0:
+            status = "partial"
+        else:
+            status = "abstain"
+
         features = {
             **ctx_features,
             "pre_ms": (t_pre - t0) * 1000,
@@ -428,15 +530,20 @@ class SpanCallResolver:
             "temperature": self.temperature,
             "n_valid": int(n_valid),
             "n_params": len(schema.parameters),
-            "n_resolved": len(payload),
+            "n_resolved": len(payload_partial),
             "h4_reason": h4_reason,
             "abstain_p": outcome.get("abstain_p"),
         }
         return ResolveResult(
             hit=bool(is_hit),
+            status=status,
             tool_name=schema.name,
             payload=payload if valid else None,
+            payload_partial=payload_partial,
+            missing_required=missing_required,
+            missing_optional=missing_optional,
             parameters=parameters,
+            confidence=call_confidence,
             joint_margin=float(delta) if valid else 0.0,
             accept_score=accept_score,
             abstain_reason=gate_reason,
@@ -454,9 +561,18 @@ class SpanCallResolver:
         t0: float,
         extra_features: Optional[Dict[str, Any]] = None,
     ) -> ResolveResult:
+        params = getattr(schema, "parameters", []) or []
+        req = [p.name for p in params if getattr(p, "required", True)]
+        opt = [p.name for p in params if not getattr(p, "required", True)]
         return ResolveResult(
             hit=False,
-            tool_name=schema.name,
+            status="abstain",
+            tool_name=getattr(schema, "name", None),
+            payload=None,
+            payload_partial={},
+            missing_required=req,
+            missing_optional=opt,
+            confidence=0.0,
             abstain_reason=reason,
             latency_ms=(time.perf_counter() - t0) * 1000,
             features=dict(extra_features or {}),
@@ -649,6 +765,10 @@ class SpanCallResolver:
         abstain_p = probs[..., 0].squeeze(0)                       # (K,)
         span_p = probs[..., 1:]                                    # (1,K,C)
         outcome["abstain_p"] = float(abstain_p.mean().detach()) if K else 0.0
+        outcome["per_param_abstain_p"] = {
+            name: float(abstain_p[k].detach()) if k < len(abstain_p) else 0.0
+            for k, name in enumerate(param_names)
+        }
 
         for k, name in enumerate(param_names):
             m = cand_masks.get(name)
@@ -663,8 +783,14 @@ class SpanCallResolver:
         abst = heads.get("abstain_head")
         if abst is not None and K > 0:
             reason_logits = abst(param_h, cls_h, utt_pool)         # (1,K,R)
-            reason_idx = int(torch.softmax(reason_logits.detach(), dim=-1).argmax(-1)[0, 0])
-            outcome["reason_index"] = reason_idx
+            reason_idxs = torch.softmax(reason_logits.detach(), dim=-1).argmax(-1)[0].tolist()
+            outcome["per_param_reasons"] = {
+                param_names[k]: _H4_REASONS[int(idx)]
+                for k, idx in enumerate(reason_idxs)
+                if k < len(param_names) and 0 <= int(idx) < len(_H4_REASONS)
+            }
+            non_ok = [int(idx) for idx in reason_idxs if int(idx) != 0]
+            outcome["reason_index"] = non_ok[0] if non_ok else int(reason_idxs[0])
 
         return anchors, outcome
 
@@ -693,6 +819,25 @@ class SpanCallResolver:
                    for i in range(tp.size(-1))]
         choices.sort(key=lambda c: c[1], reverse=True)
         return choices
+
+    @staticmethod
+    def _best_group_candidate(
+        entries: Sequence[Tuple[Any, float]],
+    ) -> Tuple[Optional[Any], float]:
+        """Return ``(best_cand, best_group_raw_prob)`` after R4 equal-value aggregation."""
+        if not entries:
+            return None, 0.0
+        group_prob: Dict[str, float] = {}
+        group_best_cand: Dict[str, Tuple[Any, float]] = {}
+        for cand, score in entries:
+            s = max(float(score), 0.0)
+            gk = _groupkey(getattr(cand, "canon_value", None))
+            group_prob[gk] = group_prob.get(gk, 0.0) + s
+            prev = group_best_cand.get(gk)
+            if prev is None or s > prev[1]:
+                group_best_cand[gk] = (cand, s)
+        best_gk = max(group_prob, key=lambda k: group_prob[k])
+        return group_best_cand[best_gk][0], group_prob[best_gk]
 
     @staticmethod
     def _param_margins(

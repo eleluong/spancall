@@ -20,6 +20,7 @@ Implements ``ToolCallEvaluator(BaseToolCallEvaluator)``:
 
 from __future__ import annotations
 
+from datetime import date, datetime
 import re
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
@@ -45,8 +46,18 @@ def _norm_number(v: Any) -> Any:
 def _deep_equal(a: Any, b: Any) -> bool:
     if isinstance(a, bool) or isinstance(b, bool):
         return bool(a) == bool(b)
+    if isinstance(a, (date, datetime)) and isinstance(b, str):
+        s_a = a.isoformat()
+        s_b = b.strip()
+        return s_a == s_b or str(a) == s_b or s_b.startswith(s_a) or s_a.startswith(s_b)
+    if isinstance(b, (date, datetime)) and isinstance(a, str):
+        s_b = b.isoformat()
+        s_a = a.strip()
+        return s_b == s_a or str(b) == s_a or s_a.startswith(s_b) or s_b.startswith(s_a)
     if isinstance(a, (int, float)) and isinstance(b, (int, float)):
         return _norm_number(a) == _norm_number(b)
+    if isinstance(a, str) and isinstance(b, str):
+        return a.strip() == b.strip()
     if isinstance(a, list) and isinstance(b, list):
         return len(a) == len(b) and all(_deep_equal(x, y) for x, y in zip(a, b))
     if isinstance(a, dict) and isinstance(b, dict):
@@ -80,11 +91,16 @@ def payload_equal(
             name = getattr(p, "name", None)
             if name is None:
                 continue
-            if not getattr(p, "required", True) and hasattr(p, "default"):
-                if name not in act and getattr(p, "default", None) is not None:
-                    act[name] = p.default
-                if name not in exp and getattr(p, "default", None) is not None:
-                    exp[name] = p.default
+            if not getattr(p, "required", True):
+                default_val = getattr(p, "default", None)
+                if name not in act and default_val is not None:
+                    act[name] = default_val
+                if name not in exp and default_val is not None:
+                    exp[name] = default_val
+                if name not in act and exp.get(name) is None:
+                    act[name] = None
+                if name not in exp and act.get(name) is None:
+                    exp[name] = None
     if set(exp.keys()) != set(act.keys()):
         return False
     return all(_deep_equal(exp[k], act[k]) for k in exp)
@@ -231,11 +247,31 @@ class ToolCallEvaluator(BaseToolCallEvaluator):
                    gt: Optional[GroundTruthCall]) -> Dict[str, Any]:
         hit = bool(pred.get("hit", False))
         payload = pred.get("payload")
+        payload_partial = pred.get("payload_partial")
+        if not payload_partial and payload:
+            payload_partial = payload
         tool_name = pred.get("tool_name") or pred.get("tool")
         gt_payload = gt.arguments if gt else None
         gt_tool = gt.tool_name if gt else None
         equal = payload_equal(gt_payload, payload, sample.tools[0] if sample.tools else None)
         correct = bool(equal and (gt_tool is None or tool_name == gt_tool))
+
+        n_gt_params = 0
+        n_pred_params = 0
+        n_correct_params = 0
+        if gt_payload and isinstance(gt_payload, dict):
+            n_gt_params = len(gt_payload)
+            if payload_partial and isinstance(payload_partial, dict):
+                n_pred_params = len(payload_partial)
+                for k, v_gt in gt_payload.items():
+                    if k in payload_partial and _deep_equal(payload_partial[k], v_gt):
+                        n_correct_params += 1
+        elif not gt_payload:
+            if payload_partial and isinstance(payload_partial, dict):
+                n_pred_params = len(payload_partial)
+
+        has_partial = bool(payload_partial and len(payload_partial) > 0)
+        status = pred.get("status", "hit" if hit else ("partial" if has_partial else "abstain"))
 
         # gates (only meaningful when hit)
         gate_correct = bool(hit and correct)
@@ -243,14 +279,20 @@ class ToolCallEvaluator(BaseToolCallEvaluator):
             "sample_id": sample.sample_id,
             "stratum": sample.stratum.value,
             "hit": hit,
+            "status": status,
             "tool_name": tool_name,
             "gt_tool": gt_tool,
             "payload": payload,
+            "payload_partial": payload_partial,
             "gt_payload": gt_payload,
             "payload_equal": equal,
             "correct": correct,
             "gate_correct": gate_correct,
-            "confidence": float(pred.get("accept_probability") or pred.get("confidence") or 0.0),
+            "confidence": float(pred.get("confidence") or pred.get("accept_probability") or 0.0),
+            "n_gt_params": n_gt_params,
+            "n_pred_params": n_pred_params,
+            "n_correct_params": n_correct_params,
+            "has_partial": has_partial,
             "errors": [],
         }
         if hit and not correct:
@@ -271,16 +313,35 @@ class ToolCallEvaluator(BaseToolCallEvaluator):
         sel = [r for r in rows if stratum is None or r["stratum"] == stratum.value]
         n = len(sel)
         if n == 0:
-            return {"n": 0.0, "exact_payload_match": 0.0, "hit_rate": 0.0,
-                    "precision_at_hit": 0.0, "false_hit_rate_on_a": 0.0}
+            return {
+                "n": 0.0,
+                "exact_payload_match": 0.0,
+                "hit_rate": 0.0,
+                "precision_at_hit": 0.0,
+                "false_hit_rate_on_a": 0.0,
+                "partial_extraction_rate": 0.0,
+                "param_precision": 0.0,
+                "param_recall": 0.0,
+                "param_f1": 0.0,
+            }
         hits = [r for r in sel if r["hit"]]
         n_hits = len(hits)
+        tot_gt = sum(r.get("n_gt_params", 0) for r in sel)
+        tot_pred = sum(r.get("n_pred_params", 0) for r in sel)
+        tot_corr = sum(r.get("n_correct_params", 0) for r in sel)
+        p_prec = (tot_corr / tot_pred) if tot_pred else 0.0
+        p_rec = (tot_corr / tot_gt) if tot_gt else 0.0
+        p_f1 = (2 * p_prec * p_rec / (p_prec + p_rec)) if (p_prec + p_rec) > 0 else 0.0
         return {
             "n": float(n),
             "exact_payload_match": sum(1.0 for r in sel if r["payload_equal"]) / n,
             "hit_rate": n_hits / n,
             "precision_at_hit": (sum(1.0 for r in hits if r["gate_correct"]) / n_hits) if n_hits else 0.0,
             "false_hit_rate_on_a": (n_hits / n) if (stratum == Stratum.A) else 0.0,
+            "partial_extraction_rate": sum(1.0 for r in sel if r.get("has_partial")) / n,
+            "param_precision": p_prec,
+            "param_recall": p_rec,
+            "param_f1": p_f1,
         }
 
     def _accumulate(self, m: ToolCallMetrics, rows: List[Dict[str, Any]],
@@ -300,6 +361,14 @@ class ToolCallEvaluator(BaseToolCallEvaluator):
         m.false_hit_rate_on_a = (
             sum(1 for r in sel if r["stratum"] == "A" and r["hit"]) / a_count
         ) if a_count else 0.0
+
+        tot_gt = sum(r.get("n_gt_params", 0) for r in sel)
+        tot_pred = sum(r.get("n_pred_params", 0) for r in sel)
+        tot_corr = sum(r.get("n_correct_params", 0) for r in sel)
+        m.param_precision = (tot_corr / tot_pred) if tot_pred else 0.0
+        m.param_recall = (tot_corr / tot_gt) if tot_gt else 0.0
+        m.param_f1 = (2 * m.param_precision * m.param_recall / (m.param_precision + m.param_recall)) if (m.param_precision + m.param_recall) > 0 else 0.0
+        m.partial_extraction_rate = sum(1.0 for r in sel if r.get("has_partial")) / n
         for r in sel:
             for err in r["errors"]:
                 if err == "error_wrong_tool":

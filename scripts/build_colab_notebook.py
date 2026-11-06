@@ -704,6 +704,9 @@ resolver = SpanCallResolver(
 )
 if DEVICE in ("cuda", "mps"):
     model.to(DEVICE)
+model.eval()
+if encoder is not None and hasattr(encoder, "eval"):
+    encoder.eval()
 print("resolver ready (checkpoint =", CHECKPOINT_DIR, ")")'''
 
 CODE_PREDICT_SPLIT = '''def predict_split(split_name: str, out_path: str, limit: Optional[int] = None) -> None:
@@ -723,9 +726,15 @@ CODE_PREDICT_SPLIT = '''def predict_split(split_name: str, out_path: str, limit:
             preds.append({
                 "sample_id": s.sample_id,
                 "hit": bool(res.hit),
+                "status": getattr(res, "status", "hit" if res.hit else "abstain"),
                 "payload": res.payload,
+                "payload_partial": getattr(res, "payload_partial", {}),
+                "missing_required": getattr(res, "missing_required", []),
+                "missing_optional": getattr(res, "missing_optional", []),
                 "tool_name": res.tool_name,
+                "confidence": float(getattr(res, "confidence", res.accept_score)),
                 "accept_probability": float(res.accept_score),
+                "abstain_reason": res.abstain_reason,
             })
             n += 1
             if limit is not None and n >= limit:
@@ -733,7 +742,7 @@ CODE_PREDICT_SPLIT = '''def predict_split(split_name: str, out_path: str, limit:
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w") as fh:
         for p in preds:
-            fh.write(json.dumps(p) + "\\n")
+            fh.write(json.dumps(p, default=str) + "\\n")
     print(f"predicted {n} rows → {out_path}")
 
 # In-domain eval split (small for speed)
@@ -769,12 +778,17 @@ if os.path.exists(src):
             s = UnifiedSample.from_dict(json.loads(line))
             res = resolver.try_resolve_candidates(s.tools, s.utterance, s.recent_context, s.current_time_iso)
 
-            # per-param probabilities (only available for resolved params)
-            param_probs = {p.name: float(p.confidence) for p in res.parameters.values()}
+            # per-param gate probabilities (0.0 for missing required params)
+            missing_req = set(getattr(res, "missing_required", []) or [])
+            param_probs = {
+                p.name: (0.0 if p.name in missing_req else float(p.confidence))
+                for p in res.parameters.values()
+            }
             preds.append({
                 "sample_id": s.sample_id,
                 "tool_name": res.tool_name,
                 "payload": res.payload,
+                "payload_partial": getattr(res, "payload_partial", {}),
                 "param_probabilities": param_probs,
                 "joint_margin": float(res.joint_margin),
                 "accept_probability": float(res.accept_score),
@@ -786,10 +800,10 @@ if os.path.exists(src):
 
 with open(CALIB_DATA, "w") as fh:
     for p in preds:
-        fh.write(json.dumps(p) + "\\n")
+        fh.write(json.dumps(p, default=str) + "\\n")
 with open(CALIB_GT, "w") as fh:
     for g in gts:
-        fh.write(json.dumps(g) + "\\n")
+        fh.write(json.dumps(g, default=str) + "\\n")
 print(f"wrote {len(preds)} calib rows → {CALIB_DATA}")'''
 
 CODE_CALIB_RUN = '''CALIB_REPORT = os.path.join(CHECKPOINT_DIR or RESULTS_DIR, "calibration_report.json")
@@ -863,12 +877,15 @@ for label, path in [
         "exact_payload_match": round(m.get("exact_payload_match", 0.0), 3),
         "hit_rate": round(m.get("hit_rate", 0.0), 3),
         "precision_at_hit": round(m.get("precision_at_hit", 0.0), 3),
+        "param_P": round(m.get("param_precision", 0.0), 3),
+        "param_R": round(m.get("param_recall", 0.0), 3),
+        "param_F1": round(m.get("param_f1", 0.0), 3),
         "false_hit_on_A": round(m.get("false_hit_rate_on_a", 0.0), 4),
         "ECE": round(m.get("ece", 0.0), 4),
     })
 
 if rows:
-    headers = ["system", "n", "exact_payload_match", "hit_rate", "precision_at_hit", "false_hit_on_A", "ECE"]
+    headers = ["system", "n", "exact_payload_match", "hit_rate", "precision_at_hit", "param_P", "param_R", "param_F1", "false_hit_on_A", "ECE"]
     print(" | ".join(headers))
     print("-|" * len(headers))
     for r in rows:

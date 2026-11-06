@@ -12,12 +12,14 @@ from __future__ import annotations
 import json
 import time
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from spancall.agent.backends.base import BaseLLMBackend
 from spancall.agent.trace import RoutingDecision, StepTrace
 from spancall.data.schema import ToolDefinition
-from spancall.infer.resolver import ResolveResult, SpanCallResolver
+
+if TYPE_CHECKING:
+    from spancall.infer.resolver import ResolveResult, SpanCallResolver
 
 
 class RouterMode(str, Enum):
@@ -94,14 +96,24 @@ class ToolCallRouter:
             if not res.hit:
                 trace = self._trace(t0, utterance, RoutingDecision.SPANCALL_ABSTAIN, res)
                 return (
-                    {"hit": False, "abstain_reason": res.abstain_reason,
-                     "tool_name": res.tool_name, "arguments": None, "spancall": False},
+                    {"hit": False, "status": getattr(res, "status", "abstain"),
+                     "abstain_reason": res.abstain_reason,
+                     "tool_name": res.tool_name, "arguments": None,
+                     "payload_partial": dict(getattr(res, "payload_partial", {}) or {}),
+                     "missing_required": list(getattr(res, "missing_required", []) or []),
+                     "confidence": float(getattr(res, "confidence", 0.0)),
+                     "spancall": False},
                     trace,
                 )
             trace = self._trace(t0, utterance, RoutingDecision.SPANCALL_HIT, res)
             return (
-                {"hit": True, "tool_name": res.tool_name, "arguments": res.payload,
-                 "payload": res.payload, "spancall": True},
+                {"hit": True, "status": "hit",
+                 "tool_name": res.tool_name, "arguments": res.payload,
+                 "payload": res.payload,
+                 "payload_partial": dict(getattr(res, "payload_partial", None) or res.payload or {}),
+                 "missing_required": [],
+                 "confidence": float(getattr(res, "confidence", 1.0)),
+                 "spancall": True},
                 trace,
             )
 

@@ -18,6 +18,12 @@ class ToolCallMetrics:
     per_param_accuracy: float = 0.0
     exact_payload_match: float = 0.0
 
+    # Partial extraction performance (P5)
+    partial_extraction_rate: float = 0.0
+    param_precision: float = 0.0
+    param_recall: float = 0.0
+    param_f1: float = 0.0
+
     # Gating and coverage
     hit_rate: float = 0.0
     precision_at_hit: float = 0.0
