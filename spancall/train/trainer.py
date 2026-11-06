@@ -53,6 +53,7 @@ import json
 import math
 import os
 import subprocess
+import time
 from dataclasses import asdict, is_dataclass
 from abc import ABC, abstractmethod
 from contextlib import nullcontext
@@ -62,6 +63,18 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+
+try:  # tqdm.auto picks the notebook widget in Jupyter/Colab, text bar in a terminal
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - tqdm is optional
+    class tqdm:  # type: ignore[no-redef]
+        def __init__(self, iterable=None, **kw): self.iterable = iterable
+        def __iter__(self): return iter(self.iterable or [])
+        def update(self, n=1): pass
+        def set_postfix(self, *a, **kw): pass
+        def close(self): pass
+        @staticmethod
+        def write(msg, *a, **kw): print(msg, flush=True)
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
@@ -646,17 +659,61 @@ class SpanCallTrainer(BaseTrainer):
         rows = self.tensorize_rows(data)
         if not rows:
             return {"loss": float("nan")}
-        rng = torch.Generator().manual_seed(self.config.seed + self.global_step)
         steps = 0
-        for _ in range(num_epochs):
-            for batch_list in self.make_batches(rows, self.config.optimization.batch_size, shuffle=True, rng=None):
+        losses: Dict[str, float] = {}
+        bs = self.config.optimization.batch_size
+        steps_per_epoch = max((len(rows) + bs - 1) // bs, 1)
+        total_steps = steps_per_epoch * num_epochs
+        log_every = max(int(getattr(self.config, "log_every", 0) or 0), 0) or max(total_steps // 100, 1)
+        t_start = time.time()
+        print(f"[train:{stage}] start: rows={len(rows)} epochs={num_epochs} "
+              f"steps/epoch={steps_per_epoch} total_steps={total_steps} bs={bs}", flush=True)
+        self._log_event({"event": "stage_start", "stage": stage, "rows": len(rows),
+                         "epochs": num_epochs, "total_steps": total_steps})
+        run_sum: Dict[str, float] = {}
+        run_n = 0
+        pbar = tqdm(total=total_steps, desc=f"train[{stage}]", dynamic_ncols=True, leave=True)
+        for epoch in range(1, num_epochs + 1):
+            ep_sum, ep_n = 0.0, 0
+            for batch_list in self.make_batches(rows, bs, shuffle=True, rng=None):
                 if len(batch_list) == 0:
                     continue
                 batch = self.collate(batch_list)
                 losses = self.train_step(batch)
                 steps += 1
                 self.history["train_loss"].append({**losses, "stage": stage, "step": self.global_step})
+                for k, v in losses.items():
+                    run_sum[k] = run_sum.get(k, 0.0) + v
+                run_n += 1
+                if math.isfinite(losses.get("loss", float("nan"))):
+                    ep_sum += losses["loss"]
+                    ep_n += 1
+                pbar.update(1)
+                pbar.set_postfix(ep=f"{epoch}/{num_epochs}", loss=f"{losses.get('loss', float('nan')):.4f}",
+                                 lr=f"{self.optimizer.param_groups[-1]['lr']:.1e}" if self.optimizer is not None else "n/a")
+                if steps % log_every == 0 or steps == total_steps:
+                    avg = {k: v / run_n for k, v in run_sum.items()}
+                    elapsed = time.time() - t_start
+                    lr = self.optimizer.param_groups[-1]["lr"] if self.optimizer is not None else float("nan")
+                    self._log_event({"event": "train", "stage": stage, "epoch": epoch, "step": self.global_step,
+                                     "stage_step": steps, "lr": lr, "elapsed_s": elapsed, **avg})
+                    run_sum, run_n = {}, 0
+            tqdm.write(f"[train:{stage}] epoch {epoch}/{num_epochs} done: "
+                       f"mean_loss={ep_sum / max(ep_n, 1):.4f}")
+            self._log_event({"event": "epoch_end", "stage": stage, "epoch": epoch,
+                             "mean_loss": ep_sum / max(ep_n, 1)})
+        pbar.close()
         return {"loss": losses.get("loss", float("nan")), "steps": float(steps)} if steps else {"loss": float("nan"), "steps": 0.0}
+
+    def _log_event(self, rec: Dict[str, Any]) -> None:
+        """Append one JSON line to ``<output_dir>/<exp>_seed<seed>/train_log.jsonl`` (never raises)."""
+        try:
+            d = Path(self.config.output_dir) / f"{self.config.experiment_name}_seed{self.config.seed}"
+            d.mkdir(parents=True, exist_ok=True)
+            with open(d / "train_log.jsonl", "a") as fh:
+                fh.write(json.dumps({"ts": datetime.now(timezone.utc).isoformat(), **rec}, default=str) + "\n")
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     # Mixed precision + stage helpers
@@ -683,14 +740,10 @@ class SpanCallTrainer(BaseTrainer):
             groups, self.config.optimization.learning_rate_head * lr_scale,
         )
         self.optimizer.zero_grad(set_to_none=True)
-        total_steps = max(
-            int(
-                self.config.optimization.num_epochs
-                * 1_000
-                / max(self.config.optimization.batch_size, 1)
-            ),
-            1,
-        )
+        total_steps = max(int(getattr(self, "_sched_total_steps", 0) or 0), 1) if getattr(
+            self, "_sched_total_steps", 0) else max(
+            int(self.config.optimization.num_epochs * 1_000
+                / max(self.config.optimization.batch_size, 1)), 1)
         warmup = max(int(total_steps * self.config.optimization.warmup_ratio), 1)
         self.scheduler = CosineWarmupSchedule(self.optimizer, warmup, total_steps)
         return groups
@@ -750,6 +803,9 @@ class SpanCallTrainer(BaseTrainer):
                 continue
 
             n_epochs = 2 if len(data) < 2_000 else self.config.optimization.num_epochs
+            # real stage length -> LR warmup/cosine schedule matches the actual run
+            bs_ = max(self.config.optimization.batch_size, 1)
+            self._sched_total_steps = ((len(data) + bs_ - 1) // bs_) * n_epochs
             frozen_stages = getattr(self.config, "freeze_encoder_stages", None) or []
             if stage == "C":
                 self._freeze_all_but_correctness()
@@ -778,14 +834,16 @@ class SpanCallTrainer(BaseTrainer):
                     summary["T1"]["gate_proceed"] = bool(self.stage_gates["T1"])
                     summary["T1"]["gate_kill"] = bool(m < 0.80)
             self.history[stage] = summary[stage]
+            print(f"[train:{stage}] finished: {summary[stage]}", flush=True)
+            self._log_event({"event": "stage_end", "stage": stage, **{k: v for k, v in summary[stage].items()}})
 
             # periodic checkpointing
             try:
                 out = Path(self.config.output_dir)
                 cp = out / f"{self.config.experiment_name}_seed{self.config.seed}" / stage / "checkpoints"
                 self.save_checkpoint(str(cp))
-            except Exception:  # checkpointing must never kill training
-                pass
+            except Exception as exc:  # checkpointing must never kill training
+                print(f"[train:{stage}] WARNING: checkpoint failed: {exc!r}", flush=True)
         return summary
 
     def evaluate(self, split: str = "dev") -> Dict[str, float]:
@@ -797,27 +855,38 @@ class SpanCallTrainer(BaseTrainer):
         self.model.eval()
         hits = 0.0
         n = 0
+        # Same autocast context as train_step: the encoder emits bf16 hidden
+        # states while head params are fp32 -> LayerNorm dtype mismatch otherwise.
+        t0 = time.time()
         with torch.no_grad():
-            for batch_list in self.make_batches(rows, self.config.optimization.batch_size):
+            for bi, batch_list in enumerate(tqdm(
+                    list(self.make_batches(rows, self.config.optimization.batch_size)),
+                    desc=f"eval[{split}]", dynamic_ncols=True, leave=False), 1):
                 batch = self.collate(batch_list)
                 b = {k: v.to(self.device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
-                H = self.encoder(b["input_ids"], b["attention_mask"], b.get("token_type_ids"))
-                if b["param_positions"].size(1) == 0:
-                    continue
-                max_tok_idx = max(H.size(1) - 1, 0)
-                safe_param_pos = b["param_positions"].clamp(min=0, max=max_tok_idx)
-                param_h = H.gather(1, safe_param_pos.unsqueeze(-1).expand(-1, -1, H.size(-1)))
-                p = self.model.pointer_head(
-                    param_h, H,
-                    candidate_masks={"starts": b["cand_starts"], "ends": b["cand_ends"]},
-                )
+                with self._amp():
+                    H = self.encoder(b["input_ids"], b["attention_mask"], b.get("token_type_ids"))
+                    if b["param_positions"].size(1) == 0:
+                        continue
+                    max_tok_idx = max(H.size(1) - 1, 0)
+                    safe_param_pos = b["param_positions"].clamp(min=0, max=max_tok_idx)
+                    param_h = H.gather(1, safe_param_pos.unsqueeze(-1).expand(-1, -1, H.size(-1)))
+                    p = self.model.pointer_head(
+                        param_h, H,
+                        candidate_masks={"starts": b["cand_starts"], "ends": b["cand_ends"]},
+                    )
+                p = {k: (v.float() if isinstance(v, torch.Tensor) else v) for k, v in p.items()}
                 starts = b["cand_starts"].clamp(min=0)
                 ends = b["cand_ends"].clamp(min=0)
                 z = torch.cat([p["abstain_logits"].unsqueeze(-1), p["span_logits"]], dim=-1)
                 acc_i, acc_t, valid = self.exact_payload_match(z, starts, ends, b["pos_indices"])
                 hits += float((acc_t * valid).sum().item())
                 n += int(valid.sum().item())
-        return {"exact_payload_match": hits / max(n, 1), "n": float(n)}
+        res = {"exact_payload_match": hits / max(n, 1), "n": float(n)}
+        self._log_event({"event": "eval", "split": split, "stage": self.stage,
+                         "step": self.global_step, **res})
+        print(f"[eval:{split}] exact_payload_match={res['exact_payload_match']:.4f} n={n}", flush=True)
+        return res
 
     # ------------------------------------------------------------------ #
     # Checkpointing
