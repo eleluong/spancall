@@ -714,8 +714,13 @@ class SpanCallResolver:
         with torch.no_grad():
             H = self.encoder(input_ids, attention_mask)                # (1, L, d)
         if self.model is not None:
+            # The encoder lives under ``backbone`` in SpanCallModel (not
+            # ``encoder``), and a bf16-trained checkpoint keeps fp32 head
+            # params (the trainer runs autocast at train time; the resolver
+            # must unify explicitly). Grab the first *head* parameter.
             head_p = next(
-                (p for n, p in self.model.named_parameters() if not n.startswith("encoder.")),
+                (p for n, p in self.model.named_parameters()
+                 if not n.startswith(("encoder.", "backbone."))),
                 None,
             )
             if head_p is not None and H.dtype != head_p.dtype:

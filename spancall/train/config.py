@@ -151,9 +151,17 @@ class DataConfig:
     when the measured tool-ambiguity slice of stratum F exceeds ~10% (E0/E7
     telemetry); the multi-call slice separately gates the list heads (H2/H6).
     Unknown keys in the YAML ``data`` section are tolerated (forward compat).
+
+    ``fraction`` (default 1.0): the fraction of each tensorized split used by
+    the trainer. Applied deterministically (seeded by ``experiment.seed``) in
+    :meth:`spancall.train.trainer.SpanCallTrainer.load_rows`, so it scales
+    **training and dev/calib evaluation together** — set ``data.fraction: 0.2``
+    to smoke-test the whole pipeline end-to-end on 20% of the data (see
+    ``configs/verify20.yaml``).
     """
 
     pack_tools: int = 1
+    fraction: float = 1.0
     recent: RecentConfig = field(default_factory=RecentConfig)
 
     @classmethod

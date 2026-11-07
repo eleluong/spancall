@@ -1,0 +1,55 @@
+# Pipeline verification config: run the FULL pipeline on 20% of the data.
+#
+# Purpose: a fast, GPU-cheap end-to-end smoke test that exercises every stage
+# (tensorize → T0/T1/T2/C training → calib → eval → test) without waiting for
+# the full corpus. Use it to confirm the pipeline *works* before launching the
+# full ``configs/default.yaml`` / ``configs/colab.yaml`` run.
+#
+# How it works:
+#   - ``data.fraction: 0.2`` → the trainer subsamples every split (train AND
+#     dev/calib eval) to 20% via a deterministic seeded sampler in
+#     ``SpanCallTrainer.load_rows`` (seed from ``experiment.seed``), so results
+#     are reproducible across reruns.
+#   - ``experiment.data_dir`` should point at the tensorized splits dir (the
+#     tensorizer must already have produced them; pad sizes match the sample
+#     ratio since training/dev shrink together).
+#
+# To run directly (no notebook):
+#   python scripts/train.py --config configs/verify20.yaml \
+#       --data_dir data/tensorized --output_dir results_verify20 --stages T0,T1,T2,C
+#
+# To use inside the notebook: set DATA_FRACTION = 0.2 in the tensorizer / config
+# cells, or merge this file's `data.fraction` into configs/colab.yaml.
+
+experiment:
+  name: "spancall_verify20"
+  seed: 42
+  output_dir: "results_verify20"
+  data_dir: "data/tensorized"
+
+data:
+  # 20% of every split (train + dev + calib eval) — deterministic per seed.
+  fraction: 0.2
+
+optimization:
+  # Small enough to finish in minutes on a single GPU; scale up when verifying.
+  num_epochs: 2
+  batch_size: 8
+  learning_rate_encoder: 3.0e-5
+  learning_rate_head: 1.0e-4
+  mixed_precision: "bf16"
+
+model:
+  backbone_name: "Qwen/Qwen3-Embedding-0.6B"
+  head_dim: 256
+  max_seq_len: 4096
+  max_span_width: 16
+  dropout: 0.1
+  heads: { tool: true, count: false, pointer: true, abstain_reason: true,
+           source: false, list_size: false, swap: false, correctness: true }
+
+training:
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: true
+  freeze_encoder_stages: []
+  checkpoint_every_n_steps: 200

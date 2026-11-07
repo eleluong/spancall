@@ -705,6 +705,13 @@ class SpanCallTrainer(BaseTrainer):
 
         Falls back to a no-op empty list when the file is absent so tests /
         dry runs can inject synthetic rows directly.
+
+        Honors ``config.data.fraction`` (default 1.0): when < 1.0 the rows are
+        subsampled **deterministically** with ``random.Random(config.seed)``
+        (stable across reruns, no duplicate rows). Because both ``_stage_data``
+        and ``evaluate`` load through here, the fraction scales the training
+        split *and* the dev/calib eval splits together — the intended "verify
+        the whole pipeline on N% of the data" knob (``configs/verify20.yaml``).
         """
         data_dir = getattr(self.config, "data_dir", None) or "data/processed"
         path = Path(data_dir) / f"{split}.jsonl"
@@ -720,6 +727,14 @@ class SpanCallTrainer(BaseTrainer):
                     continue
                 d = _json.loads(line)
                 rows.append(d)
+
+        frac = float(getattr(getattr(self.config, "data", None), "fraction", 1.0) or 1.0)
+        if frac < 1.0:
+            import random
+
+            rng = random.Random(int(getattr(self.config, "seed", 42)))
+            n = max(int(len(rows) * frac), 1)
+            rows = [rows[i] for i in sorted(rng.sample(range(len(rows)), min(n, len(rows))))]
         return rows
 
     def tensorize_rows(self, rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:

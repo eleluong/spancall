@@ -634,6 +634,11 @@ CODE_COLAB_CFG = '''import yaml, os
 
 EXPERIMENT_NAME = "spancall_colab"
 SEED = 42
+# Pipeline verification knob: ``data.fraction`` scales EVERY split
+# (train + dev/calib eval) deterministically (seeded by SEED) inside
+# ``SpanCallTrainer.load_rows``. 1.0 = full data; 0.2 = quick 20% sanity
+# run that exercises tensorize -> T0/T1/T2/C -> eval -> test end-to-end.
+DATA_FRACTION = 0.2
 
 with open("configs/default.yaml") as fh:
     cfg = yaml.safe_load(fh)
@@ -653,10 +658,13 @@ cfg["training"]["gradient_checkpointing"] = True
 cfg["model"]["freeze_encoder_stages"] = []
 cfg["model"]["max_seq_len"] = MAX_SEQ_LEN
 
+# fraction < 1 -> deterministic 20% subsample of every split (verify mode)
+cfg.setdefault("data", {})["fraction"] = DATA_FRACTION
+
 out = "configs/colab.yaml"
 with open(out, "w") as fh:
     yaml.safe_dump(cfg, fh)
-print(f"wrote {out} (epochs={NUM_EPOCHS}, bs=8, accum=4, bf16=True, freeze=[])")
+print(f"wrote {out} (epochs={NUM_EPOCHS}, bs=8, accum=4, bf16=True, freeze=[], data_fraction={DATA_FRACTION})")
 CONFIG_PATH = out'''
 
 CODE_TRAIN_RUN = '''# Direct in-notebook training execution (provides live logging and full native tracebacks)
