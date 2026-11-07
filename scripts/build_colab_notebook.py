@@ -101,11 +101,85 @@ TEST_SPLITS   = ["hermes_test_ood_schema", "hermes_test_ood_para", "hermes_test_
 import torch
 DEVICE = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
 
+# ============================================================================
+# SINGLE SOURCE OF TRUTH - every "what data to process / train on" knob.
+# Everything below is defined BEFORE any download, filtering, or tensorization
+# runs, so changing a knob NEVER requires re-downloading or re-processing data
+# that was built under a different config. Canonical splits in DATA_DIR are
+# never rewritten by later cells.
+# ============================================================================
+
+EXPERIMENT_NAME = "spancall_colab"
+SEED            = 42                 # seeds ALL deterministic subsampling
+                                     # (must equal trainer seed for reproducibility)
+
+# --- model / tensorization budget ---
+BACKBONE       = "Qwen/Qwen3-Embedding-0.6B"   # encoder + tokenizer backbone
+MAX_SEQ_LEN    = 4096                # rows whose tokenized input exceeds this are
+                                     # dropped during tensorization (reported in the
+                                     # summary - NEVER written back over source splits)
+MAX_SPAN_WIDTH = 16                  # candidate span width cap (mask builder)
+MAX_POS        = 3                   # positive slots per param (pointer P in v1 loss);
+                                     # part of the config fingerprint because changing
+                                     # it after rows exist would mis-pad pos_indices.
+
+# --- which canonical split feeds each trainer split ---
+SPLIT_INPUTS = {
+    "t0":       "hermes_train.jsonl",
+    "t1":       "hermes_train.jsonl",
+    "t2":       "hermes_train.jsonl",
+    "stage_c":  "hermes_calib.jsonl",
+    "dev":      "hermes_dev.jsonl",
+    "calib":    "hermes_calib.jsonl",
+}
+
+# --- hard caps on samples tensorized per split (None = all) ---
+SAMPLE_LIMITS = {"t0": None, "t1": None, "t2": None, "stage_c": None, "dev": None, "calib": None}
+
+# --- how much of each split to tensorize ---
+# Applied BEFORE tensorization via a seeded row selection that mirrors
+# SpanCallTrainer.load_rows exactly (random.Random(SEED), n = N*frac,
+# sorted rng.sample) so a 0.2 run tensorizes 20% instead of tensorizing 100%
+# and only then training on 20%. When DATA_FRACTION < 1.0 the trainer must run
+# with data.fraction = 1.0 (see cell §4) because the tensorized files ALREADY
+# are the subset.
+DATA_FRACTION = 0.2                  # 1.0 = full data; <1.0 = seeded quick run
+
+# --- parallel tensorization ---
+TENSORIZE_WORKERS = max(1, min(os.cpu_count() or 1, 16))  # fork pool size for the
+                                         # tensorize loop. Output is deterministic
+                                         # regardless of this value (rows keep input order).
+
+# --- eval / test sample caps at inference time ---
+EVAL_LIMIT     = 500                 # param-extraction / tool-pred / e2e eval
+TEST_LIMIT     = 200                 # predictions per OOD/adversarial test split
+
+# --- dataset re-pull ---
+FORCE_HF_DOWNLOAD = False            # True -> always re-pull canonical splits from HF
+
+# ============================================================================
+# CONFIG SUMMARY - the run's data contract is explicit up front.
+# ============================================================================
+print("=" * 72)
+print("DATA CONFIG (single source of truth, defined before any processing)")
+print("=" * 72)
+print(f"EXPERIMENT_NAME = {EXPERIMENT_NAME}  SEED = {SEED}")
+print(f"BACKBONE        = {BACKBONE}")
+print(f"MAX_SEQ_LEN     = {MAX_SEQ_LEN}  MAX_SPAN_WIDTH = {MAX_SPAN_WIDTH}  MAX_POS = {MAX_POS}")
+print("SPLIT_INPUTS:")
+for k, v in SPLIT_INPUTS.items():
+    print(f"  {k:<9} <- {v}   (limit={SAMPLE_LIMITS.get(k)})")
+print(f"DATA_FRACTION   = {DATA_FRACTION}  (seeded row selection BEFORE tensorization)")
+print(f"TENSORIZE_WORKERS = {TENSORIZE_WORKERS}  (parallel tensorize pool)")
+print(f"EVAL_LIMIT      = {EVAL_LIMIT}  TEST_LIMIT = {TEST_LIMIT}")
+print(f"FORCE_HF_DOWNLOAD = {FORCE_HF_DOWNLOAD}")
+
 print(f"PROJECT_ROOT  = {PROJECT_ROOT}")
 print(f"HF_DATASET_ID = {HF_DATASET_ID} (token={'set' if HF_TOKEN else 'unset'})")
 print(f"DATA_DIR      = {DATA_DIR}")
 print(f"TENSOR_DIR    = {TENSOR_DIR}")
-print(f"DEVICE        = {DEVICE}")'''
+print(f"DEVICE        = {DEVICE}")
+'''
 
 MARKDOWN_ENV = """---
 ## 1. Runtime & Package Check
@@ -156,7 +230,6 @@ CANONICAL_SPLITS = [
     "hermes_test_adversarial.jsonl",
 ]
 
-FORCE_HF_DOWNLOAD = False  # set True to always re-pull from Hugging Face Hub
 
 os.makedirs(DATA_DIR, exist_ok=True)
 missing = [f for f in CANONICAL_SPLITS if not os.path.exists(os.path.join(DATA_DIR, f))]
@@ -233,9 +306,8 @@ from spancall.model.masks import CandidateMaskBuilder
 H4_REASONS = ("OK", "ABSENT", "AMBIGUOUS", "NEEDS_REASONING", "OFF_WINDOW")
 STRATUM_ABSTAIN = {Stratum.A}                       # absent/unresolvable → abstain row
 
-BACKBONE = "Qwen/Qwen3-Embedding-0.6B"
-MAX_SEQ_LEN, MAX_SPAN_WIDTH = 4096, 16
 
+# BACKBONE / MAX_SEQ_LEN / MAX_SPAN_WIDTH come from cell §0b (single config source)
 tokenizer = AutoTokenizer.from_pretrained(BACKBONE, use_fast=True)
 tokenizer.add_special_tokens({"additional_special_tokens": list(SPECIAL_MARKER_TOKENS)})
 mask_builder = CandidateMaskBuilder(max_seq_len=MAX_SEQ_LEN, max_span_width=MAX_SPAN_WIDTH)
@@ -268,8 +340,6 @@ def _h4(s: UnifiedSample, param: str, default: str = "OK") -> int:
     return H4_REASONS.index(val) if val in H4_REASONS else 0
 
 
-MAX_POS = 3   # positive slots per param (pointer P in the v1 loss)
-
 
 def _snap(cs: int, ce: int, offsets: List[tuple]) -> Optional[tuple]:
     """BPE-aware snapping: first/last token overlapping [cs, ce)."""
@@ -299,30 +369,6 @@ def _param_anchors(entries, offsets: List[tuple], n_params: int) -> List[int]:
     return (anchors + [0] * n_params)[:n_params]
 
 
-def _sample_seq_len(s: UnifiedSample, tokenizer) -> int:
-    """Compute tokenized sequence length of a sample (with fast char lower-bound)."""
-    raw_chars = len(s.utterance or "") + sum(
-        len(str(r.get("key", ""))) + len(str(r.get("value", ""))) + 16
-        for r in (s.recent_context or [])
-    )
-    if raw_chars < (MAX_SEQ_LEN // 2):
-        return raw_chars
-    tool = s.tools[0] if s.tools else None
-    if s.ground_truth_calls and s.tools:
-        gt_name = s.ground_truth_calls[0].tool_name
-        tool = next((t for t in s.tools if t.name == gt_name), tool)
-    if tool is not None:
-        try:
-            out = build_input(
-                tooldef_to_template_tool(tool),
-                s.utterance,
-                recent_context=_recent_rows(s),
-                now=_now_iso(s),
-            )
-            return len(tokenizer(out.text, add_special_tokens=False)["input_ids"])
-        except Exception:
-            pass
-    return len(tokenizer(s.utterance or "", add_special_tokens=False)["input_ids"])
 
 
 def tensorize_sample(
@@ -517,84 +563,167 @@ def tensorize_sample(
         row["tool_targets"] = torch.tensor(gt_idx, dtype=torch.long)
     return row'''
 
-CODE_TENSOR_RUN = '''# ---- filter out samples > 4K tokens & tensorize all splits --------------
-import json, os
+CODE_TENSOR_RUN = '''# ---- tensorize all splits: config-driven, NON-destructive + PARALLEL ----
+# Canonical splits under DATA_DIR are never mutated: rows are length-filtered
+# (len(ids) > MAX_SEQ_LEN -> tensorize_sample returns None) and fractioned
+# (seeded row selection mirroring SpanCallTrainer.load_rows) here in-memory,
+# with drop counts reported below.
+#
+# W1: the per-sample tensorize loop runs in a fork-based ProcessPoolExecutor
+# (TENSORIZE_WORKERS workers). Each worker inherits the already-loaded
+# tokenizer + mask_builder at fork time -> zero per-worker re-loading cost.
+# If fork is unavailable or the pool raises, it falls back to an identical
+# sequential loop (same input order -> same output rows).
+#
+# W2: out-splits sharing the same (input split, packing mode) are tensorized
+# ONCE and written to every member. hermes_train's single-tool form feeds both
+# t0 and t1, so that file is processed twice total (single-tool + multi-tool)
+# instead of three times.
 
-# 1. Remove any samples exceeding MAX_SEQ_LEN (4K) from canonical splits in DATA_DIR
-for split_file in CANONICAL_SPLITS:
-    split_path = os.path.join(DATA_DIR, split_file)
-    if not os.path.exists(split_path):
-        continue
-    kept_lines, removed_long = [], 0
-    with open(split_path, "r") as fh:
-        for line in fh:
-            raw = line.strip()
-            if not raw:
-                continue
-            s = UnifiedSample.from_dict(json.loads(raw))
-            if _sample_seq_len(s, tokenizer) > MAX_SEQ_LEN:
-                removed_long += 1
-                continue
-            kept_lines.append(raw)
-    if removed_long > 0:
-        with open(split_path, "w") as fh:
-            for l in kept_lines:
-                fh.write(l + "\\n")
-        print(f"filtered {split_file}: kept {len(kept_lines)}, removed {removed_long} (> {MAX_SEQ_LEN} tokens)")
+import json, os, random
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing as mp
+from spancall.data.schema import UnifiedSample
 
-SPLIT_INPUTS = {
-    "t0":       "hermes_train.jsonl",
-    "t1":       "hermes_train.jsonl",
-    "t2":       "hermes_train.jsonl",
-    "stage_c":  "hermes_calib.jsonl",
-    "dev":      "hermes_dev.jsonl",
-    "calib":    "hermes_calib.jsonl",
-}
-
-# Full dataset training without subsampling limits (None)
-SAMPLE_LIMITS = {"t0": None, "t1": None, "t2": None, "stage_c": None, "dev": None, "calib": None}
-
-os.makedirs(TENSOR_DIR, exist_ok=True)
-
-
-def _iter_samples(path: str):
+def _iter_raw_lines(path: str):
+    """Yield raw JSON dicts from a .jsonl split (no dataclass construction)."""
     with open(path, "r") as fh:
         for line in fh:
             line = line.strip()
             if line:
-                yield UnifiedSample.from_dict(json.loads(line))
+                yield json.loads(line)
 
+def _fraction_subset(raw_lines, frac: float, seed: int):
+    """Seeded index selection contractually identical to trainer.load_rows:
+    rng = random.Random(seed); n = max(int(N*frac), 1);
+    keep sorted(rng.sample(range(N), min(n, N))). Applied to RAW lines so a
+    <1.0 fraction run saves the expensive tensorize work too."""
+    raw_lines = list(raw_lines)
+    if frac >= 1.0:
+        return raw_lines
+    rng = random.Random(int(seed))
+    n = max(int(len(raw_lines) * frac), 1)
+    keep = set(rng.sample(range(len(raw_lines)), min(n, len(raw_lines))))
+    return [d for i, d in enumerate(raw_lines) if i in keep]
 
-def _serialize(row: Dict[str, Any]) -> Dict[str, Any]:
+def _serialize(row):
     return {k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in row.items()}
 
-
-stats = {}
-for out_name, in_name in SPLIT_INPUTS.items():
-    src = os.path.join(DATA_DIR, in_name)
-    if not os.path.exists(src):
-        print(f"SKIP {out_name}: {src} missing")
-        continue
-    limit = SAMPLE_LIMITS.get(out_name)
-    rows, dropped = [], 0
-    # Enable pack_multi_tools for t2 and dev so H1 tool head trains and evaluates on candidate selection
-    pack_multi = out_name in ("t2", "dev")
-    for s in _iter_samples(src):
+def _tensorize_task(args):
+    """Tensorize one raw sample -> serialized row dict, or None (dropped).
+    Module-level so the fork pool can reference it; tokenizer / mask_builder /
+    tensorize_sample / _serialize are inherited from the parent at fork time."""
+    d, pack_multi = args
+    try:
+        s = UnifiedSample.from_dict(d)
         row = tensorize_sample(s, tokenizer, mask_builder, pack_multi_tools=pack_multi)
         if row is None:
-            dropped += 1
-            continue
-        rows.append(_serialize(row))
-        if limit is not None and len(rows) >= limit:
-            break
-    out_path = os.path.join(TENSOR_DIR, f"{out_name}.jsonl")
-    with open(out_path, "w") as fh:
-        for r in rows:
-            fh.write(json.dumps(r) + "\\n")
-    stats[out_name] = {"rows": len(rows), "dropped": dropped}
-    print(f"wrote {out_name}.jsonl: {len(rows)} rows ({dropped} dropped)")
+            return None
+        return _serialize(row)
+    except Exception:
+        return None
 
-print("\\ntensorize summary:", json.dumps(stats, indent=2))'''
+_CHUNK = 256  # tasks per submitted batch (bounded memory + early-limit stop)
+
+def _tensorize_many(raw, pack_multi: bool, need, workers: int):
+    """Tensorize `raw` in a fork pool (or sequentially as fallback), preserving
+    input order. Stops early once `need` serialized rows are produced so
+    SAMPLE_LIMITS still bounds runtime."""
+    if need is None:
+        need = len(raw)
+    rows = []
+    ctx = None
+    if workers > 1:
+        try:
+            ctx = mp.get_context("fork")
+        except Exception:
+            ctx = None
+    if ctx is not None:
+        try:
+            with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
+                for start in range(0, len(raw), _CHUNK):
+                    batch = raw[start:start + _CHUNK]
+                    for res in ex.map(_tensorize_task, [(d, pack_multi) for d in batch]):
+                        if res is not None:
+                            rows.append(res)
+                            if len(rows) >= need:
+                                return rows
+            return rows
+        except Exception:
+            rows = []  # pool failed -> sequential fallback below
+    for d in raw:
+        res = _tensorize_task((d, pack_multi))
+        if res is not None:
+            rows.append(res)
+            if len(rows) >= need:
+                break
+    return rows
+
+# Group out-splits by (input split, packing mode) so shared work runs once.
+groups = defaultdict(list)
+for out_name, in_name in SPLIT_INPUTS.items():
+    pack_multi = out_name in ("t2", "dev")
+    groups[(in_name, pack_multi)].append(out_name)
+
+os.makedirs(TENSOR_DIR, exist_ok=True)
+stats = {}
+
+for (in_name, pack_multi), out_names in groups.items():
+    src = os.path.join(DATA_DIR, in_name)
+    if not os.path.exists(src):
+        for on in out_names:
+            print(f"SKIP {on}: {src} missing")
+        continue
+    raw = _fraction_subset(_iter_raw_lines(src), DATA_FRACTION, SEED)
+    # need = largest per-member limit so shared work satisfies the tightest cap
+    need = None
+    for on in out_names:
+        lim = SAMPLE_LIMITS.get(on)
+        if lim is not None:
+            need = lim if need is None else max(need, lim)
+    rows = _tensorize_many(raw, pack_multi, need, TENSORIZE_WORKERS)
+    mode = "multi-tool" if pack_multi else "single-tool"
+    for on in out_names:
+        limit = SAMPLE_LIMITS.get(on)
+        out_rows = rows if limit is None else rows[:limit]
+        out_path = os.path.join(TENSOR_DIR, f"{on}.jsonl")
+        with open(out_path, "w") as fh:
+            for r in out_rows:
+                fh.write(json.dumps(r) + "\\n")
+        stats[on] = {
+            "rows": len(out_rows),
+            "dropped": len(raw) - len(rows),   # over processed prefix (exact when no limit)
+            "shared_with": [o for o in out_names if o != on] or None,
+            "raw_after_fraction": len(raw),
+            "fraction": DATA_FRACTION,
+            "pack_multi": pack_multi,
+            "limit": limit,
+        }
+        print(f"wrote {on}.jsonl: {len(out_rows)} rows ({len(raw) - len(rows)} dropped,"
+              f" {len(raw)} raw after fraction {DATA_FRACTION}, {mode})")
+
+print("\\ntensorize summary:", json.dumps(stats, indent=2))
+
+# ---- config fingerprint: guards checkpoint selection against stale runs ----
+fingerprint = {
+    "experiment_name": EXPERIMENT_NAME,
+    "seed": SEED,
+    "backbone": BACKBONE,
+    "max_seq_len": MAX_SEQ_LEN,
+    "max_span_width": MAX_SPAN_WIDTH,
+    "max_pos": MAX_POS,
+    "data_fraction": DATA_FRACTION,
+    "split_inputs": SPLIT_INPUTS,
+    "sample_limits": SAMPLE_LIMITS,
+}
+# NOTE: TENSORIZE_WORKERS is intentionally NOT in the fingerprint — output rows
+# are identical regardless of pool size, so checkpoint validity is unaffected.
+fp_path = os.path.join(TENSOR_DIR, "config_fingerprint.json")
+with open(fp_path, "w") as fh:
+    json.dump(fingerprint, fh, indent=2, sort_keys=True)
+print("wrote config fingerprint ->", fp_path)
+'''
 
 MARKDOWN_TENSOR_SANITY = """### Sanity: dev split tensorizes with computable positives
 
@@ -632,13 +761,13 @@ Runs [`scripts/train.py`](../scripts/train.py) against the tensorized splits.
 
 CODE_COLAB_CFG = '''import yaml, os
 
-EXPERIMENT_NAME = "spancall_colab"
-SEED = 42
-# Pipeline verification knob: ``data.fraction`` scales EVERY split
-# (train + dev/calib eval) deterministically (seeded by SEED) inside
-# ``SpanCallTrainer.load_rows``. 1.0 = full data; 0.2 = quick 20% sanity
-# run that exercises tensorize -> T0/T1/T2/C -> eval -> test end-to-end.
-DATA_FRACTION = 0.2
+# EXPERIMENT_NAME / SEED / DATA_FRACTION / BACKBONE / MAX_SEQ_LEN are defined
+# (once) in cell §0b. DATA_FRACTION is already applied as a seeded row subset
+# DURING tensorization (cell §3), so the trainer consumes 100% of the
+# tensorized files. Set TRAIN_FRACTION < 1.0 HERE only if you re-tensorized
+# with DATA_FRACTION = 1.0 and want a second, trainer-side subsample for an
+# even quicker sanity run.
+TRAIN_FRACTION = 1.0
 
 with open("configs/default.yaml") as fh:
     cfg = yaml.safe_load(fh)
@@ -656,16 +785,17 @@ cfg["optimization"]["mixed_precision"] = "bf16"
 cfg["training"]["gradient_accumulation_steps"] = 4
 cfg["training"]["gradient_checkpointing"] = True
 cfg["model"]["freeze_encoder_stages"] = []
-cfg["model"]["max_seq_len"] = MAX_SEQ_LEN
+cfg["model"]["max_seq_len"] = MAX_SEQ_LEN          # from §0b
 
-# fraction < 1 -> deterministic 20% subsample of every split (verify mode)
-cfg.setdefault("data", {})["fraction"] = DATA_FRACTION
+# fraction: tensorized files already reflect DATA_FRACTION (see cell §3)
+cfg.setdefault("data", {})["fraction"] = TRAIN_FRACTION
 
 out = "configs/colab.yaml"
 with open(out, "w") as fh:
     yaml.safe_dump(cfg, fh)
-print(f"wrote {out} (epochs={NUM_EPOCHS}, bs=8, accum=4, bf16=True, freeze=[], data_fraction={DATA_FRACTION})")
-CONFIG_PATH = out'''
+print(f"wrote {out} (epochs={NUM_EPOCHS}, bs=8, accum=4, bf16=True, freeze=[], data_fraction={TRAIN_FRACTION})")
+CONFIG_PATH = out
+'''
 
 CODE_TRAIN_RUN = '''# Direct in-notebook training execution (provides live logging and full native tracebacks)
 from scripts.train import main as train_main
@@ -690,7 +820,7 @@ The trainer writes checkpoints per stage under `results/{exp}_seed{seed}/{stage}
 
 `CHECKPOINT_DIR` is then used by prediction/calibration/eval."""
 
-CODE_PICK_CP = '''import glob, os
+CODE_PICK_CP = '''import glob, os, json
 
 exp_root = os.path.join(RESULTS_DIR, f"{EXPERIMENT_NAME}_seed{SEED}")
 
@@ -701,32 +831,65 @@ def _latest_stage_cp():
             return os.path.dirname(cps[-1]), stage
     return None, None
 
+# ---- stale-artifact guard: refuse checkpoints trained under a different config ----
+ALLOW_STALE_CHECKPOINT = False
+fp_path = os.path.join(TENSOR_DIR, "config_fingerprint.json")
+fingerprint = {
+    "experiment_name": EXPERIMENT_NAME,
+    "seed": SEED,
+    "backbone": BACKBONE,
+    "max_seq_len": MAX_SEQ_LEN,
+    "max_span_width": MAX_SPAN_WIDTH,
+    "max_pos": MAX_POS,
+    "data_fraction": DATA_FRACTION,
+    "split_inputs": SPLIT_INPUTS,
+    "sample_limits": SAMPLE_LIMITS,
+}
+config_ok = True
+if os.path.exists(fp_path):
+    with open(fp_path) as fh:
+        saved = json.load(fh)
+    config_ok = (saved == fingerprint)
+    if not config_ok:
+        print("WARNING: TENSOR_DIR fingerprint does NOT match current config.")
+        print("  saved  :", json.dumps(saved, sort_keys=True))
+        print("  current:", json.dumps(fingerprint, sort_keys=True))
+else:
+    print("WARNING: no config_fingerprint.json in TENSOR_DIR (run the tensorize cell first).")
+    config_ok = False
+
 CHECKPOINT_DIR = None
 cp_dir, cp_stage = _latest_stage_cp()
 model_init = os.path.join(RESULTS_DIR, "model_init")
 
-if cp_dir is not None:
+if cp_dir is not None and config_ok:
     CHECKPOINT_DIR = cp_dir
     print(f"picked stage-{cp_stage} checkpoint @ {CHECKPOINT_DIR}")
-elif os.path.isdir(model_init):
+elif cp_dir is not None and not config_ok and ALLOW_STALE_CHECKPOINT:
+    CHECKPOINT_DIR = cp_dir
+    print(f"WARNING: using STALE stage-{cp_stage} checkpoint @ {CHECKPOINT_DIR} (config mismatch)")
+elif os.path.isdir(model_init) and config_ok:
     CHECKPOINT_DIR = model_init
     print("no staged checkpoint; using model_init @", CHECKPOINT_DIR)
 else:
     all_m = sorted(glob.glob(os.path.join(RESULTS_DIR, "**", "model.pt"), recursive=True))
-    if all_m:
+    if all_m and (config_ok or ALLOW_STALE_CHECKPOINT):
         CHECKPOINT_DIR = os.path.dirname(all_m[-1])
         print("fallback checkpoint @", CHECKPOINT_DIR)
+    else:
+        print("no usable checkpoint (config fingerprint mismatch and ALLOW_STALE_CHECKPOINT=False)")
 
 print("CHECKPOINT_DIR =", CHECKPOINT_DIR)
 if CHECKPOINT_DIR:
-    print("  contains:", sorted(os.listdir(CHECKPOINT_DIR)))'''
+    print("  contains:", sorted(os.listdir(CHECKPOINT_DIR)))
+'''
 
 MARKDOWN_PREDICT_INTRO = """---
 ## 5. Inference & Evaluation
 
 To evaluate correctly without conflating failure modes, the evaluation is broken into three distinct, separate parts:
-1. **Eval Part 1 — Parameter Extraction Evaluation (Oracle / Given GT Tool)**: Tests parameter extraction (`resolver.try_resolve(gt_tool, ...)`) independently of tool selection, reporting ungated/partial extraction (`param_precision`, `param_recall`, `param_f1`, `partial_extraction_rate`, `exact_payload_match` on `Stratum.F`, mean `confidence` on `Stratum.F` vs `Stratum.A`).
-2. **Eval Part 2 — Function (Tool) Prediction Evaluation**: Tests H1 tool selection (`resolver.predict_tool(s.tools, ...)`) across candidate tool schemas independently, reporting top-1 tool accuracy overall and on multi-tool samples (`len(s.tools) > 1`), mean winning tool probability, tool margin (`p_top1 - p_top2`), and gated tool coverage/accuracy.
+1. **Eval Part 1 — Parameter Extraction Evaluation (Oracle / Given GT Tool)**: Tests parameter extraction (`resolver.try_resolve(gt_tool, ...)`) independently of tool selection. Runs in **uncalibrated diagnostics mode**: it scores the raw argmax values from `res.parameters[p].value` (populated even when the abstain head vetoes a param) instead of `payload_partial`, so it isolates pointer-head quality and reports a veto/decomposition breakdown (`pointer correct-but-vetoed` vs `pointer wrong` vs `pointer empty`) — no calibration, no gate.
+2. **Eval Part 2 — Function (Tool) Prediction Evaluation**: Tests H1 tool selection (`resolver.predict_tool(...)`) across candidate tool schemas independently. Runs in **uncalibrated diagnostics mode**: it always scores ≥ 2 candidates (GT tool guaranteed present; a same-corpus distractor is appended for single-tool rows) so the single-candidate shortcut in `predict_tool` never fires — reporting raw top-1 accuracy, mean winner probability and margin, with no gating.
 3. **Eval Part 3 — End-to-End Function Calling Evaluation (General)**: Tests full function calling (`resolver.try_resolve_candidates(s.tools, ...)`: H1 tool selection + H3/H4 parameter extraction & gating) vs the `B1a` baseline on identical data subsets across `hermes_eval` and the 3 OOD/adversarial splits (`hermes_test_ood_schema`, `hermes_test_ood_para`, `hermes_test_adversarial`).
 """
 
@@ -781,29 +944,57 @@ if encoder is not None and hasattr(encoder, "eval"):
 print("resolver ready (checkpoint =", CHECKPOINT_DIR, ")")'''
 
 MARKDOWN_EVAL_PART1 = """---
-## 5a. Evaluation Part 1 — Parameter Extraction (Oracle Tool Given)
+## 5a. Evaluation Part 1 — RAW Parameter Extraction (Oracle Tool Given, No Calibration)
 
-Evaluates parameter extraction directly on ground-truth tools using `resolver.try_resolve(gt_tool, ...)`, completely decoupling parameter extraction from function/tool prediction."""
+Evaluates parameter extraction directly on ground-truth tools using `resolver.try_resolve(gt_tool, ...)`, completely decoupling parameter extraction from function/tool prediction.
+
+> **Uncalibrated diagnostics mode.** This cell reads `res.parameters[p].value` — the **raw argmax candidate** the resolver keeps even when the abstain head vetoes the parameter ([`resolver.py:445`](../spancall/infer/resolver.py:445) stores it in `best_unfiltered`, and the unresolved branch re-exposes it at [`resolver.py:534`](../spancall/infer/resolver.py:534)) — instead of `res.payload_partial`, which the gate leaves empty before calibration. It isolates **pointer-head quality** from the abstain/gate machinery:
+> - `source_type == "abstain"` → raw argmax was correct but the abstain head vetoed it (miscalibrated abstain head, not a bad pointer)
+> - `source_type == "unresolved"` → no candidate beat abstain; `value` is the best canon_value anyway
+> - `pointer_wrong` / `pointer_empty` → genuine pointer-head failures
+>
+> The gated (production-like) metrics (`payload_partial`, `hit`, `status`) are still available on the same `res` objects if a with-gate comparison is needed — they are simply not what this cell scores."""
 
 CODE_EVAL_PART1 = '''import json, os
+from collections import Counter
 from spancall.data.schema import Stratum, UnifiedSample
 
-def eval_param_extraction(split_name: str, limit: Optional[int] = 500):
+def _norm(v):
+    """Normalize a GT/pred value for comparison (None-safe, case/space tolerant)."""
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s.lower() if s.lower() in ("true", "false", "none", "null") else s
+
+def eval_param_extraction_raw(split_name: str, limit: Optional[int] = 500):
+    """RAW parameter-extraction accuracy (no calibration, no gate).
+
+    Reads `res.parameters[p].value` — the raw argmax candidate (populated even
+    when the abstain head vetoed the param) — instead of `res.payload_partial`,
+    which the gate leaves empty before calibration. This isolates pointer-head
+    quality and separates "pointer wrong" from "pointer right but the abstain
+    head vetoed it".
+    """
     src = os.path.join(DATA_DIR, f"{split_name}.jsonl")
     if not os.path.exists(src):
         print(f"File not found: {src}")
         return
-    
+
     total = 0
     stratum_f_total = 0
     stratum_f_exact = 0
     param_tp = 0
     param_fp = 0
     param_fn = 0
-    partial_extracted = 0
-    conf_f = []
-    conf_a = []
-    
+    raw_extracted = 0
+    confs = []
+    p_abs_all = []
+    buckets = Counter()          # source_type -> count
+    vetoed = 0                   # params the abstain head killed despite a candidate
+    pointer_correct_vetoed = 0   # raw argmax correct but abstain head vetoed
+    pointer_wrong = 0            # raw argmax present and != GT
+    pointer_empty = 0            # no candidate found at all
+
     with open(src) as fh:
         for line in fh:
             if not line.strip():
@@ -815,125 +1006,194 @@ def eval_param_extraction(split_name: str, limit: Optional[int] = 500):
             gt_tool = next((t for t in s.tools if t.name == gt_call.tool_name), None)
             if not gt_tool:
                 continue
-            
+
             total += 1
             res = resolver.try_resolve(gt_tool, s.utterance, s.recent_context, s.current_time_iso)
-            pred_payload = res.payload_partial or {}
             gt_args = gt_call.arguments or {}
-            
+
+            # RAW payload: every parameter's argmax value (cast value for chosen
+            # params, canon_value for vetoed/unresolved params).
+            raw_pred = {}
+            for p in gt_tool.parameters:
+                pr = res.parameters.get(p.name)
+                if pr is None:
+                    continue
+                buckets[pr.source_type] += 1
+                confs.append(pr.confidence)
+                p_abs_all.append(pr.p_abstain)
+                if pr.source_type == "abstain":
+                    vetoed += 1
+                if pr.value is not None:
+                    raw_pred[p.name] = pr.value
+
+            norm_pred = {k: _norm(v) for k, v in raw_pred.items()}
+            norm_gt = {k: _norm(v) for k, v in gt_args.items()}
             if s.stratum == Stratum.F:
                 stratum_f_total += 1
-                conf_f.append(res.confidence)
-                if pred_payload == gt_args:
+                if norm_pred == norm_gt:
                     stratum_f_exact += 1
-            else:
-                conf_a.append(res.confidence)
-                
-            if pred_payload:
-                partial_extracted += 1
-                
-            # Parameter-level precision/recall
-            for k, v in pred_payload.items():
-                if k in gt_args and str(gt_args[k]).strip() == str(v).strip():
+            if raw_pred:
+                raw_extracted += 1
+
+            # parameter-level precision/recall over RAW argmax values
+            for k, v in norm_pred.items():
+                if k in norm_gt and norm_gt[k] == v:
                     param_tp += 1
+                    pr = res.parameters.get(k)
+                    if pr is not None and pr.source_type == "abstain":
+                        pointer_correct_vetoed += 1
                 else:
                     param_fp += 1
-            for k, v in gt_args.items():
-                if k not in pred_payload:
+                    if k in norm_gt:
+                        pointer_wrong += 1
+            for k in norm_gt:
+                if k not in norm_pred:
                     param_fn += 1
-                    
+                    pr = res.parameters.get(k)
+                    if pr is None or pr.value is None:
+                        pointer_empty += 1
+
             if limit is not None and total >= limit:
                 break
-                
+
     p = param_tp / max(1, param_tp + param_fp)
     r = param_tp / max(1, param_tp + param_fn)
     f1 = 2 * p * r / max(1e-8, p + r)
     f_exact = stratum_f_exact / max(1, stratum_f_total)
-    mean_cf = sum(conf_f) / max(1, len(conf_f))
-    mean_ca = sum(conf_a) / max(1, len(conf_a))
-    partial_rate = partial_extracted / max(1, total)
-    
-    print(f"=== Parameter Extraction Evaluation (Oracle Tool) on {split_name} (N={total}) ===")
-    print(f"Param Precision: {p:.4f} | Recall: {r:.4f} | F1: {f1:.4f}")
-    print(f"Exact Payload Match (Stratum F): {f_exact:.4f} ({stratum_f_exact}/{stratum_f_total})")
-    print(f"Partial Extraction Rate: {partial_rate:.4f} ({partial_extracted}/{total})")
-    print(f"Mean Confidence on Stratum F (Solvable): {mean_cf:.4f}")
-    print(f"Mean Confidence on Stratum A (Unsolvable): {mean_ca:.4f}")
+    mean_conf = sum(confs) / max(1, len(confs))
+    mean_pabs = sum(p_abs_all) / max(1, len(p_abs_all))
+
+    print(f"=== RAW Parameter Extraction (Oracle Tool) on {split_name} (N={total}) — no calibration ===")
+    print(f"Raw Param Precision: {p:.4f} | Recall: {r:.4f} | F1: {f1:.4f}")
+    print(f"Raw Exact Payload Match (Stratum F): {f_exact:.4f} ({stratum_f_exact}/{stratum_f_total})")
+    print(f"Raw Extraction Rate (>=1 param): {raw_extracted/max(1,total):.4f} ({raw_extracted}/{total})")
+    print(f"Mean raw argmax confidence: {mean_conf:.4f} | Mean p_abstain: {mean_pabs:.4f}")
+    print(f"Abstain-head vetoes: {vetoed} | ... of which raw argmax CORRECT (veto wrong): {pointer_correct_vetoed}")
+    print(f"Pointer wrong (argmax present, != GT): {pointer_wrong} | Pointer empty (no candidate): {pointer_empty}")
+    print(f"Per-param source_type distribution: {dict(buckets)}")
     print("================================================================================")
 
-eval_param_extraction(EVAL_SPLIT, limit=500)'''
+eval_param_extraction_raw(EVAL_SPLIT, limit=500)'''
 
 MARKDOWN_EVAL_PART2 = """---
-## 5b. Evaluation Part 2 — Function (Tool) Prediction Evaluation
+## 5b. Evaluation Part 2 — RAW Function (Tool) Prediction (No Calibration)
 
-Evaluates H1 tool selection across candidate tool schemas independently, isolating tool choice accuracy from parameter extraction."""
+Evaluates H1 tool selection across candidate tool schemas independently, isolating tool choice accuracy from parameter extraction.
+
+> **Uncalibrated diagnostics mode.** This cell **always feeds ≥ 2 candidate schemas** so the single-candidate shortcut in [`predict_tool`](../spancall/infer/resolver.py:261) (which returns `tool_prob/margin = 1.0` without a model forward pass) never fires. The GT tool is guaranteed present in the candidate set (patching the ~24% of `hermes_eval` rows whose `s.tools` lacks the GT tool name), and single-tool rows get a same-corpus distractor appended. `gated_hit` is ignored (it depends on `tau_tool`)."""
 
 CODE_EVAL_PART2 = '''import json, os
+from collections import Counter
 from spancall.data.schema import UnifiedSample
 
-def eval_tool_prediction(split_name: str, limit: Optional[int] = 500):
+def eval_tool_prediction_raw(split_name: str, limit: Optional[int] = 500,
+                             distractor_pool: Optional[dict] = None):
+    """RAW H1 tool-selection accuracy (no calibration, no gate).
+
+    Always feeds >= 2 candidate schemas per row so the single-candidate
+    shortcut in predict_tool (which returns prob/margin = 1.0 without a model
+    forward pass) never fires. The true tool is guaranteed present in the
+    candidate set; single-tool rows get a same-corpus distractor appended.
+    """
     src = os.path.join(DATA_DIR, f"{split_name}.jsonl")
     if not os.path.exists(src):
         print(f"File not found: {src}")
         return
-        
+
+    # collect rows + a tool-name pool for distractor sampling
+    rows = []
+    if distractor_pool is None:
+        distractor_pool = {}
+        with open(src) as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                s = UnifiedSample.from_dict(json.loads(line))
+                rows.append(s)
+                for t in s.tools or []:
+                    distractor_pool.setdefault(t.name, t)
+    else:
+        with open(src) as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                rows.append(UnifiedSample.from_dict(json.loads(line)))
+    distractor_names = sorted(distractor_pool)
+
     total = 0
     multi_total = 0
-    top1_correct = 0
-    multi_top1_correct = 0
+    multi_correct = 0
+    single_total = 0
+    single_correct = 0
+    augmented = 0
     probs = []
     margins = []
-    gated_correct = 0
-    gated_hits = 0
-    
-    with open(src) as fh:
-        for line in fh:
-            if not line.strip():
+    empty_scores = 0
+    wrong_as = Counter()
+
+    for s in rows:
+        if not s.ground_truth_calls or not s.tools:
+            continue
+        gt_name = s.ground_truth_calls[0].tool_name
+        native_multi = len(s.tools) > 1
+
+        candidates = list(s.tools)
+        names = {t.name for t in candidates}
+        grew = False
+        # guarantee the true tool is present (hermes_eval has ~24% rows where
+        # the GT tool name is not in s.tools; removing that data confound)
+        if gt_name not in names and gt_name in distractor_pool:
+            candidates.append(distractor_pool[gt_name])
+            names.add(gt_name)
+            grew = True
+        # guarantee >= 2 distinct tools so the H1 shortcut never fires
+        if len(names) < 2:
+            distractor = next((distractor_pool[n] for n in distractor_names if n != gt_name), None)
+            if distractor is None:
                 continue
-            s = UnifiedSample.from_dict(json.loads(line))
-            if not s.ground_truth_calls or not s.tools:
-                continue
-            gt_tool_name = s.ground_truth_calls[0].tool_name
-            total += 1
-            is_multi = len(s.tools) > 1
-            if is_multi:
-                multi_total += 1
-                
-            tool_pred = resolver.predict_tool(s.tools, s.utterance, s.recent_context, s.current_time_iso)
-            pred_name = tool_pred["tool_name"]
-            is_correct = (pred_name == gt_tool_name)
-            
-            if is_correct:
-                top1_correct += 1
-                if is_multi:
-                    multi_top1_correct += 1
-                    
-            probs.append(tool_pred["tool_prob"])
-            margins.append(tool_pred["tool_margin"])
-            
-            if tool_pred["gated_hit"]:
-                gated_hits += 1
-                if is_correct:
-                    gated_correct += 1
-                    
-            if limit is not None and total >= limit:
-                break
-                
-    acc_all = top1_correct / max(1, total)
-    acc_multi = multi_top1_correct / max(1, multi_total)
+            candidates.append(distractor)
+            grew = True
+        if grew:
+            augmented += 1
+
+        pred = resolver.predict_tool(candidates, s.utterance, s.recent_context, s.current_time_iso)
+        pred_name = pred.get("tool_name")
+        is_correct = bool(pred_name) and pred_name == gt_name
+        total += 1
+        probs.append(pred.get("tool_prob", 0.0))
+        margins.append(pred.get("tool_margin", 0.0))
+        if not pred.get("tool_scores"):
+            empty_scores += 1
+
+        if native_multi:
+            multi_total += 1
+            multi_correct += int(is_correct)
+        else:
+            single_total += 1
+            single_correct += int(is_correct)
+        if pred_name and pred_name != gt_name:
+            wrong_as[pred_name] += 1
+
+        if limit is not None and total >= limit:
+            break
+
+    acc_all = (single_correct + multi_correct) / max(1, total)
+    acc_multi = multi_correct / max(1, multi_total)
+    acc_single = single_correct / max(1, single_total)
     mean_p = sum(probs) / max(1, len(probs))
     mean_m = sum(margins) / max(1, len(margins))
-    gated_cov = gated_hits / max(1, total)
-    gated_prec = gated_correct / max(1, gated_hits)
-    
-    print(f"=== Function / Tool Prediction (H1) on {split_name} (N={total}) ===")
-    print(f"Top-1 Tool Accuracy (Overall): {acc_all:.4f} ({top1_correct}/{total})")
-    print(f"Top-1 Tool Accuracy (Multi-tool subset, N={multi_total}): {acc_multi:.4f} ({multi_top1_correct}/{multi_total})")
+
+    print(f"=== RAW Tool Prediction (H1) on {split_name} (N={total}) — >=2 candidates, no gate ===")
+    print(f"Raw Top-1 Tool Accuracy (Overall): {acc_all:.4f} ({(single_correct + multi_correct)}/{total})")
+    print(f"  Multi-tool subset: {acc_multi:.4f} ({multi_correct}/{multi_total})")
+    print(f"  Single+distractor subset: {acc_single:.4f} ({single_correct}/{single_total})")
     print(f"Mean Winner Tool Probability: {mean_p:.4f} | Mean Margin: {mean_m:.4f}")
-    print(f"Gated Coverage: {gated_cov:.4f} | Precision@Gated: {gated_prec:.4f}")
+    print(f"Rows with empty tool_scores (no winner emitted): {empty_scores}")
+    print(f"Rows where candidates were augmented beyond s.tools: {augmented}")
+    print(f"Most common wrong picks: {wrong_as.most_common(8)}")
     print("==================================================================")
 
-eval_tool_prediction(EVAL_SPLIT, limit=500)'''
+eval_tool_prediction_raw(EVAL_SPLIT, limit=500)'''
 
 CODE_PREDICT_SPLIT = '''def predict_split(split_name: str, out_path: str, limit: Optional[int] = None) -> None:
     src = os.path.join(DATA_DIR, f"{split_name}.jsonl")
@@ -979,7 +1239,7 @@ CODE_PREDICT_SPLIT = '''def predict_split(split_name: str, out_path: str, limit:
     print(f"predicted {n} rows → {out_path} and saved subset → {sub_src}")
 
 # Predict on EVAL_SPLIT (saving exact subset for matching baseline comparison)
-predict_split(EVAL_SPLIT, os.path.join(RESULTS_DIR, "preds_eval.jsonl"), limit=500)'''
+predict_split(EVAL_SPLIT, os.path.join(RESULTS_DIR, "preds_eval.jsonl"), limit=EVAL_LIMIT)'''
 
 MARKDOWN_CALIB_INTRO = """---
 ## 6. Calibration (optional)
@@ -1140,7 +1400,7 @@ Evaluate the trained checkpoint (or the B1a baseline) on the three held-out test
 
 CODE_TEST_PREDS = '''# generate predictions for each test split (limit keeps runtime sane)
 for split in TEST_SPLITS:
-    predict_split(split, os.path.join(RESULTS_DIR, f"preds_{split}.jsonl"), limit=200)'''
+    predict_split(split, os.path.join(RESULTS_DIR, f"preds_{split}.jsonl"), limit=TEST_LIMIT)'''
 
 CODE_TEST_EVAL = '''import subprocess, sys
 
