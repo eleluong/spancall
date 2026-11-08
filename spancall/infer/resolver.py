@@ -159,6 +159,7 @@ class SpanCallResolver:
         model_path: Optional[str] = None,
         calib_thresholds_path: Optional[str] = None,
         *,
+        raw_mode: bool = False,
         encoder: Any = None,
         model: Any = None,
         tokenizer: Any = None,
@@ -172,6 +173,7 @@ class SpanCallResolver:
         k_recent: int = 32,
         context_budget_tokens: int = 16384,
     ) -> None:
+        self.raw_mode = bool(raw_mode)
         self.model_path = model_path
         self.calib_thresholds_path = calib_thresholds_path
         # Context window is backbone-driven (single source of truth): derive
@@ -233,9 +235,10 @@ class SpanCallResolver:
         utterance: str,
         recent_context: Optional[List[Dict[str, Any]]] = None,
         now: Optional[Any] = None,
+        raw_mode: Optional[bool] = None,
     ) -> ResolveResult:
         """Attempts to resolve a fully-specified tool call in a single forward pass."""
-        return self._resolve(schema, utterance, recent_context, now)
+        return self._resolve(schema, utterance, recent_context, now, raw_mode=raw_mode)
 
     def predict_tool(
         self,
@@ -243,6 +246,7 @@ class SpanCallResolver:
         utterance: str,
         recent_context: Optional[List[Dict[str, Any]]] = None,
         now: Optional[Any] = None,
+        raw_mode: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """Directly evaluate H1 tool selection across candidate tools.
 
@@ -252,9 +256,10 @@ class SpanCallResolver:
             tool_prob: winning tool softmax probability
             tool_margin: p_top1 - p_top2 margin
             tool_scores: list of (tool_name, prob)
-            gated_hit: whether tool_margin > tau_tool
+            gated_hit: whether tool_margin > tau_tool (or True in raw_mode)
             abstain_reason: reason if not gated_hit else None
         """
+        eff_raw = self.raw_mode if raw_mode is None else bool(raw_mode)
         if not candidate_schemas:
             return {"tool_name": None, "tool_idx": -1, "tool_prob": 0.0, "tool_margin": 0.0,
                     "tool_scores": [], "gated_hit": False, "abstain_reason": "no_candidates"}
@@ -287,7 +292,7 @@ class SpanCallResolver:
         winner_name, winner_p = choices[0]
         margin = winner_p - (choices[1][1] if len(choices) > 1 else 0.0)
         tau_tool = float(self._gate_cfg.get("tau_tool", 0.0))
-        gated_hit = margin > tau_tool
+        gated_hit = True if eff_raw else (margin > tau_tool)
 
         # Locate winner_idx by index in candidate_schemas (handles duplicate names safely)
         winner_idx = 0
@@ -312,18 +317,20 @@ class SpanCallResolver:
         utterance: str,
         recent_context: Optional[List[Dict[str, Any]]] = None,
         now: Optional[Any] = None,
+        raw_mode: Optional[bool] = None,
     ) -> ResolveResult:
         """Batch-scores candidate schemas and resolves the winner if unambiguous.
 
         Renders all schemas in one packed sequence (``build_input_multi``),
         runs the H1 tool head over the ``<|tool|>`` anchors, and — when the top
-        tool's softmax margin beats ``tau_tool`` (default 0.0) — delegates to
+        tool's softmax margin beats ``tau_tool`` (or in raw mode) — delegates to
         the single-schema pipeline for the winning tool.
         """
+        eff_raw = self.raw_mode if raw_mode is None else bool(raw_mode)
         if not candidate_schemas:
             return ResolveResult(hit=False, status="abstain", abstain_reason="no_candidates")
         if len(candidate_schemas) == 1:
-            return self.try_resolve(candidate_schemas[0], utterance, recent_context, now)
+            return self.try_resolve(candidate_schemas[0], utterance, recent_context, now, raw_mode=eff_raw)
         if torch is None:  # pragma: no cover
             return ResolveResult(hit=False, status="abstain", abstain_reason="torch_unavailable")
         if self.encoder is None:  # pragma: no cover
@@ -366,10 +373,10 @@ class SpanCallResolver:
 
         winner = next((s for s in candidate_schemas if s.name == winner_name), candidate_schemas[0])
 
-        res = self._resolve(winner, utterance, selected_recent, now)
+        res = self._resolve(winner, utterance, selected_recent, now, raw_mode=eff_raw)
         res.features.update(features)
 
-        if margin <= tau_tool:
+        if not eff_raw and margin <= tau_tool:
             res.hit = False
             res.status = "partial" if res.payload_partial else "abstain"
             res.abstain_reason = f"tool_margin_below_tau_tool ({margin:.3f} <= {tau_tool})"
@@ -385,8 +392,10 @@ class SpanCallResolver:
         utterance: str,
         recent_context: Optional[List[Dict[str, Any]]],
         now: Optional[Any],
+        raw_mode: Optional[bool] = None,
     ) -> ResolveResult:
         """Single-schema one-pass resolution (the §4.1.3 chain)."""
+        eff_raw = self.raw_mode if raw_mode is None else bool(raw_mode)
         t0 = time.perf_counter()
         if torch is None:  # pragma: no cover
             return ResolveResult(hit=False, abstain_reason="torch_unavailable")
@@ -449,10 +458,12 @@ class SpanCallResolver:
             best_cand, best_raw_p = self._best_group_candidate(entries)
             best_unfiltered[p.name] = (best_cand, best_raw_p)
             p_abs = float(per_param_abstain_p.get(p.name, 0.0))
-            if not entries or (p_abs > 0.0 and p_abs >= best_raw_p):
+            if not eff_raw and (not entries or (p_abs > 0.0 and p_abs >= best_raw_p)):
                 active_param_scores[p.name] = []
                 if entries and p_abs >= best_raw_p:
                     abstained_params.add(p.name)
+            elif eff_raw and not entries:
+                active_param_scores[p.name] = []
             else:
                 active_param_scores[p.name] = entries
 
@@ -588,6 +599,9 @@ class SpanCallResolver:
             gate_reason = f"schema_invalid: {validation_reason}"
         elif cast_failures:
             gate_reason = f"cast_failed:{','.join(cast_failures)}"
+        elif eff_raw:
+            is_hit = True
+            gate_reason = None
         else:
             is_hit, gate_reason = self.gate.evaluate(
                 param_probabilities=param_probs,
@@ -596,7 +610,7 @@ class SpanCallResolver:
                 is_schema_valid=True,
                 risk_tier=schema.risk_tier,
             )
-        if not is_hit and gate_reason is None and h4_reason not in (None, "OK"):
+        if not eff_raw and not is_hit and gate_reason is None and h4_reason not in (None, "OK"):
             gate_reason = f"h4:{h4_reason}"
 
         if is_hit:

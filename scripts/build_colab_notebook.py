@@ -143,7 +143,7 @@ SAMPLE_LIMITS = {"t0": None, "t1": None, "t2": None, "stage_c": None, "dev": Non
 # and only then training on 20%. When DATA_FRACTION < 1.0 the trainer must run
 # with data.fraction = 1.0 (see cell §4) because the tensorized files ALREADY
 # are the subset.
-DATA_FRACTION = 0.2                  # 1.0 = full data; <1.0 = seeded quick run
+DATA_FRACTION = 1.0                  # 1.0 = full data (B1); <1.0 = seeded quick run
 
 # --- parallel tensorization ---
 TENSORIZE_WORKERS = max(1, min(os.cpu_count() or 1, 16))  # fork pool size for the
@@ -499,6 +499,19 @@ def tensorize_sample(
                         found = True
                         break
 
+        # Fallback to direct GT argument matching if target_spans missed (recovers silent abstains)
+        if not matched_cis and s.stratum == Stratum.F and gt_tool.name in (s.ground_truth_calls[0].tool_name if s.ground_truth_calls else ""):
+            gt_args = dict(s.ground_truth_calls[0].arguments or {}) if s.ground_truth_calls else {}
+            gt_val = gt_args.get(param.name)
+            if gt_val is not None:
+                for ci, c in enumerate(cands):
+                    if c.canon_value is not None:
+                        c_val = str(c.canon_value).strip().lower()
+                        g_val = str(gt_val).strip().lower()
+                        if c.canon_value == gt_val or c_val == g_val:
+                            if ci not in matched_cis:
+                                matched_cis.append(ci)
+
         # Candidate capping: hard negatives near positive spans + uniform stride
         if len(cands) > MAX_C:
             keep_pos = matched_cis[:MAX_POS]
@@ -661,9 +674,10 @@ def _tensorize_many(raw, pack_multi: bool, need, workers: int):
     return rows
 
 # Group out-splits by (input split, packing mode) so shared work runs once.
+# In the unified B-single pipeline, all train and dev rows use uniform multi-tool packing.
 groups = defaultdict(list)
 for out_name, in_name in SPLIT_INPUTS.items():
-    pack_multi = out_name in ("t2", "dev")
+    pack_multi = out_name in ("t0", "t1", "t2", "dev")
     groups[(in_name, pack_multi)].append(out_name)
 
 os.makedirs(TENSOR_DIR, exist_ok=True)
@@ -782,8 +796,11 @@ NUM_EPOCHS = 5
 cfg["optimization"]["num_epochs"] = NUM_EPOCHS
 cfg["optimization"]["batch_size"] = 8
 cfg["optimization"]["mixed_precision"] = "bf16"
+cfg["optimization"]["abstain_weight"] = 1.0   # B2: abstain loss weight (1.0 vs 1.5)
 cfg["training"]["gradient_accumulation_steps"] = 4
 cfg["training"]["gradient_checkpointing"] = True
+cfg["training"]["eval_splits"] = ["dev"]      # A6: per-epoch held-out test evaluation curve
+cfg["training"]["eval_limit"] = 500
 cfg["model"]["freeze_encoder_stages"] = []
 cfg["model"]["max_seq_len"] = MAX_SEQ_LEN          # from §0b
 
@@ -805,10 +822,91 @@ train_main([
     "--experiment_name", EXPERIMENT_NAME,
     "--output_dir", RESULTS_DIR,
     "--data_dir", TENSOR_DIR,
-    "--stages", "T0,T1,T2,C",
+    "--stages", "T2",
     "--device", DEVICE,
     "--seed", str(SEED),
 ])'''
+
+MARKDOWN_TRAIN_TELEMETRY = """### Training telemetry (epoch curves & loss components)
+
+`run_stage` writes a JSON-lines log to `results/{exp}_seed{seed}/train_log.jsonl` (`stage_start` / `train` / `epoch_end` / `epoch_eval` / `stage_end` events). This cell replays it into directly readable tables:
+
+- per-stage summary (rows, epochs, final loss, steps)
+- per-epoch held-out eval curve (`span_acc`, `exact_payload_match`, `abstain_acc`) — the A6 gate used for checkpoint selection
+- per-epoch mean train loss
+- LR + loss-component trajectory (pointer / accept / reason / tool / corr)"""
+
+CODE_TRAIN_TELEMETRY = '''# ---- training telemetry: replay train_log.jsonl into readable tables ----
+import json, os
+from collections import defaultdict
+
+def _load_train_log():
+    p = os.path.join(RESULTS_DIR, f"{EXPERIMENT_NAME}_seed{SEED}", "train_log.jsonl")
+    if not os.path.exists(p):
+        print(f"train_log.jsonl not found at {p}")
+        return []
+    with open(p) as fh:
+        return [json.loads(l) for l in fh if l.strip()]
+
+train_log = _load_train_log()
+if train_log:
+    stages = defaultdict(list)
+    for rec in train_log:
+        stages[rec.get("stage", "?")].append(rec)
+
+    print("=" * 78)
+    print("TRAIN LOG — STAGE SUMMARIES")
+    print("=" * 78)
+    for st, recs in stages.items():
+        starts = [r for r in recs if r.get("event") == "stage_start"]
+        ends = [r for r in recs if r.get("event") == "stage_end"]
+        if ends:
+            e = ends[-1]
+            s = starts[-1] if starts else {}
+            print(f"  {st:<6} rows={s.get('rows','?'):<7} epochs={s.get('num_epochs','?'):<4} "
+                  f"final_loss={e.get('loss', 0):.4f}  steps={e.get('steps','?')}")
+
+    print("\\n" + "=" * 78)
+    print("PER-EPOCH HELD-OUT EVAL CURVE (epoch_eval events)")
+    print("=" * 78)
+    evals = [r for r in train_log if r.get("event") == "epoch_eval"]
+    if evals:
+        print(f"  {'stage':<8}{'epoch':>6}{'n':>6}{'span_acc':>10}{'exact_payload':>15}{'abstain_acc':>13}")
+        for r in evals:
+            print(f"  {str(r.get('stage','?')):<8}{r.get('epoch','?'):>6}{r.get('n','?'):>6}"
+                  f"{r.get('span_acc', 0):>10.3f}{r.get('exact_payload_match', 0):>15.3f}"
+                  f"{r.get('abstain_acc', 0):>13.3f}")
+    else:
+        print("  no epoch_eval events (held-out eval not enabled for these stages)")
+
+    print("\\n" + "=" * 78)
+    print("PER-EPOCH MEAN TRAIN LOSS (epoch_end events)")
+    print("=" * 78)
+    ends = [r for r in train_log if r.get("event") == "epoch_end"]
+    if ends:
+        print(f"  {'stage':<8}{'epoch':>6}{'mean_loss':>12}")
+        for r in ends:
+            print(f"  {str(r.get('stage','?')):<8}{r.get('epoch','?'):>6}{r.get('mean_loss', 0):>12.4f}")
+    else:
+        print("  no epoch_end events")
+
+    print("\\n" + "=" * 78)
+    print("LOSS-COMPONENT TRAJECTORY (train events, downsampled to ~40 rows)")
+    print("=" * 78)
+    trs = [r for r in train_log if r.get("event") == "train"]
+    if trs:
+        step = max(1, len(trs) // 40)
+        print(f"  {'stage':<8}{'step':>6}{'loss':>9}{'pointer':>10}{'accept':>10}{'reason':>10}{'tool':>10}{'corr':>10}{'lr':>12}")
+        for i, r in enumerate(trs):
+            if i % step == 0 or i == len(trs) - 1:
+                print(f"  {str(r.get('stage','?')):<8}{r.get('stage_step','?'):>6}{r.get('loss', 0):>9.4f}"
+                      f"{r.get('pointer', 0):>10.4f}{r.get('accept', 0):>10.4f}{r.get('reason', 0):>10.4f}"
+                      f"{r.get('tool', 0):>10.4f}{r.get('corr', 0):>10.4f}{r.get('lr', 0):>12.2e}")
+    else:
+        print("  no train events")
+else:
+    print("No training log found — run the training cell first.")
+'''
 
 MARKDOWN_PICK_CP = """### Pick the best checkpoint
 
@@ -825,7 +923,11 @@ CODE_PICK_CP = '''import glob, os, json
 exp_root = os.path.join(RESULTS_DIR, f"{EXPERIMENT_NAME}_seed{SEED}")
 
 def _latest_stage_cp():
-    for stage in ["C", "T2", "T1", "T0"]:
+    # A7: Best-checkpoint-by-epoch-curve
+    best_cp = os.path.join(exp_root, "best_checkpoint")
+    if os.path.exists(os.path.join(best_cp, "model.pt")):
+        return best_cp, "best_curve"
+    for stage in ["T2", "T1", "t2", "t1", "C", "T0"]:
         cps = sorted(glob.glob(os.path.join(exp_root, stage, "checkpoints", "**", "model.pt"), recursive=True))
         if cps:
             return os.path.dirname(cps[-1]), stage
@@ -922,14 +1024,10 @@ model = SpanCallModel(
     hidden_dim=encoder.hidden_dim,
 )
 
-# calib_thresholds_path → calibration_report.json from §6 (optional)
-calib_path = None
-if CHECKPOINT_DIR and os.path.exists(os.path.join(CHECKPOINT_DIR, "calibration_report.json")):
-    calib_path = os.path.join(CHECKPOINT_DIR, "calibration_report.json")
-
+# Raw mode: pure argmax decoding, no confidence/abstain gating (Phase A1/A2)
 resolver = SpanCallResolver(
     model_path=CHECKPOINT_DIR,
-    calib_thresholds_path=calib_path,
+    raw_mode=True,
     encoder=encoder,
     model=model,
     tokenizer=tokenizer,
@@ -956,7 +1054,7 @@ Evaluates parameter extraction directly on ground-truth tools using `resolver.tr
 > The gated (production-like) metrics (`payload_partial`, `hit`, `status`) are still available on the same `res` objects if a with-gate comparison is needed — they are simply not what this cell scores."""
 
 CODE_EVAL_PART1 = '''import json, os
-from collections import Counter
+from collections import Counter, defaultdict
 from spancall.data.schema import Stratum, UnifiedSample
 
 def _norm(v):
@@ -994,6 +1092,7 @@ def eval_param_extraction_raw(split_name: str, limit: Optional[int] = 500):
     pointer_correct_vetoed = 0   # raw argmax correct but abstain head vetoed
     pointer_wrong = 0            # raw argmax present and != GT
     pointer_empty = 0            # no candidate found at all
+    per_param = defaultdict(lambda: {"gt": 0, "tp": 0, "fp": 0, "fn": 0, "n_absent": 0})
 
     with open(src) as fh:
         for line in fh:
@@ -1053,6 +1152,24 @@ def eval_param_extraction_raw(split_name: str, limit: Optional[int] = 500):
                     if pr is None or pr.value is None:
                         pointer_empty += 1
 
+            # per-parameter accumulation (Stratum-F rows only — the extractable signal)
+            if s.stratum == Stratum.F:
+                for p in gt_tool.parameters:
+                    pn = p.name
+                    st = per_param[pn]
+                    if pn in norm_gt:
+                        st["gt"] += 1
+                    if pn in norm_pred:
+                        if pn in norm_gt and norm_pred[pn] == norm_gt[pn]:
+                            st["tp"] += 1
+                        else:
+                            st["fp"] += 1
+                    elif pn in norm_gt:
+                        st["fn"] += 1
+                    pr = res.parameters.get(pn)
+                    if pr is not None and pr.source_type == "abstain":
+                        st["n_absent"] += 1
+
             if limit is not None and total >= limit:
                 break
 
@@ -1071,6 +1188,16 @@ def eval_param_extraction_raw(split_name: str, limit: Optional[int] = 500):
     print(f"Abstain-head vetoes: {vetoed} | ... of which raw argmax CORRECT (veto wrong): {pointer_correct_vetoed}")
     print(f"Pointer wrong (argmax present, != GT): {pointer_wrong} | Pointer empty (no candidate): {pointer_empty}")
     print(f"Per-param source_type distribution: {dict(buckets)}")
+
+    if per_param:
+        print("\\n--- Per-parameter RAW extraction (Stratum F only; sorted by most false-negatives) ---")
+        print(f"{'param':<26}{'gt':>5}{'tp':>5}{'fp':>5}{'fn':>5}{'prec':>7}{'rec':>7}{'f1':>7}{'vetoed':>8}")
+        for pn, st in sorted(per_param.items(), key=lambda kv: (-kv[1]["fn"], -kv[1]["gt"])):
+            prec = st["tp"] / max(1, st["tp"] + st["fp"])
+            rec = st["tp"] / max(1, st["gt"])
+            f1p = 2 * prec * rec / max(1e-8, prec + rec)
+            print(f"{pn:<26}{st['gt']:>5}{st['tp']:>5}{st['fp']:>5}{st['fn']:>5}"
+                  f"{prec:>7.3f}{rec:>7.3f}{f1p:>7.3f}{st['n_absent']:>8}")
     print("================================================================================")
 
 eval_param_extraction_raw(EVAL_SPLIT, limit=500)'''
@@ -1130,6 +1257,7 @@ def eval_tool_prediction_raw(split_name: str, limit: Optional[int] = 500,
     margins = []
     empty_scores = 0
     wrong_as = Counter()
+    per_tool = defaultdict(lambda: {"n": 0, "correct": 0, "wrong_as": Counter()})
 
     for s in rows:
         if not s.ground_truth_calls or not s.tools:
@@ -1173,6 +1301,11 @@ def eval_tool_prediction_raw(split_name: str, limit: Optional[int] = 500,
             single_correct += int(is_correct)
         if pred_name and pred_name != gt_name:
             wrong_as[pred_name] += 1
+        tt = per_tool[gt_name]
+        tt["n"] += 1
+        tt["correct"] += int(is_correct)
+        if pred_name and pred_name != gt_name:
+            tt["wrong_as"][pred_name] += 1
 
         if limit is not None and total >= limit:
             break
@@ -1191,11 +1324,43 @@ def eval_tool_prediction_raw(split_name: str, limit: Optional[int] = 500,
     print(f"Rows with empty tool_scores (no winner emitted): {empty_scores}")
     print(f"Rows where candidates were augmented beyond s.tools: {augmented}")
     print(f"Most common wrong picks: {wrong_as.most_common(8)}")
+
+    if per_tool:
+        print("\\n--- Per-tool H1 accuracy (sorted by most wrong picks) ---")
+        print(f"{'tool':<30}{'n':>6}{'acc':>8}{'wrong_as':<40}")
+        for tname, st in sorted(per_tool.items(), key=lambda kv: (-kv[1]["n"], kv[1]["correct"])):
+            acc_t = st["correct"] / max(1, st["n"])
+            wrong_str = ", ".join(f"{w}x{v}" for w, v in st["wrong_as"].most_common(3))
+            print(f"{tname:<30}{st['n']:>6}{acc_t:>8.3f}  {wrong_str}")
     print("==================================================================")
 
 eval_tool_prediction_raw(EVAL_SPLIT, limit=500)'''
 
-CODE_PREDICT_SPLIT = '''def predict_split(split_name: str, out_path: str, limit: Optional[int] = None) -> None:
+CODE_PREDICT_SPLIT = '''def _param_detail(pr) -> Dict[str, Any]:
+    """Serialize one ParameterResolution for the detailed prediction log."""
+    return {
+        "value": getattr(pr, "value", None),
+        "confidence": float(getattr(pr, "confidence", 0.0) or 0.0),
+        "margin": float(getattr(pr, "margin", 0.0) or 0.0),
+        "source_type": getattr(pr, "source_type", None),
+        "char_span": list(pr.char_span) if getattr(pr, "char_span", None) else None,
+        "p_abstain": float(getattr(pr, "p_abstain", 0.0) or 0.0),
+    }
+
+
+def _features_detail(features) -> Dict[str, Any]:
+    """A compact, JSON-safe view of resolver.features (latency + H1/H4 stats)."""
+    feats = dict(features or {})
+    if "tool_scores" in feats and isinstance(feats["tool_scores"], dict):
+        # top-3 tool probabilities only (keep the log small)
+        top = sorted(feats["tool_scores"].items(), key=lambda kv: -float(kv[1]))[:3]
+        feats["tool_scores"] = {k: float(v) for k, v in top}
+    return {k: v for k, v in feats.items()
+            if k not in ("recent_selected", "tool_scores_all")}
+
+
+def predict_split(split_name: str, out_path: str, limit: Optional[int] = None,
+                  detailed: bool = True) -> None:
     src = os.path.join(DATA_DIR, f"{split_name}.jsonl")
     sub_src = os.path.join(RESULTS_DIR, f"subset_{split_name}.jsonl")
     if not os.path.exists(src):
@@ -1212,8 +1377,11 @@ CODE_PREDICT_SPLIT = '''def predict_split(split_name: str, out_path: str, limit:
             raw_dict = json.loads(line)
             s = UnifiedSample.from_dict(raw_dict)
             res = resolver.try_resolve_candidates(s.tools, s.utterance, s.recent_context, s.current_time_iso)
-            preds.append({
+            rec = {
                 "sample_id": s.sample_id,
+                "stratum": s.stratum.value,
+                "gt_tool": (s.ground_truth_calls[0].tool_name if s.ground_truth_calls else None),
+                "gt_args": (s.ground_truth_calls[0].arguments if s.ground_truth_calls else {}),
                 "hit": bool(res.hit),
                 "status": getattr(res, "status", "hit" if res.hit else "abstain"),
                 "payload": res.payload,
@@ -1221,10 +1389,16 @@ CODE_PREDICT_SPLIT = '''def predict_split(split_name: str, out_path: str, limit:
                 "missing_required": getattr(res, "missing_required", []),
                 "missing_optional": getattr(res, "missing_optional", []),
                 "tool_name": res.tool_name,
-                "confidence": float(getattr(res, "confidence", res.accept_score)),
-                "accept_probability": float(res.accept_score),
+                "confidence": float(getattr(res, "confidence", res.accept_score) or 0.0),
+                "accept_probability": float(res.accept_score or 0.0),
+                "joint_margin": float(getattr(res, "joint_margin", 0.0) or 0.0),
                 "abstain_reason": res.abstain_reason,
-            })
+                "latency_ms": float(getattr(res, "latency_ms", 0.0) or 0.0),
+            }
+            if detailed:
+                rec["parameters"] = {p: _param_detail(pr) for p, pr in (res.parameters or {}).items()}
+                rec["features"] = _features_detail(getattr(res, "features", {}))
+            preds.append(rec)
             subset_samples.append(raw_dict)
             n += 1
             if limit is not None and n >= limit:
@@ -1236,87 +1410,205 @@ CODE_PREDICT_SPLIT = '''def predict_split(split_name: str, out_path: str, limit:
     with open(sub_src, "w") as fh:
         for s_dict in subset_samples:
             fh.write(json.dumps(s_dict, default=str) + "\\n")
-    print(f"predicted {n} rows → {out_path} and saved subset → {sub_src}")
+    n_hit = sum(1 for p in preds if p["hit"])
+    print(f"predicted {n} rows → {out_path} (hit={n_hit}) and saved subset → {sub_src}")
 
 # Predict on EVAL_SPLIT (saving exact subset for matching baseline comparison)
 predict_split(EVAL_SPLIT, os.path.join(RESULTS_DIR, "preds_eval.jsonl"), limit=EVAL_LIMIT)'''
 
+MARKDOWN_SAMPLES_INTRO = """---
+## 5c. Sample-Prediction Forensics
+
+Dives into the per-sample prediction log `preds_eval.jsonl` written by the cell above (each row now carries `stratum`, `gt_tool`/`gt_args`, `status`, per-parameter `parameters` detail with `source_type`/`confidence`/`p_abstain`, and `features` latency/H1 breakdown). This is the manual, qualitative pass that turns aggregate numbers into hypotheses:
+- **Hits** — what a correct payload looks like (sanity check that "hit" is real).
+- **Misses by bucket** — wrong tool / wrong value / abstain: read the actual utterance vs predicted vs GT side by side.
+- **Confidence calibration** — do high-confidence misses exist (dangerous) vs low-confidence abstains (safe)?"""
+
+CODE_SAMPLES_FORENSICS = '''import json, os
+import textwrap
+
+PREDS_PATH = os.path.join(RESULTS_DIR, "preds_eval.jsonl")
+if not os.path.exists(PREDS_PATH):
+    print("preds_eval.jsonl not found — run the predict_split cell first")
+else:
+    with open(PREDS_PATH) as fh:
+        preds = [json.loads(l) for l in fh if l.strip()]
+    subs = {}
+    sub_path = os.path.join(RESULTS_DIR, f"subset_{EVAL_SPLIT}.jsonl")
+    if os.path.exists(sub_path):
+        from spancall.data.schema import UnifiedSample
+        with open(sub_path) as fh:
+            for l in fh:
+                if l.strip():
+                    d = json.loads(l)
+                    subs[d.get("sample_id")] = UnifiedSample.from_dict(d)
+
+    print(f"Loaded {len(preds)} prediction records from {PREDS_PATH}\\n")
+
+    # ---- helper: readable utterance ----
+    def _utt(sid):
+        s = subs.get(sid)
+        if s is None:
+            return "(subset sample not available)"
+        return textwrap.shorten(s.utterance, width=160, placeholder=" …")
+
+    def _verdict(p):
+        """Short human verdict for one prediction row."""
+        if p.get("hit"):
+            return "HIT"
+        if p.get("status") == "partial":
+            return "PARTIAL"
+        if p.get("tool_name") and p.get("gt_tool") and p["tool_name"] != p["gt_tool"]:
+            return "WRONG_TOOL"
+        return "ABSTAIN"
+
+    # ---- per-bucket counts ----
+    from collections import Counter
+    verdicts = Counter(_verdict(p) for p in preds)
+    print("Verdict distribution:")
+    for v, c in verdicts.most_common():
+        print(f"  {v:<12}{c:>5}  ({c / max(1, len(preds)):.1%})")
+    print()
+
+    # ---- 1. sample hits (up to 5) ----
+    hits = [p for p in preds if p.get("hit")]
+    print("=" * 72)
+    print(f"SAMPLE HITS ({len(hits)} total; showing up to 5)")
+    print("=" * 72)
+    for p in hits[:5]:
+        print(f"\\n--- {p.get('sample_id')} [{p.get('tool_name')}] conf={p.get('confidence'):.3f} ---")
+        print(f"  utt : {_utt(p.get('sample_id'))}")
+        print(f"  gt  : {json.dumps(p.get('gt_args'), default=str)}")
+        print(f"  pred: {json.dumps(p.get('payload'), default=str)}")
+
+    # ---- 2. wrong-tool misses (up to 5) ----
+    wrong = [p for p in preds if _verdict(p) == "WRONG_TOOL"]
+    if wrong:
+        print("\\n" + "=" * 72)
+        print(f"WRONG-TOOL MISSES ({len(wrong)} total; showing up to 5)")
+        print("=" * 72)
+        for p in wrong[:5]:
+            print(f"\\n--- {p.get('sample_id')} → predicted {p.get('tool_name')} (gt={p.get('gt_tool')}) conf={p.get('confidence'):.3f} ---")
+            print(f"  utt : {_utt(p.get('sample_id'))}")
+            if "features" in p and "tool_scores" in (p.get("features") or {}):
+                print(f"  H1 scores: {p['features']['tool_scores']}")
+
+    # ---- 3. wrong-value / partial misses (up to 5) ----
+    part = [p for p in preds if _verdict(p) == "PARTIAL"]
+    if part:
+        print("\\n" + "=" * 72)
+        print(f"PARTIAL / WRONG-VALUE MISSES ({len(part)} total; showing up to 5)")
+        print("=" * 72)
+        for p in part[:5]:
+            print(f"\\n--- {p.get('sample_id')} [{p.get('tool_name')}] status={p.get('status')} ---")
+            print(f"  utt : {_utt(p.get('sample_id'))}")
+            print(f"  gt  : {json.dumps(p.get('gt_args'), default=str)}")
+            print(f"  pred: {json.dumps(p.get('payload_partial'), default=str)}")
+
+    # ---- 4. abstains (up to 5) + top abstain reasons ----
+    abst = [p for p in preds if _verdict(p) == "ABSTAIN"]
+    print("\\n" + "=" * 72)
+    print(f"ABSTAINS ({len(abst)} total; showing up to 5)")
+    print("=" * 72)
+    from collections import Counter as _C
+    reasons = _C((p.get("abstain_reason") or "no_reason") for p in abst)
+    print("Top abstain reasons:")
+    for r, c in reasons.most_common(6):
+        print(f"  {r:<50}{c:>5}")
+    for p in abst[:5]:
+        print(f"\\n--- {p.get('sample_id')} [{p.get('tool_name')}] reason={p.get('abstain_reason')} ---")
+        print(f"  utt : {_utt(p.get('sample_id'))}")
+        print(f"  gt  : {json.dumps(p.get('gt_args'), default=str)}")
+
+    # ---- 5. calibration: high-confidence misses ----
+    errs = [p for p in preds if _verdict(p) in ("WRONG_TOOL", "PARTIAL") and p.get("confidence", 0) >= 0.9]
+    if errs:
+        print("\\n" + "=" * 72)
+        print(f"HIGH-CONFIDENCE ERRORS (conf>=0.9; {len(errs)} total — dangerous if gated on confidence)")
+        print("=" * 72)
+        for p in sorted(errs, key=lambda x: -x.get("confidence", 0))[:5]:
+            print(f"\\n--- {p.get('sample_id')} {_verdict(p)} conf={p.get('confidence'):.3f} ---")
+            print(f"  utt : {_utt(p.get('sample_id'))}")
+            print(f"  gt  : {json.dumps(p.get('gt_args'), default=str)}  pred: {json.dumps(p.get('payload_partial'), default=str)}")
+    else:
+        print("\\nNo high-confidence errors found — good calibration signal.")'''
+
 MARKDOWN_CALIB_INTRO = """---
-## 6. Calibration (optional)
+## 6. Calibration (Skipped in Raw Mode / Ablation Only)
 
-Produces `calibration_report.json` (temperature + per-tier thresholds) which the resolver can then consume via `calib_thresholds_path`.
+Per Phase A1 (plans/accuracy_improvement_deep_dive.md), calibration is removed from the critical evaluation path. All model evaluation measures **raw accuracy** (`raw_mode=True`).
+This section is preserved for ablation/reference only and is disabled by default."""
 
-The calibrator expects **resolver prediction rows** with this contract (see [`spancall/train/calibrate.py`](../spancall/train/calibrate.py)):
-```
-{sample_id, tool_name, payload, param_probabilities, joint_margin, accept_probability, schema_valid, risk_tier}
-+ parallel ground truth {sample_id, arguments}
-```
+CODE_CALIB_ROWS = '''# Skipped in raw-accuracy pipeline (A1)
+RUN_CALIBRATION_ABLATION = False
 
-> If you prefer to skip temperature fitting, pass `--temperature 1.0` and the report still sweeps tau_p/tau_a/tau_delta."""
+import json, os
 
-CODE_CALIB_ROWS = '''import json, os
-
-# Build calibration rows from the calib split via the resolver
 CALIB_DATA = os.path.join(RESULTS_DIR, "calib_rows.jsonl")
 CALIB_GT   = os.path.join(RESULTS_DIR, "calib_gt.jsonl")
 
-src = os.path.join(DATA_DIR, "hermes_calib.jsonl")
-preds, gts = [], []
-if os.path.exists(src):
-    with open(src) as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            s = UnifiedSample.from_dict(json.loads(line))
-            res = resolver.try_resolve_candidates(s.tools, s.utterance, s.recent_context, s.current_time_iso)
+if RUN_CALIBRATION_ABLATION:
+    src = os.path.join(DATA_DIR, "hermes_calib.jsonl")
+    preds, gts = [], []
+    if os.path.exists(src):
+        with open(src) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                s = UnifiedSample.from_dict(json.loads(line))
+                res = resolver.try_resolve_candidates(s.tools, s.utterance, s.recent_context, s.current_time_iso)
 
-            # per-param gate probabilities (0.0 for missing required params)
-            missing_req = set(getattr(res, "missing_required", []) or [])
-            param_probs = {
-                p.name: (0.0 if p.name in missing_req else float(p.confidence))
-                for p in res.parameters.values()
-            }
-            preds.append({
-                "sample_id": s.sample_id,
-                "tool_name": res.tool_name,
-                "payload": res.payload,
-                "payload_partial": getattr(res, "payload_partial", {}),
-                "param_probabilities": param_probs,
-                "joint_margin": float(res.joint_margin),
-                "accept_probability": float(res.accept_score),
-                "schema_valid": bool(res.payload is not None),
-                "risk_tier": (s.tools[0].risk_tier if s.tools else "read_only"),
-            })
-            gt_args = s.ground_truth_calls[0].arguments if s.ground_truth_calls else {}
-            gts.append({"sample_id": s.sample_id, "arguments": gt_args})
+                # per-param gate probabilities (0.0 for missing required params)
+                missing_req = set(getattr(res, "missing_required", []) or [])
+                param_probs = {
+                    p.name: (0.0 if p.name in missing_req else float(p.confidence))
+                    for p in res.parameters.values()
+                }
+                preds.append({
+                    "sample_id": s.sample_id,
+                    "tool_name": res.tool_name,
+                    "payload": res.payload,
+                    "payload_partial": getattr(res, "payload_partial", {}),
+                    "param_probabilities": param_probs,
+                    "joint_margin": float(res.joint_margin),
+                    "accept_probability": float(res.accept_score),
+                    "schema_valid": bool(res.payload is not None),
+                    "risk_tier": (s.tools[0].risk_tier if s.tools else "read_only"),
+                })
+                gt_args = s.ground_truth_calls[0].arguments if s.ground_truth_calls else {}
+                gts.append({"sample_id": s.sample_id, "arguments": gt_args})
 
-with open(CALIB_DATA, "w") as fh:
-    for p in preds:
-        fh.write(json.dumps(p, default=str) + "\\n")
-with open(CALIB_GT, "w") as fh:
-    for g in gts:
-        fh.write(json.dumps(g, default=str) + "\\n")
-print(f"wrote {len(preds)} calib rows → {CALIB_DATA}")'''
+    with open(CALIB_DATA, "w") as fh:
+        for p in preds:
+            fh.write(json.dumps(p, default=str) + "\\n")
+    with open(CALIB_GT, "w") as fh:
+        for g in gts:
+            fh.write(json.dumps(g, default=str) + "\\n")
+    print(f"wrote {len(preds)} calib rows → {CALIB_DATA}")
+else:
+    print("§6 Calibration skipped (raw-accuracy mode active per Phase A1)")'''
 
-CODE_CALIB_RUN = '''CALIB_REPORT = os.path.join(CHECKPOINT_DIR or RESULTS_DIR, "calibration_report.json")
+CODE_CALIB_RUN = '''if RUN_CALIBRATION_ABLATION:
+    CALIB_REPORT = os.path.join(CHECKPOINT_DIR or RESULTS_DIR, "calibration_report.json")
+    import subprocess, sys
+    subprocess.run([
+        sys.executable, "scripts/calibrate.py",
+        "--config", CONFIG_PATH,
+        "--checkpoint", CHECKPOINT_DIR,
+        "--calib_data", CALIB_DATA,
+        "--ground_truth", CALIB_GT,
+        "--output", CALIB_REPORT,
+    ], check=False)
 
-import subprocess, sys
-subprocess.run([
-    sys.executable, "scripts/calibrate.py",
-    "--config", CONFIG_PATH,
-    "--checkpoint", CHECKPOINT_DIR,
-    "--calib_data", CALIB_DATA,
-    "--ground_truth", CALIB_GT,
-    "--output", CALIB_REPORT,
-], check=False)
-
-if os.path.exists(CALIB_REPORT):
-    import json
-    rep = json.load(open(CALIB_REPORT))
-    print("report keys:", sorted(rep.keys()))
-    print("temperature:", rep.get("temperature"), "| tau_p:", rep.get("tau_p"),
-          "| tau_a:", rep.get("tau_a"), "| tau_delta:", rep.get("tau_delta"))'''
+    if os.path.exists(CALIB_REPORT):
+        import json
+        rep = json.load(open(CALIB_REPORT))
+        print("report keys:", sorted(rep.keys()))
+        print("temperature:", rep.get("temperature"), "| tau_p:", rep.get("tau_p"),
+              "| tau_a:", rep.get("tau_a"), "| tau_delta:", rep.get("tau_delta"))
+else:
+    print("Calibration fitting skipped")'''
 
 MARKDOWN_EVAL_INTRO = """---
 ## 7. General Function Calling Evaluation (Eval Part 3)
@@ -1360,32 +1652,135 @@ def _load_metrics(path):
 rows = []
 for label, path in [
     ("B1a (regex)", os.path.join(RESULTS_DIR, f"toolcall_metrics_{EVAL_SPLIT}_b1a.json")),
-    ("SpanCall",    os.path.join(RESULTS_DIR, f"toolcall_metrics_{EVAL_SPLIT}_model.json")),
+    ("SpanCall (raw)", os.path.join(RESULTS_DIR, f"toolcall_metrics_{EVAL_SPLIT}_model.json")),
 ]:
     m = _load_metrics(path)
     if m is None:
         continue
+    m_f = m.get("metrics_by_stratum", {}).get("F", {})
     rows.append({
         "system": label,
-        "n": m.get("total_samples"),
-        "exact_payload_match": round(m.get("exact_payload_match", 0.0), 3),
-        "hit_rate": round(m.get("hit_rate", 0.0), 3),
-        "precision_at_hit": round(m.get("precision_at_hit", 0.0), 3),
-        "param_P": round(m.get("param_precision", 0.0), 3),
-        "param_R": round(m.get("param_recall", 0.0), 3),
-        "param_F1": round(m.get("param_f1", 0.0), 3),
+        "n_F": int(m_f.get("n", 0)),
+        "exact_F": round(m_f.get("exact_payload_match", 0.0), 3),
+        "hit_F": round(m_f.get("hit_rate", 0.0), 3),
+        "param_F1_F": round(m_f.get("param_f1", 0.0), 3),
         "false_hit_on_A": round(m.get("false_hit_rate_on_a", 0.0), 4),
-        "ECE": round(m.get("ece", 0.0), 4),
+        "exact_all": round(m.get("exact_payload_match", 0.0), 3),
+        "hit_all": round(m.get("hit_rate", 0.0), 3),
     })
 
 if rows:
-    headers = ["system", "n", "exact_payload_match", "hit_rate", "precision_at_hit", "param_P", "param_R", "param_F1", "false_hit_on_A", "ECE"]
+    headers = ["system", "n_F", "exact_F", "hit_F", "param_F1_F", "false_hit_on_A", "exact_all", "hit_all"]
     print(" | ".join(headers))
     print("-|" * len(headers))
     for r in rows:
         print(" | ".join(str(r[h]) for h in headers))
 else:
     print("no metric files found yet — run the two eval_toolcall cells above")'''
+
+MARKDOWN_EVAL_DETAIL_INTRO = """### Detailed eval forensics (errors, abstains, confidence)
+
+Beyond the headline table: which errors dominate, which tools fail most, which abstain reasons dominate, and whether confidence separates hits from misses (ECE + calibration)."""
+ 
+CODE_EVAL_DETAIL = '''import json, os
+from collections import Counter, defaultdict
+
+def _err_buckets(m):
+    return {k: m.get(k, 0) for k in [
+        "error_wrong_tool", "error_wrong_value", "error_entity_swap",
+        "error_duplicate_span", "error_date_misparse", "error_extra_call", "error_missing_call"]}
+
+def _conf_bins(preds, key="confidence", bins=(0.0, 0.5, 0.8, 0.9, 0.95, 1.01)):
+    """Confidence histogram: is confidence separating hits from misses?"""
+    out = []
+    for i in range(len(bins) - 1):
+        lo, hi = bins[i], bins[i + 1]
+        sel = [p for p in preds if lo <= float(p.get(key, 0.0)) < hi]
+        if not sel:
+            continue
+        n_hit = sum(1 for p in sel if p.get("hit"))
+        n_ok = sum(1 for p in sel if p.get("payload_equal") or (p.get("hit") and p.get("tool_name") == p.get("gt_tool")))
+        out.append((f"{lo:.2f}-{hi:.2f}", len(sel), n_hit, n_ok))
+    return out
+
+# ---- model metrics file ----
+m_path = os.path.join(RESULTS_DIR, f"toolcall_metrics_{EVAL_SPLIT}_model.json")
+if not os.path.exists(m_path):
+    print("model metrics file not found — run the eval_toolcall cell first")
+else:
+    with open(m_path) as fh:
+        m = json.load(fh)
+
+    print("=" * 72)
+    print(f"ERROR TAXONOMY — {EVAL_SPLIT} (SpanCall model)")
+    print("=" * 72)
+    errs = _err_buckets(m)
+    tot_err = sum(errs.values())
+    for k, v in sorted(errs.items(), key=lambda kv: -kv[1]):
+        if v:
+            print(f"  {k:<22}{v:>5}  ({v / max(1, tot_err):.1%} of errors)")
+
+    print("\\n" + "=" * 72)
+    print("ABSTAIN REASONS (model)")
+    print("=" * 72)
+    for r, c in sorted(m.get("abstain_reasons", {}).items(), key=lambda kv: -kv[1]):
+        print(f"  {r:<50}{c:>5}")
+
+    print("\\n" + "=" * 72)
+    print("CONFIDENCE CALIBRATION (model predictions vs hit/tool-ok)")
+    print("=" * 72)
+    p_path = os.path.join(RESULTS_DIR, f"preds_{EVAL_SPLIT}.jsonl")
+    preds = []
+    if os.path.exists(p_path):
+        with open(p_path) as fh:
+            preds = [json.loads(l) for l in fh if l.strip()]
+    # join with ground truth from the subset, build tool-ok / payload-equal columns
+    sub_path = os.path.join(RESULTS_DIR, f"subset_{EVAL_SPLIT}.jsonl")
+    gt_map = {}
+    if os.path.exists(sub_path):
+        from spancall.eval.toolcall.evaluator import payload_equal
+        from spancall.data.schema import UnifiedSample
+        with open(sub_path) as fh:
+            for l in fh:
+                if l.strip():
+                    s = UnifiedSample.from_dict(json.loads(l))
+                    if s.ground_truth_calls:
+                        gt_map[s.sample_id] = s
+    for p in preds:
+        s = gt_map.get(p.get("sample_id"))
+        if s is not None and s.ground_truth_calls:
+            gt = s.ground_truth_calls[0]
+            p["gt_tool"] = gt.tool_name
+            p["payload_equal"] = payload_equal(gt.arguments or {}, p.get("payload"),
+                                               s.tools[0] if s.tools else None)
+    if preds:
+        for label, n, n_hit, n_ok in _conf_bins(preds):
+            print(f"  conf {label:<10}{n:>5} rows | hits={n_hit:>4} ({n_hit / max(1, n):.2f}) | tool-ok={n_ok:>4} ({n_ok / max(1, n):.2f})")
+        high_e = [p for p in preds if p.get("confidence", 0) >= 0.9 and not p.get("payload_equal")
+                  and p.get("hit")]
+        print(f"  high-confidence errors (conf>=0.9, hit, payload != GT): {len(high_e)}")
+        for p in sorted(high_e, key=lambda x: -x.get("confidence", 0))[:5]:
+            print(f"    {p.get('sample_id')} conf={p.get('confidence'):.3f} tool={p.get('tool_name')} "
+                  f"pred={json.dumps(p.get('payload'), default=str)}")
+    else:
+        print("  no prediction rows available to score")
+
+    # ---- per-tool e2e accuracy from metrics' errors_by_sample + preds ----
+    print("\\n" + "=" * 72)
+    print("PER-TOOL E2E (from preds joined with GT tool)")
+    print("=" * 72)
+    per_tool = defaultdict(lambda: {"n": 0, "hit": 0, "exact": 0})
+    for p in preds:
+        tname = p.get("gt_tool") or p.get("tool_name")
+        per_tool[tname]["n"] += 1
+        per_tool[tname]["hit"] += int(bool(p.get("hit")))
+        per_tool[tname]["exact"] += int(bool(p.get("payload_equal")))
+    print(f"{'tool':<30}{'n':>6}{'hit':>6}{'hit%':>7}{'exact':>7}{'exact%':>8}")
+    for tname, st in sorted(per_tool.items(), key=lambda kv: -kv[1]["n"]):
+        if st["n"] == 0:
+            continue
+        print(f"{tname:<30}{st['n']:>6}{st['hit']:>6}{st['hit'] / st['n']:>7.2f}"
+              f"{st['exact']:>7}{st['exact'] / st['n']:>8.2f}")'''
 
 MARKDOWN_TEST_INTRO = """---
 ## 8. Test — OOD / adversarial splits
@@ -1427,18 +1822,100 @@ print("test eval done")'''
 
 CODE_TEST_TABLE = '''import json, os
 
-print(f"{'split':<26}{'system':<8}{'n':>6}{'exact':>8}{'hit':>7}{'P@hit':>8}{'falseA':>9}{'ECE':>8}")
+print(f"{'split':<26}{'system':<14}{'n_F':>6}{'exact_F':>9}{'hit_F':>8}{'false_A':>9}{'exact_all':>10}")
 for split in TEST_SPLITS + [EVAL_SPLIT]:
-    for label, suffix in [("b1a", "b1a"), ("model", "model")]:
+    for label, suffix in [("b1a", "b1a"), ("model (raw)", "model")]:
         path = os.path.join(RESULTS_DIR, f"toolcall_metrics_{split}_{suffix}.json")
         m = _load_metrics(path)
         if not m:
             continue
-        n = m.get("total_samples", "-")
-        print(f"{split:<26}{label:<8}{n:<6}"
-              f"{m.get('exact_payload_match', 0.0):<8.3f}{m.get('hit_rate', 0.0):<7.3f}"
-              f"{m.get('precision_at_hit', 0.0):<8.3f}{m.get('false_hit_rate_on_a', 0.0):<9.4f}"
-              f"{m.get('ece', 0.0):<8.4f}")'''
+        m_f = m.get("metrics_by_stratum", {}).get("F", {})
+        n_f = int(m_f.get("n", 0))
+        exact_f = m_f.get("exact_payload_match", 0.0)
+        hit_f = m_f.get("hit_rate", 0.0)
+        false_a = m.get("false_hit_rate_on_a", 0.0)
+        exact_all = m.get("exact_payload_match", 0.0)
+        print(f"{split:<26}{label:<14}{n_f:>6}"
+              f"{exact_f:>9.3f}{hit_f:>8.3f}"
+              f"{false_a:>9.4f}{exact_all:>10.3f}")'''
+
+MARKDOWN_TEST_DETAIL_INTRO = """### Test-split forensics
+
+For each OOD/adversarial split: the error-taxonomy breakdown, dominant abstain reasons, and sample prediction forensics (top misses with the actual utterance) — the qualitative signal on *how* generalization breaks, not just that it dropped."""
+
+CODE_TEST_DETAIL = '''import json, os
+from collections import Counter
+import textwrap
+
+def _err_buckets(m):
+    return {k: m.get(k, 0) for k in [
+        "error_wrong_tool", "error_wrong_value", "error_entity_swap",
+        "error_duplicate_span", "error_date_misparse", "error_extra_call", "error_missing_call"]}
+
+def _show_split(split: str, k: int = 4):
+    m_path = os.path.join(RESULTS_DIR, f"toolcall_metrics_{split}_model.json")
+    if not os.path.exists(m_path):
+        print(f"\\n{split}: no model metrics file — run the test eval cell first")
+        return
+    with open(m_path) as fh:
+        m = json.load(fh)
+    print("\\n" + "=" * 72)
+    print(f"{split} — model (raw)")
+    print("=" * 72)
+    m_f = m.get("metrics_by_stratum", {}).get("F", {})
+    print(f"Stratum F: n={int(m_f.get('n', 0))} exact={m_f.get('exact_payload_match', 0):.3f} "
+          f"hit={m_f.get('hit_rate', 0):.3f} | false_hit_on_A={m.get('false_hit_rate_on_a', 0):.4f}")
+
+    errs = _err_buckets(m)
+    tot_err = sum(errs.values())
+    if tot_err:
+        top = sorted(errs.items(), key=lambda kv: -kv[1])[:4]
+        print("  top errors: " + ", ".join(f"{k}={v}" for k, v in top if v))
+    else:
+        print("  no errors (all abstains or perfect)")
+
+    reas = m.get("abstain_reasons", {})
+    if reas:
+        print("  abstain reasons: " + ", ".join(f"{r}x{c}" for r, c in sorted(reas.items(), key=lambda kv: -kv[1])[:4]))
+
+    # sample preds forensics
+    p_path = os.path.join(RESULTS_DIR, f"preds_{split}.jsonl")
+    sub_path = os.path.join(RESULTS_DIR, f"subset_{split}.jsonl")
+    preds, subs = [], {}
+    if os.path.exists(p_path):
+        with open(p_path) as fh:
+            preds = [json.loads(l) for l in fh if l.strip()]
+    if os.path.exists(sub_path):
+        from spancall.data.schema import UnifiedSample
+        with open(sub_path) as fh:
+            for l in fh:
+                if l.strip():
+                    d = json.loads(l)
+                    subs[d.get("sample_id")] = UnifiedSample.from_dict(d)
+    if preds:
+        def _utt(sid):
+            s = subs.get(sid)
+            return textwrap.shorten(s.utterance, width=140, placeholder=" …") if s else "(n/a)"
+        # misses: hit=False or payload mismatch — with the utterance for qualitative reading
+        bad = []
+        for p in preds:
+            s = subs.get(p.get("sample_id"))
+            gt = s.ground_truth_calls[0] if s and s.ground_truth_calls else None
+            gt_args = gt.arguments if gt else {}
+            if p.get("hit") and p.get("payload") == gt_args:
+                continue
+            bad.append(p)
+        print(f"\\n  Sample misses ({len(bad)} of {len(preds)} rows; showing up to {k}):")
+        for p in bad[:k]:
+            tag = "WRONG_TOOL" if (p.get("tool_name") and p.get("gt_tool") and p["tool_name"] != p["gt_tool"]) else ("PARTIAL" if p.get("status") == "partial" else "ABSTAIN")
+            print(f"    • {p.get('sample_id')} [{tag}] pred={p.get('tool_name')} gt={p.get('gt_tool')}")
+            print(f"      utt: {_utt(p.get('sample_id'))}")
+            if p.get("payload_partial"):
+                print(f"      pred_payload: {json.dumps(p.get('payload_partial'), default=str)}")
+
+for split in TEST_SPLITS:
+    _show_split(split)
+'''
 
 MARKDOWN_PERSIST = """---
 ## 9. Persist to Drive (optional)
@@ -1492,10 +1969,15 @@ What ran:
   2. HF dataset ({HF_DATASET_ID}) → {DATA_DIR}
   3. tensorizer → {TENSOR_DIR} (closes P7 gap)
   4. staged training T0/T1/T2/C → {RESULTS_DIR}
+     └─ telemetry: epoch eval curve + loss components (train_log.jsonl)
   5. resolver predictions → {RESULTS_DIR}/preds_*.jsonl
+     └─ forensics: per-sample hits/misses/abstains side-by-side
   6. (optional) calibration → calibration_report.json
   7. offline eval: b1a + model on {EVAL_SPLIT}
+     └─ deep dive: error taxonomy, abstain reasons, confidence bins,
+        per-tool e2e + RAW per-param / H1 breakdowns
   8. test splits: {TEST_SPLITS}
+     └─ per-split forensics: top errors + sampled misses
   9. optional Drive mirror @ {DRIVE_OUT}
   9b. long-trajectory agent check
  10. repo unit tests
@@ -1527,6 +2009,8 @@ cells = [
     new_markdown_cell(MARKDOWN_TRAIN),
     new_code_cell(CODE_COLAB_CFG),
     new_code_cell(CODE_TRAIN_RUN),
+    new_markdown_cell(MARKDOWN_TRAIN_TELEMETRY),
+    new_code_cell(CODE_TRAIN_TELEMETRY),
     new_markdown_cell(MARKDOWN_PICK_CP),
     new_code_cell(CODE_PICK_CP),
     new_markdown_cell(MARKDOWN_PREDICT_INTRO),
@@ -1536,6 +2020,8 @@ cells = [
     new_markdown_cell(MARKDOWN_EVAL_PART2),
     new_code_cell(CODE_EVAL_PART2),
     new_code_cell(CODE_PREDICT_SPLIT),
+    new_markdown_cell(MARKDOWN_SAMPLES_INTRO),
+    new_code_cell(CODE_SAMPLES_FORENSICS),
     new_markdown_cell(MARKDOWN_CALIB_INTRO),
     new_code_cell(CODE_CALIB_ROWS),
     new_code_cell(CODE_CALIB_RUN),
@@ -1544,10 +2030,14 @@ cells = [
     new_code_cell(CODE_EVAL_MODEL),
     new_markdown_cell(MARKDOWN_CMP),
     new_code_cell(CODE_CMP),
+    new_markdown_cell(MARKDOWN_EVAL_DETAIL_INTRO),
+    new_code_cell(CODE_EVAL_DETAIL),
     new_markdown_cell(MARKDOWN_TEST_INTRO),
     new_code_cell(CODE_TEST_PREDS),
     new_code_cell(CODE_TEST_EVAL),
     new_code_cell(CODE_TEST_TABLE),
+    new_markdown_cell(MARKDOWN_TEST_DETAIL_INTRO),
+    new_code_cell(CODE_TEST_DETAIL),
     new_markdown_cell(MARKDOWN_PERSIST),
     new_code_cell(CODE_PERSIST),
     new_markdown_cell(MARKDOWN_LONG_TRAJ),

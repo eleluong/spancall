@@ -130,6 +130,13 @@ def test_p6_acceptance_suite() -> None:
     assert 0.0 < res_partial.confidence < conf_full
     assert res_partial.confidence == pytest.approx(0.92 * (2.0 / 3.0))
 
+    # In raw_mode=True, the p_abstain veto and confidence gate are bypassed:
+    res_raw = resolver.try_resolve(schema, "A B", raw_mode=True)
+    assert res_raw.hit is True
+    assert res_raw.status == "hit"
+    assert res_raw.payload == {"param_0": "A", "param_1": "B", "param_2": "NOISE"}
+    assert len(res_raw.missing_required) == 0
+
     # 2b. 1 of 3 params grounded (param_0 grounded, param_1 and param_2 abstain)
     def mock_heads_one(output, H, cls_h, per_token, cand_masks):
         outcome = {

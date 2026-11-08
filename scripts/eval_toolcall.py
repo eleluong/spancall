@@ -163,13 +163,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         json.dump(_metrics_to_dict(metrics), fh, indent=2, default=str)
         fh.write("\n")
 
+    f_metrics = metrics.metrics_by_stratum.get("F", {})
+    f_n = int(f_metrics.get("n", 0))
+    f_exact = f_metrics.get("exact_payload_match", 0.0)
+    f_hit = f_metrics.get("hit_rate", 0.0)
     print(f"[SpanCall Eval: ToolCall] wrote {out_path}")
-    print(f"[SpanCall Eval: ToolCall] total={metrics.total_samples} "
-          f"exact_payload_match={metrics.exact_payload_match:.3f} "
-          f"hit_rate={metrics.hit_rate:.3f} "
-          f"precision_at_hit={metrics.precision_at_hit:.3f} "
-          f"false_hit_rate_on_a={metrics.false_hit_rate_on_a:.4f} "
-          f"ECE={metrics.ece:.4f}")
+    print(f"[SpanCall Eval: ToolCall] Stratum F (N={f_n}): exact_payload_match={f_exact:.3f} hit_rate={f_hit:.3f} | "
+          f"Stratum A: false_hit_rate={metrics.false_hit_rate_on_a:.4f} | "
+          f"Overall exact={metrics.exact_payload_match:.3f} hit={metrics.hit_rate:.3f} ECE={metrics.ece:.4f}")
     print("[SpanCall Eval: ToolCall] OK")
     return 0
 

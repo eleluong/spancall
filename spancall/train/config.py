@@ -84,6 +84,7 @@ class OptimizationConfig:
     batch_size: int = 64
     num_epochs: int = 4
     mixed_precision: str = "bf16"
+    abstain_weight: float = 1.0  # B2: abstain column loss weight (1.0 vs 1.5)
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> "OptimizationConfig":
@@ -210,6 +211,8 @@ class TrainingConfig:
     freeze_encoder_stages: List[str] = field(default_factory=list)  # e.g. ["T0", "T1"]
     use_8bit_optimizer: bool = False       # bitsandbytes PagedAdamW8bit (falls back if absent)
     stop_on_gate_kill: bool = False        # abort the curriculum after T1 when the E1 gate says KILL (<0.80)
+    eval_splits: List[str] = field(default_factory=list)  # A6: per-epoch held-out evaluation splits
+    eval_limit: int = 500                  # row cap per eval split to keep epoch wall-time bounded
 
     @classmethod
     def from_yaml(cls, path: Union[str, Path]) -> "TrainingConfig":
@@ -263,6 +266,13 @@ class TrainingConfig:
             stop_on_gate_kill=bool(
                 training.get("stop_on_gate_kill", cfg.stop_on_gate_kill)
             ),
+            eval_splits=list(
+                training.get("eval_splits")
+                or data.get("eval_splits")
+                or experiment.get("eval_splits")
+                or cfg.eval_splits
+            ),
+            eval_limit=int(training.get("eval_limit", cfg.eval_limit)),
             seed=experiment.get("seed", cfg.seed),
             output_dir=experiment.get("output_dir", cfg.output_dir),
             experiment_name=experiment.get("name", cfg.experiment_name),

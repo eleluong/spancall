@@ -44,8 +44,24 @@ def _norm_number(v: Any) -> Any:
 
 
 def _deep_equal(a: Any, b: Any) -> bool:
+    # 1. Boolean handling (including bool strings and numeric bools)
     if isinstance(a, bool) or isinstance(b, bool):
-        return bool(a) == bool(b)
+        if isinstance(a, bool) and isinstance(b, bool):
+            return a == b
+        bool_val = a if isinstance(a, bool) else b
+        other = b if isinstance(a, bool) else a
+        if isinstance(other, str):
+            low = other.strip().lower()
+            if low in ("true", "1", "yes", "t"):
+                return bool_val is True
+            if low in ("false", "0", "no", "f"):
+                return bool_val is False
+            return False
+        if isinstance(other, (int, float)):
+            return bool_val == bool(other)
+        return False
+
+    # 2. Date / datetime handling
     if isinstance(a, (date, datetime)) and isinstance(b, str):
         s_a = a.isoformat()
         s_b = b.strip()
@@ -54,10 +70,37 @@ def _deep_equal(a: Any, b: Any) -> bool:
         s_b = b.isoformat()
         s_a = a.strip()
         return s_b == s_a or str(b) == s_a or s_a.startswith(s_b) or s_b.startswith(s_a)
+    if isinstance(a, (date, datetime)) and isinstance(b, (date, datetime)):
+        return a == b or a.isoformat() == b.isoformat()
+
+    # 3. Numeric string coercion
+    if isinstance(a, (int, float)) and isinstance(b, str):
+        try:
+            val_b = float(b.strip().replace(",", ""))
+            return _norm_number(a) == _norm_number(val_b)
+        except (ValueError, TypeError):
+            return False
+    if isinstance(b, (int, float)) and isinstance(a, str):
+        try:
+            val_a = float(a.strip().replace(",", ""))
+            return _norm_number(val_a) == _norm_number(b)
+        except (ValueError, TypeError):
+            return False
+
     if isinstance(a, (int, float)) and isinstance(b, (int, float)):
         return _norm_number(a) == _norm_number(b)
+
     if isinstance(a, str) and isinstance(b, str):
-        return a.strip() == b.strip()
+        sa = a.strip()
+        sb = b.strip()
+        if sa == sb:
+            return True
+        # ISO date/datetime matching: "2026-10-23" matches "2026-10-23T00:00:00"
+        if len(sa) >= 10 and len(sb) >= 10 and sa[:10] == sb[:10]:
+            if sa.startswith(sb) or sb.startswith(sa):
+                return True
+        return False
+
     if isinstance(a, list) and isinstance(b, list):
         return len(a) == len(b) and all(_deep_equal(x, y) for x, y in zip(a, b))
     if isinstance(a, dict) and isinstance(b, dict):
@@ -76,7 +119,8 @@ def payload_equal(
 
     - Missing optional params in ``actual`` equal to the schema ``default`` are
       materialized before comparison.
-    - ``5`` vs ``5.0`` compare equal.
+    - ``5`` vs ``5.0`` and numeric string coercions compare equal.
+    - Symmetric optional-param handling.
     """
     if actual is None:
         return expected is None
@@ -101,6 +145,19 @@ def payload_equal(
                     act[name] = None
                 if name not in exp and act.get(name) is None:
                     exp[name] = None
+                if name in act and act[name] == default_val and name not in exp:
+                    exp[name] = default_val
+                if name in exp and exp[name] == default_val and name not in act:
+                    act[name] = default_val
+
+    # Symmetric None handling for absent keys
+    for k in list(act.keys()):
+        if act[k] is None and k not in exp:
+            del act[k]
+    for k in list(exp.keys()):
+        if exp[k] is None and k not in act:
+            del exp[k]
+
     if set(exp.keys()) != set(act.keys()):
         return False
     return all(_deep_equal(exp[k], act[k]) for k in exp)

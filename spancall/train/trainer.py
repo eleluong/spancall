@@ -308,7 +308,8 @@ class SpanCallTrainer(BaseTrainer):
         self.model = model
         self.encoder = encoder
         self.tokenizer = tokenizer
-        self.loss = loss_container or SpanCallLossContainer()
+        abst_w = float(getattr(getattr(self.config, "optimization", None), "abstain_weight", 1.0) or 1.0)
+        self.loss = loss_container or SpanCallLossContainer(abstain_weight=abst_w)
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         if self.device == "cuda" and not torch.cuda.is_available():
             self.device = "cpu"
@@ -337,7 +338,7 @@ class SpanCallTrainer(BaseTrainer):
         import random as _random
         self._rng = _random.Random(int(getattr(config, "seed", 0) or 0))   # seeded batch shuffling
         self.stage: str = "T0"
-        self.history: Dict[str, Any] = {"train_loss": [], "dev": {}}
+        self.history: Dict[str, Any] = {"train_loss": [], "dev": {}, "epoch_eval": []}
         self.stage_gates: Dict[str, bool] = {}
 
     # ------------------------------------------------------------------ #
@@ -716,8 +717,11 @@ class SpanCallTrainer(BaseTrainer):
         data_dir = getattr(self.config, "data_dir", None) or "data/processed"
         path = Path(data_dir) / f"{split}.jsonl"
         if not path.exists():
-            kw = getattr(self.config, "data_dir", None)
-            return []
+            alt_path = Path(data_dir) / f"hermes_{split}.jsonl"
+            if alt_path.exists():
+                path = alt_path
+            else:
+                return []
         import json as _json
         rows = []
         with open(path) as fh:
@@ -815,6 +819,40 @@ class SpanCallTrainer(BaseTrainer):
                        f"mean_loss={ep_sum / max(ep_n, 1):.4f}")
             self._log_event({"event": "epoch_end", "stage": stage, "epoch": epoch,
                              "mean_loss": ep_sum / max(ep_n, 1)})
+
+            # A6: per-epoch held-out test evaluation hook
+            eval_splits = getattr(self.config, "eval_splits", None) or []
+            if isinstance(eval_splits, str):
+                eval_splits = [eval_splits]
+            eval_limit = getattr(self.config, "eval_limit", 500)
+            for es in eval_splits:
+                ev_res = self.evaluate(es, limit=eval_limit)
+                ep_rec = {
+                    "stage": stage,
+                    "epoch": epoch,
+                    "split": es,
+                    "span_acc": float(ev_res.get("span_acc", 0.0)),
+                    "exact_payload_match": float(ev_res.get("exact_payload_match", 0.0)),
+                    "abstain_acc": float(ev_res.get("abstain_acc", 0.0)),
+                    "n": float(ev_res.get("n", 0.0)),
+                }
+                if "epoch_eval" not in self.history:
+                    self.history["epoch_eval"] = []
+                self.history["epoch_eval"].append(ep_rec)
+                self._log_event({"event": "epoch_eval", **ep_rec})
+
+                # A7: Best-checkpoint-by-epoch-curve
+                cur_metric = float(ev_res.get("exact_payload_match", 0.0))
+                if not hasattr(self, "_best_curve_metric") or cur_metric > self._best_curve_metric:
+                    self._best_curve_metric = cur_metric
+                    self._best_curve_info = {"stage": stage, "epoch": epoch, "split": es, "exact_payload_match": cur_metric}
+                    try:
+                        out = Path(self.config.output_dir)
+                        best_cp = out / f"{self.config.experiment_name}_seed{self.config.seed}" / "best_checkpoint"
+                        self.save_checkpoint(str(best_cp))
+                        print(f"[train:{stage}:epoch {epoch}] NEW BEST on {es}: exact_payload_match={cur_metric:.4f} -> saved to {best_cp}", flush=True)
+                    except Exception as exc:
+                        print(f"[train:{stage}:epoch {epoch}] WARNING: best checkpoint save failed: {exc!r}", flush=True)
         pbar.close()
         self._flush_accumulation()
         self._release_cuda_cache()
@@ -986,11 +1024,13 @@ class SpanCallTrainer(BaseTrainer):
                 break
         return summary
 
-    def evaluate(self, split: str = "dev") -> Dict[str, float]:
-        """Evaluate exact-payload match on a split (T1 gate input)."""
+    def evaluate(self, split: str = "dev", limit: Optional[int] = None) -> Dict[str, float]:
+        """Evaluate exact-payload match on a split (T1 gate input / per-epoch curve)."""
         rows = self.load_rows(split)
         if not rows:
             return {"exact_payload_match": float("nan"), "n": 0.0}
+        if limit is not None and len(rows) > limit:
+            rows = rows[:limit]
         rows = self.tensorize_rows(rows)
         self.model.eval()
         hits = 0.0

@@ -380,5 +380,8 @@ def test_deep_equal_corners() -> None:
     assert _deep_equal({"a": 1}, {"a": 1, "b": 2}) is False
     assert _deep_equal(3, 3.0) is True
     assert _deep_equal(True, 1) is True  # bool coerced via bool(a) == bool(b)
-    assert _deep_equal("1", 1) is False  # strings never coerce to numbers
+    assert _deep_equal("1", 1) is True  # A3: numeric/bool string coercion
+    assert _deep_equal("true", True) is True  # A3: bool string coercion
+    assert _deep_equal("false", False) is True  # A3: bool string coercion
+    assert _deep_equal("xyz", 1) is False
     assert _deep_equal(None, None) is True

@@ -227,6 +227,8 @@ class StrictTypeCaster(BaseTypeCaster):
         """
         region = getattr(choice, "region", "value")
         span = getattr(choice, "span", None)
+        if span is None and getattr(choice, "char_start", None) is not None and getattr(choice, "char_end", None) is not None:
+            span = (getattr(choice, "char_start"), getattr(choice, "char_end"))
         if region == "utterance" and output is not None and span is not None:
             ok, raw, reason = self.extract_original(
                 char_start=span[0], char_end=span[1], output=output
@@ -236,6 +238,8 @@ class StrictTypeCaster(BaseTypeCaster):
             ok_c, value = self._cast(raw, param_schema)
             return ok_c, value, None if ok_c else "cast_fail"
         raw_val = getattr(choice, "value", None)
+        if raw_val is None:
+            raw_val = getattr(choice, "canon_value", None)
         ok_c, value = self.cast_canonical(raw_val, param_schema)
         if not ok_c and isinstance(raw_val, str):
             ok_c, value = self._cast(raw_val, param_schema)
