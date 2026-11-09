@@ -121,6 +121,14 @@ ABSTAIN_WEIGHT    = 0.5    # HALF of the default 1.0 — the H-T2 knob
 MIXED_PRECISION   = "bf16"
 EVAL_LIMIT        = 200
 
+# --- dataset pull (HF) ---
+HF_DATASET_ID  = os.environ.get("DATASET_NAME", "convoicon/spancall")
+HF_TOKEN       = os.environ.get("HUGGING_FACE_TOKEN") or os.environ.get("HF_TOKEN")
+if HF_TOKEN:
+    os.environ["HF_TOKEN"] = HF_TOKEN
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = HF_TOKEN
+FORCE_HF_DOWNLOAD = False            # True -> always re-pull canonical splits from HF
+
 # --- paths ---
 DATA_DIR          = str(PROJECT_ROOT / "data" / "processed")     # canonical splits
 TENSOR_DIR        = str(PROJECT_ROOT / "data" / "tensorized_exp")  # experiment rows
@@ -143,11 +151,54 @@ print(f"DATA slice: TRAIN_LIMIT={TRAIN_LIMIT}  DEV_LIMIT={DEV_LIMIT}  F:A={F_A_R
 print(f"TRAIN knobs: epochs={NUM_EPOCHS}  bs={BATCH_SIZE}  accum={GRAD_ACCUM}  abstain_weight={ABSTAIN_WEIGHT}")
 print(f"DEVICE = {DEVICE}")
 print(f"PROJECT_ROOT = {PROJECT_ROOT}")
+print(f"HF_DATASET_ID = {HF_DATASET_ID} (token={'set' if HF_TOKEN else 'unset'})")
 print(f"DATA_DIR     = {DATA_DIR}")
 print(f"TENSOR_DIR   = {TENSOR_DIR}")
 print(f"RESULTS_DIR  = {RESULTS_DIR}")'''
 
-MARKDOWN_DATA = """## 1. Build the F-heavy experiment subset
+MARKDOWN_DATA_PULL = """## 1. Dataset — Load the canonical splits (Hugging Face)
+
+Downloads the canonical SpanCall splits (`hermes_train`, `hermes_dev`, …) from
+`HF_DATASET_ID` (`convoicon/spancall`) via `snapshot_download` into
+`data/processed/`. If the splits already exist locally they are used directly
+(set `FORCE_HF_DOWNLOAD = True` to re-pull)."""
+
+CODE_DATA_PULL = '''from huggingface_hub import snapshot_download
+
+CANONICAL_SPLITS = [
+    "hermes_train.jsonl",
+    "hermes_dev.jsonl",
+    "hermes_calib.jsonl",
+    "hermes_eval.jsonl",
+    "hermes_test_ood_schema.jsonl",
+    "hermes_test_ood_para.jsonl",
+    "hermes_test_adversarial.jsonl",
+]
+
+os.makedirs(DATA_DIR, exist_ok=True)
+missing = [f for f in CANONICAL_SPLITS if not os.path.exists(os.path.join(DATA_DIR, f))]
+
+if FORCE_HF_DOWNLOAD or missing:
+    print(f"Downloading splits from Hugging Face dataset: {HF_DATASET_ID} ...")
+    snapshot_download(
+        repo_id=HF_DATASET_ID,
+        repo_type="dataset",
+        local_dir=str(PROJECT_ROOT),
+        allow_patterns=["data/processed/*.jsonl", "data/processed/*.json"],
+        token=HF_TOKEN,
+    )
+
+print("Canonical splits in DATA_DIR:")
+for f in sorted(os.listdir(DATA_DIR)):
+    p = os.path.join(DATA_DIR, f)
+    if os.path.isfile(p):
+        print(f"  {f:<34} ({os.path.getsize(p):>12,} bytes)")
+missing_after = [f for f in ("hermes_train.jsonl", "hermes_dev.jsonl")
+                 if not os.path.exists(os.path.join(DATA_DIR, f))]
+if missing_after:
+    raise SystemExit(f"Dataset still missing in {DATA_DIR}: {missing_after}")'''
+
+MARKDOWN_DATA = """## 2. Build the F-heavy experiment subset
 
 Filters each canonical split to a **positive-rich mix** (H-T2's core idea):
 keep all stratum-F rows (up to limits) and sample stratum-A rows so the
@@ -203,7 +254,7 @@ stats_dev = build_f_heavy_subset(
 print("train subset:", json.dumps(stats_train, indent=2))
 print("dev subset:", json.dumps(stats_dev, indent=2))'''
 
-MARKDOWN_TENSOR = """## 2. Tensorize the experiment subset (multi-tool packed)
+MARKDOWN_TENSOR = """## 3. Tensorize the experiment subset (multi-tool packed)
 
 Reuses the exact production tensorizer semantics from `scripts/build_colab_notebook.py`
 (candidate building, matched-positive column resolution, MAX_C=512 capping, padding) —
@@ -531,7 +582,7 @@ def tensorize_split(split: str, workers: int = None) -> dict:
 print(json.dumps(tensorize_split("exp_train"), indent=2))
 print(json.dumps(tensorize_split("exp_dev"), indent=2))'''
 
-MARKDOWN_AUDIT = """## 3. Experiment A — Label audit (H-D2)
+MARKDOWN_AUDIT = """## 4. Experiment A — Label audit (H-D2)
 
 Re-scan the **tensorized** `t2.jsonl` rows and count, per F param, how many
 matched ≥1 candidate column (`pos_indices` nonzero) vs. silently defaulted to
@@ -578,7 +629,7 @@ VERDICT_D2 = "CONFIRMED (>10% silent)" if audit["silent_rate_pct"] > 10 else \
              ("PARTIAL (5-10%)" if audit["silent_rate_pct"] > 5 else "REFUTED (<=5%)")
 print(f"→ H-D2 verdict: {VERDICT_D2}  (silent_rate={audit['silent_rate_pct']:.2f}%)")'''
 
-MARKDOWN_ORACLE = """## 4. Experiment B — Oracle-candidate ceiling (H-cand)
+MARKDOWN_ORACLE = """## 5. Experiment B — Oracle-candidate ceiling (H-cand)
 
 With the **pointer head bypassed** (oracle picks the GT-matching candidate per
 param), how high can exact-payload match go on the F dev rows? If the ceiling
@@ -663,7 +714,7 @@ VERDICT_CAND = ("CONFIRMED (ceiling < 90%)" if ceiling["ceiling_pct"] < 90
                 else "REFUTED (ceiling >= 90% — H3/cast is the problem)")
 print(f"→ H-cand verdict: {VERDICT_CAND}")'''
 
-MARKDOWN_RESOLVER = """## 5. Shared resolver (pre/post training)
+MARKDOWN_RESOLVER = """## 6. Shared resolver (pre/post training)
 
 Builds `SpanCallResolver(raw_mode=True)` — bypasses the τ gate so any remaining
 empty-payload rows must come from upstream (candidate generation / pointer /
@@ -720,7 +771,7 @@ if RUN_PRE_HIST and os.path.isdir(EXISTING_CKPT_DIR):
 else:
     print("resolver_pre SKIPPED — EXISTING_CKPT_DIR not found:", EXISTING_CKPT_DIR)'''
 
-MARKDOWN_PRE_HIST = """## 6. Experiment C — Pointer-prob histogram (H-T1, pre-train)
+MARKDOWN_PRE_HIST = """## 7. Experiment C — Pointer-prob histogram (H-T1, pre-train)
 
 Run the **existing** checkpoint in raw mode over the dev subset, collecting:
 - per-param `abstain_p` (H3 column-0 softmax mass)
@@ -801,7 +852,7 @@ if resolver_pre is not None:
 else:
     print("skipped — no existing checkpoint")'''
 
-MARKDOWN_MINITRAIN = """## 7. Experiment D — Mini-train (H-T2)
+MARKDOWN_MINITRAIN = """## 8. Experiment D — Mini-train (H-T2)
 
 Train the model on the **F-heavy** tensorized subset (`t2.jsonl`) with
 **abstain_weight=0.5** (half the default) and 2 epochs — the exact knobs the
@@ -867,7 +918,7 @@ if RUN_MINITRAIN:
 else:
     print("skipped (RUN_MINITRAIN=False)")'''
 
-MARKDOWN_POST_EVAL = """## 8. Experiment E — Post-train eval (H-T2 + H-E2)
+MARKDOWN_POST_EVAL = """## 9. Experiment E — Post-train eval (H-T2 + H-E2)
 
 Compare pre vs post on the SAME dev slice:
 
@@ -940,7 +991,7 @@ elif not RUN_POST_EVAL:
 else:
     print("skipped — resolver_post not built (RUN_MINITRAIN or checkpoint missing)")'''
 
-MARKDOWN_VERDICT = """## 9. Verdict — did the experiments confirm the diagnosis?
+MARKDOWN_VERDICT = """## 10. Verdict — did the experiments confirm the diagnosis?
 
 Maps measured numbers back to hypotheses and prints a single decisive table."""
 
@@ -996,6 +1047,8 @@ cells = [
     new_code_cell(CODE_SETUP),
     new_markdown_cell(MARKDOWN_CONFIG),
     new_code_cell(CODE_CONFIG),
+    new_markdown_cell(MARKDOWN_DATA_PULL),
+    new_code_cell(CODE_DATA_PULL),
     new_markdown_cell(MARKDOWN_DATA),
     new_code_cell(CODE_DATA),
     new_markdown_cell(MARKDOWN_TENSOR),
