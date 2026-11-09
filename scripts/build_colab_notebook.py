@@ -814,11 +814,14 @@ NUM_EPOCHS = 5
 cfg["optimization"]["num_epochs"] = NUM_EPOCHS
 cfg["optimization"]["batch_size"] = 8
 cfg["optimization"]["mixed_precision"] = "bf16"
-cfg["optimization"]["abstain_weight"] = 1.0   # B2: abstain loss weight (1.0 vs 1.5)
+# abstain_weight intentionally NOT overridden here: the shipped H-T2 recipe
+# (0.5) flows through from configs/default.yaml (docs/param_recall_diagnosis.md §7b).
 cfg["training"]["gradient_accumulation_steps"] = 4
 cfg["training"]["gradient_checkpointing"] = True
 cfg["training"]["eval_splits"] = ["dev"]      # A6: per-epoch held-out test evaluation curve
 cfg["training"]["eval_limit"] = 500
+cfg["training"]["resolver_eval_split"] = "dev"  # e2e resolver eval hook (T1-gate vs post-eval divergence)
+cfg["training"]["resolver_eval_limit"] = 40
 cfg["model"]["freeze_encoder_stages"] = []
 cfg["model"]["max_seq_len"] = MAX_SEQ_LEN          # from §0b
 
