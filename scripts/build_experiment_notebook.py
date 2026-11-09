@@ -96,7 +96,16 @@ SEED             = 13                    # seeds all deterministic subsampling
 BACKBONE         = "Qwen/Qwen3-Embedding-0.6B"
 MAX_SEQ_LEN      = 4096
 MAX_SPAN_WIDTH   = 16
-MAX_POS          = 3                     # positive slots per param (config fingerprint)
+# T3: MAX_POS is now driven by configs/default.yaml (optimization.max_pos).
+# It fingerprints tensorized rows (pos_indices pad columns), so changing it
+# requires re-tensorizing — keeping the single source of truth in the config
+# prevents the trainer (max_pos) and the tensorizer (MAX_POS) from drifting.
+import yaml
+try:
+    _cfg_yaml = yaml.safe_load(open("configs/default.yaml")) or {}
+    MAX_POS   = int((_cfg_yaml.get("optimization") or {}).get("max_pos", 3))
+except Exception:
+    MAX_POS   = 3                       # fallback: legacy multi-positive default
 
 # --- data slice ---
 SPLIT_INPUTS = {
@@ -279,6 +288,11 @@ from spancall.data.schema import Stratum, UnifiedSample
 from spancall.model.masks import CandidateMaskBuilder
 
 STRATUM_ABSTAIN = {Stratum.A}
+# D2 fix (copied from the production colab builder): an unmatched Stratum-F
+# positive must be MASKED OUT of the pointer loss, never silently relabeled to
+# the abstain column (that taught H3 to abstain on ~15% of F params — H-D2
+# CONFIRMED in the experiment notebook). Testers can opt out with MASK_F_UNMATCHED=0.
+MASK_F_UNMATCHED = 1
 
 tokenizer = AutoTokenizer.from_pretrained(BACKBONE, use_fast=True)
 tokenizer.add_special_tokens({"additional_special_tokens": list(SPECIAL_MARKER_TOKENS)})
@@ -491,12 +505,17 @@ def tensorize_sample(s: UnifiedSample, tokenizer, mask_builder,
 
         cand_start_rows.append([c.tok_start for c in cands])
         cand_end_rows.append([c.tok_end for c in cands])
-        pos_cols = [ci + 1 for ci in matched_cis[:MAX_POS]]
-        if s.stratum in STRATUM_ABSTAIN or not pos_cols:
-            pos_cols = [0]   # <-- the H-D2 silent-abstain path
-        pos_rows.append((pos_cols + [-1] * MAX_POS)[:MAX_POS])
+        _max_pos = int(MAX_POS)
+        pos_cols = [ci + 1 for ci in matched_cis[:_max_pos]]
+        if s.stratum in STRATUM_ABSTAIN:
+            pos_cols = [0]                          # genuine abstain target (row is A)
+        elif not pos_cols and MASK_F_UNMATCHED:
+            pos_cols = []                           # D2 fix: exclude from loss entirely
+        elif not pos_cols:
+            pos_cols = [0]                          # old corrupting behavior (opt-out)
+        pos_rows.append((pos_cols + [-1] * _max_pos)[:_max_pos])
         reasons.append(_h4(s, param.name))
-        cue.append(1.0)
+        cue.append(0.0 if not pos_cols else 1.0)    # fully-masked row → zeroed via pointer_mask
 
     C = max((len(c) for c in cand_start_rows), default=0)
     C = max(min(C, MAX_C), 1)

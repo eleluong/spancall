@@ -133,6 +133,56 @@ flowchart TD
 
 ---
 
+## 7b. VERIFIED upgrade recipe (production defaults, shipped)
+
+The 1K-row rerun (`spancall_verify_1k`, `notebooks/spancall_experiment_verify.ipynb`)
+confirmed the training-recipe hypothesis (H-T2) and refuted the oracle ceiling
+(H-cand: 100% even with ground truth). The verified numbers:
+
+| lever | before | after | note |
+|---|---|---|---|
+| trainer-dev exact_payload_match | 0.164 | **0.761** | F-heavy recipe + abstain_weight 0.5 |
+| span_acc (pointer) | — | **0.80** | F-only param extraction |
+| param_recall (F-only, post-train) | 0.083 | **0.150** | +80% relative, still the bottleneck |
+| tool_acc (H1, trainer eval) | (vacuous 1.0, single-tool) | 1.0 | now *real*: multi-tool distractor sets |
+
+**Bottleneck shift (the crucial finding):** the divergence between the trainer's
+dev eval and the post-training resolver e2e eval is no longer the H3 training
+volume — it is the **resolver inference pipeline** (H-*D3 training/serve skew*):
+trainer tool_acc = 1.0 while the resolver scores 8 `error_wrong_tool` at
+inference, plus 13 persistent abstained rows (now instrumented as
+`features.empty_candidates` in `try_resolve_candidates` so they are one grep,
+not a re-run).
+
+### The shipped production recipe (§7 item 6, now defaults)
+
+1. **D2 fix (label corruption)** — [`MASK_F_UNMATCHED=1`](scripts/build_colab_notebook.py:320):
+   unmatched Stratum-F positives now become `pos_cols=[]` (fully-masked, excluded
+   via `has_pos=False` + `cue_mask`→`pointer_mask`), never `pos_cols=[0]` (fake abstain).
+   Applied identically in [`build_experiment_notebook.py`](scripts/build_experiment_notebook.py:512).
+2. **H-T2 recipe (F-heavy sampling + abstain de-collapse)** —
+   [`data.train_f_ratio: 0.7`](configs/default.yaml:23) (F:A stratified subsample in
+   [`SpanCallTrainer.load_rows`](spancall/train/trainer.py:752)) + [`optimization.abstain_weight: 0.5`](configs/default.yaml:85)
+   (wired into the loss at [`trainer.py:311`](spancall/train/trainer.py:311)).
+3. **H1 distractor training** — [`data.pack_tools: 3`](configs/default.yaml:18) makes
+   multi-tool packing the default so H1 is trained/evaluated on real candidate sets
+   (`tool_loss` [`loss.py:240`](spancall/model/loss.py:240), `tool_acc` [`trainer.py:1109`](spancall/train/trainer.py:1109)).
+4. **E2E resolver eval hook (train/serve skew watcher)** — new
+   [`SpanCallTrainer.evaluate_resolver`](spancall/train/trainer.py:1168) runs the
+   production `SpanCallResolver` over the UnifiedSample split each epoch
+   (`training.resolver_eval_split` / `resolver_eval_limit`, default disabled),
+   reporting `hit_rate`/`exact_payload_match`/`param_recall` side-by-side with the
+   trainer-dev curve to catch D3 skew at train time instead of post-eval.
+5. **T3 (MAX_POS=1)** — [`optimization.max_pos: 1`](configs/default.yaml:88) is the
+   config single source of truth; both notebook builders now read it at runtime,
+   so trainer and tensorizer cannot drift.
+
+> Remaining gap (next work item): the H1-vs-resolver tool gap (8 × error_wrong_tool
+> at inference) and 13 persistent abstains point at the resolver's candidate/`_build_multi`
+> path as the new prime suspect for the post-H3 ceiling.
+
+---
+
 ## 8. One-line answer
 
 Param recall is 0.0022 because the pointer head, trained only in T2 on majority-abstain data with silently-corrupted positive labels, learned to abstain rather than point — so 98.5% of rows emit an empty payload even with the gate bypassed; the residual failures (wrong values on the 3 emissions, and a 3× denominator inflation from Stratum A rows) finish the number off.

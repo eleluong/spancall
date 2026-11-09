@@ -6,11 +6,21 @@ experiment:
   output_dir: "results"
 
 data:
-  # D5: default pipeline packs ONE tool per input (build_input). The multi-tool
-  # form (build_input_multi, [NONE] anchor, T=4/J=3 slots) stays implemented and
-  # tested but is NOT invoked until a measured tool-ambiguity slice > ~10% of
-  # stratum F (E0/E7 telemetry) flips this to > 1 (docs/remediation_plan.md D5).
-  pack_tools: 1
+  # H-T2 upgrade (validated in notebooks/spancall_experiment_verify.ipynb,
+  # spancall_verify_1k): the pointer collapsed to abstain because the default
+  # pipeline was ~85% Stratum-A and abstain_weight was 1.0. The F-heavy recipe
+  # (train_f_ratio > 0 and abstain_weight <= 0.5) de-collapses H3: trainer-dev
+  # exact_payload_match went 0.164 -> 0.761 and F-only param_recall 0.083 -> 0.150.
+  #
+  # Multi-tool packing (build_input_multi, H1 over <|tool|> anchors) is now the
+  # DEFAULT so H1 is actually trained against distractor candidate sets instead
+  # of the old single-tool (pack_tools=1) path where tool_acc=1.0 was vacuous.
+  pack_tools: 3
+  # F:Abstain mixing ratio for the trainer subsample. >0 forces F-heavy rows so
+  # H3 sees positive targets (train/fraction subsampling in
+  # SpanCallTrainer.load_rows keeps F rows first, then samples A to the ratio).
+  # 0 == old behavior (pure random fraction subsample).
+  train_f_ratio: 0.7
   recent:
     k_recent: 32
     context_budget_tokens: 4096
@@ -70,10 +80,22 @@ optimization:
   batch_size: 64
   num_epochs: 4
   mixed_precision: "bf16"
+  # H-T2: 0.5 (half the old 1.0) de-collapses the pointer — the single biggest
+  # measured lever (5.33->2.87 loss at 74 rows; F-only recall 0.083 baseline)
+  abstain_weight: 0.5
+  # T3: keep only the top positive slot per param. Multi-positive (MAX_POS=3)
+  # suppresses top-1 probability; MAX_POS=1 is the cheap ablation.
+  max_pos: 1
 
 training:
   gradient_accumulation_steps: 1
   checkpoint_every_n_steps: 500
+  # E2E-hook: run the raw-mode SpanCallResolver over a text split after each
+  # epoch to surface the train/serve skew (trainer-dev exact_payload_match ~0.76
+  # vs resolver e2e ~0.15). Path points at a UnifiedSample .jsonl (dev split);
+  # empty disables the hook.
+  resolver_eval_split: ""        # e.g. "dev" to enable
+  resolver_eval_limit: 40        # row cap (the 1K experiment used 40 dev rows)
 
 calibration:
   target_precision: 0.95

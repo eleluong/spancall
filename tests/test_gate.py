@@ -173,12 +173,16 @@ class ConjunctionGateTest(unittest.TestCase):
 
 class PackToolsTest(unittest.TestCase):
     def test_data_config_default_packs_one_tool(self):
+        # The DataConfig dataclass default is 1; the production multi-tool
+        # default (3) ships via default.yaml so callers opt in explicitly.
         cfg = DataConfig()
         self.assertEqual(cfg.pack_tools, 1)
 
-    def test_default_yaml_packs_one_tool(self):
+    def test_default_yaml_packs_three_tools(self):
+        # H1 distractor-training upgrade: default.yaml ships pack_tools: 3 so
+        # the H1 tool head is trained against explicit distractor candidate sets.
         cfg = TrainingConfig.from_yaml(DEFAULT_YAML)
-        self.assertEqual(cfg.data.pack_tools, 1)
+        self.assertEqual(cfg.data.pack_tools, 3)
 
     def test_pack_tools_opt_in(self):
         d = DataConfig.from_dict({"pack_tools": 2})
@@ -191,7 +195,7 @@ class PackToolsTest(unittest.TestCase):
     def test_data_section_unknown_keys_tolerated(self):
         cfg = TrainingConfig.from_yaml(DEFAULT_YAML)
         # sources/stratum_mix/schema_split are unmodeled YAML — ignored, not errors
-        self.assertEqual(cfg.data.pack_tools, 1)
+        self.assertEqual(cfg.data.pack_tools, 3)
         self.assertFalse(hasattr(cfg.data, "sources"))
 
     def test_mixer_receives_pack_tools(self):

@@ -328,7 +328,15 @@ class SpanCallResolver:
         """
         eff_raw = self.raw_mode if raw_mode is None else bool(raw_mode)
         if not candidate_schemas:
-            return ResolveResult(hit=False, status="abstain", abstain_reason="no_candidates")
+            # Instrumented for the empty-candidate abstain cohort (H-D3): these rows
+            # never reach H1/H3 because the caller supplied no candidate schemas,
+            # so the resolver's abstain is a *data/interface* artifact, not model
+            # behaviour. Exposing it as a first-class feature makes the diagnosis
+            # one grep instead of a re-run (13 persistent abstains in the 1K exp).
+            return ResolveResult(
+                hit=False, status="abstain", abstain_reason="no_candidates",
+                features={"n_candidates": 0, "empty_candidates": True},
+            )
         if len(candidate_schemas) == 1:
             return self.try_resolve(candidate_schemas[0], utterance, recent_context, now, raw_mode=eff_raw)
         if torch is None:  # pragma: no cover
@@ -360,12 +368,15 @@ class SpanCallResolver:
         choices = self._tool_scores(output, H, per_token)
         features = {
             **ctx_features,
+            "n_candidates": len(candidate_schemas),
             "pre_ms": (t_enc - t0) * 1000,
             "enc_ms": (time.perf_counter() - t_enc) * 1000,
             "tool_scores": dict(choices),
             "temperature": self.temperature,
         }
         if not choices:
+            features["n_tool_anchors"] = 0
+            features["no_tool_anchors"] = True
             return ResolveResult(hit=False, status="abstain", abstain_reason="no_tool_scores", features=features)
         winner_name, winner_p = choices[0]
         margin = winner_p - (choices[1][1] if len(choices) > 1 else 0.0)

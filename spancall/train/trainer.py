@@ -739,6 +739,49 @@ class SpanCallTrainer(BaseTrainer):
             rng = random.Random(int(getattr(self.config, "seed", 42)))
             n = max(int(len(rows) * frac), 1)
             rows = [rows[i] for i in sorted(rng.sample(range(len(rows)), min(n, len(rows))))]
+
+        # H-T2: F-heavy stratified subsample. ``train_f_ratio`` (data.train_f_ratio)
+        # is the target share of rows whose accept_targets would be 1.0 (Stratum F).
+        # Tensorized rows carry ``accept_targets`` (1.0 = F) so we can stratify
+        # directly on the file without re-deriving strata. When set, this overrides
+        # the pure-random fraction subsample above so the trainer consumes an
+        # F-heavy slice (the validated recipe: 700 F / 137 A @ 83.6% F).
+        train_f_ratio = float(
+            getattr(getattr(self.config, "data", None), "train_f_ratio", 0.0) or 0.0
+        )
+        if train_f_ratio > 0.0 and rows:
+            import random as _r2
+            rng2 = _r2.Random(int(getattr(self.config, "seed", 42)) + 7)
+
+            def _is_f(r: Dict[str, Any]) -> bool:
+                v = r.get("accept_targets", 0.0)
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError):
+                    # serialized 0-dim tensor -> list form (e.g. [1.0])
+                    if isinstance(v, (list, tuple)) and len(v):
+                        try:
+                            fv = float(v[0])
+                        except (TypeError, ValueError):
+                            fv = 0.0
+                    else:
+                        fv = 0.0
+                return fv >= 0.5
+
+            f_rows = [r for r in rows if _is_f(r)]
+            a_rows = [r for r in rows if not _is_f(r)]
+            if f_rows and a_rows:
+                # F keeps n_f = total * train_f_ratio rows (capped by supply); A is
+                # capped at the complementary budget so the slice approaches the
+                # requested F share (validated recipe: 700 F / 137 A @ 83.6% F).
+                n_keep = len(rows)
+                n_f = min(len(f_rows), max(int(n_keep * train_f_ratio), 1))
+                n_a_max = max(int(n_keep * (1.0 - train_f_ratio)), 0)
+                if len(f_rows) > n_f:
+                    f_rows = [f_rows[i] for i in sorted(rng2.sample(range(len(f_rows)), n_f))]
+                if len(a_rows) > n_a_max:
+                    a_rows = [a_rows[i] for i in sorted(rng2.sample(range(len(a_rows)), min(n_a_max, len(a_rows))))]
+                rows = f_rows + a_rows
         return rows
 
     def tensorize_rows(self, rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -853,6 +896,18 @@ class SpanCallTrainer(BaseTrainer):
                         print(f"[train:{stage}:epoch {epoch}] NEW BEST on {es}: exact_payload_match={cur_metric:.4f} -> saved to {best_cp}", flush=True)
                     except Exception as exc:
                         print(f"[train:{stage}:epoch {epoch}] WARNING: best checkpoint save failed: {exc!r}", flush=True)
+
+            # E2E-hook: raw-mode resolver eval (train/serve skew watcher). Runs
+            # once per epoch (not per eval split) so the divergence watcher is
+            # cheap even with several eval_splits configured.
+            if getattr(self.config, "resolver_eval_split", "") or "":
+                try:
+                    self.evaluate_resolver(
+                        getattr(self.config, "resolver_eval_split", ""),
+                        limit=getattr(self.config, "resolver_eval_limit", 40),
+                    )
+                except Exception as exc:  # pragma: no cover - never kill training
+                    print(f"[train:{stage}:epoch {epoch}] WARNING: evaluate_resolver failed: {exc!r}", flush=True)
         pbar.close()
         self._flush_accumulation()
         self._release_cuda_cache()
@@ -1108,6 +1163,112 @@ class SpanCallTrainer(BaseTrainer):
               f"span_acc={res['span_acc']:.4f} (n={n_span}) abstain_acc={res['abstain_acc']:.4f} "
               f"(n={n_gold_abs}) pred_abstain_rate={res['pred_abstain_rate']:.3f}{tool_str}", flush=True)
         self._release_cuda_cache()
+        return res
+
+    def evaluate_resolver(self, split: str = "dev", limit: Optional[int] = None) -> Dict[str, Any]:
+        """Run the raw-mode SpanCallResolver e2e over a text split (T1-gate vs post-eval divergence).
+
+        The trainer's ``evaluate()`` and the production resolver run *different*
+        render/parse pipelines (notebook H-* experiments showed trainer-dev
+        exact_payload_match ~0.76 while the resolver e2e was ~0.15 — the
+        ``train/serve skew`` D3 finding). This hook rebuilds the resolver from
+        the current in-memory checkpoint via ``config.resolver_factory`` and
+        scores it with ``ToolCallEvaluator`` on the UnifiedSample JSONL split
+        pointed to by ``config.resolver_eval_split``.
+
+        Requires:
+            config.resolver_factory  — callable(checkpoint_dir) -> SpanCallResolver
+            a UnifiedSample .jsonl at ``data_dir/<split>.jsonl``
+        """
+        factory = getattr(self.config, "resolver_factory", None)
+        if factory is None:
+            print("[evaluate_resolver] skipped — config.resolver_factory is None", flush=True)
+            return {}
+        res_split = getattr(self.config, "resolver_eval_split", "") or ""
+        if not res_split:
+            return {}
+        data_dir = Path(getattr(self.config, "data_dir", None) or "data/processed")
+        path = data_dir / f"{res_split}.jsonl"
+        if not path.exists():
+            alt = data_dir / f"hermes_{res_split}.jsonl"
+            if alt.exists():
+                path = alt
+            else:
+                print(f"[evaluate_resolver] skipped — split file not found: {path}", flush=True)
+                return {}
+        # Persist the current model+encoder to a temp checkpoint the factory loads
+        out_dir = Path(self.config.output_dir) / f"{self.config.experiment_name}_seed{self.config.seed}"
+        ckpt_dir = out_dir / "resolver_eval_ckpt"
+        try:
+            self.save_checkpoint(str(ckpt_dir))
+        except Exception as exc:  # pragma: no cover - checkpoint IO errors
+            print(f"[evaluate_resolver] WARNING: checkpoint save failed ({exc!r}); skipping", flush=True)
+            return {}
+
+        try:
+            resolver = factory(str(ckpt_dir))
+        except Exception as exc:  # pragma: no cover - factory may need HF download
+            print(f"[evaluate_resolver] WARNING: resolver_factory failed ({exc!r}); skipping", flush=True)
+            return {}
+        if resolver is None:
+            return {}
+
+        from spancall.data.schema import UnifiedSample
+        from spancall.eval.toolcall.evaluator import ToolCallEvaluator
+
+        limit = int(limit) if limit is not None else int(
+            getattr(self.config, "resolver_eval_limit", 40) or 40
+        )
+        samples: List[Any] = []
+        preds: List[Dict[str, Any]] = []
+        with open(path) as fh:
+            for i, line in enumerate(fh):
+                if limit is not None and i >= limit:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                s = UnifiedSample.from_dict(json.loads(line))
+                samples.append(s)
+                try:
+                    rres = resolver.try_resolve_candidates(
+                        s.tools, s.utterance, s.recent_context, s.current_time_iso)
+                except Exception:  # pragma: no cover - resolve must never kill the hook
+                    rres = None
+                preds.append({
+                    "sample_id": s.sample_id,
+                    "stratum": s.stratum.value,
+                    "hit": bool(rres.hit) if rres is not None else False,
+                    "status": getattr(rres, "status", "abstain"),
+                    "payload": getattr(rres, "payload", None),
+                    "payload_partial": getattr(rres, "payload_partial", {}) or {},
+                    "tool_name": getattr(rres, "tool_name", None),
+                    "confidence": float(getattr(rres, "confidence", 0.0) or 0.0),
+                    "accept_probability": float(getattr(rres, "accept_score", 0.0) or 0.0),
+                    "joint_margin": float(getattr(rres, "joint_margin", 0.0) or 0.0),
+                    "abstain_reason": getattr(rres, "abstain_reason", None),
+                })
+        if not samples:
+            return {}
+        ev = ToolCallEvaluator()
+        m = ev.evaluate(samples, preds)
+        fb = m.metrics_by_stratum.get("F", {})
+        res = {
+            "split": res_split,
+            "total": m.total_samples,
+            "hit_rate": m.hit_rate,
+            "exact_payload_match": m.exact_payload_match,
+            "param_precision": m.param_precision,
+            "param_recall": m.param_recall,
+            "param_f1": m.param_f1,
+            "stratum_F": {k: fb.get(k) for k in
+                          ("n", "hit_rate", "param_precision", "param_recall", "param_f1")},
+            "abstain_reasons": m.abstain_reasons,
+        }
+        self._log_event({"event": "resolver_eval", **res})
+        print(f"[resolver_eval:{res_split}] hit_rate={res['hit_rate']:.4f} "
+              f"exact_payload_match={res['exact_payload_match']:.4f} "
+              f"param_recall={res['param_recall']:.4f} (n={res['total']})", flush=True)
         return res
 
     # ------------------------------------------------------------------ #

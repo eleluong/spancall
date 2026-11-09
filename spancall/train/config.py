@@ -84,7 +84,8 @@ class OptimizationConfig:
     batch_size: int = 64
     num_epochs: int = 4
     mixed_precision: str = "bf16"
-    abstain_weight: float = 1.0  # B2: abstain column loss weight (1.0 vs 1.5)
+    abstain_weight: float = 1.0   # B2/H-T2: abstain column loss weight (0.5 de-collapses)
+    max_pos: int = 3              # T3: positive slots per param (1 = top-1 only)
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> "OptimizationConfig":
@@ -163,6 +164,8 @@ class DataConfig:
 
     pack_tools: int = 1
     fraction: float = 1.0
+    train_f_ratio: float = 0.0   # H-T2: target F:(A) ratio in trainer subsample
+                                 # (0 = old pure-random fraction subsample)
     recent: RecentConfig = field(default_factory=RecentConfig)
 
     @classmethod
@@ -213,6 +216,9 @@ class TrainingConfig:
     stop_on_gate_kill: bool = False        # abort the curriculum after T1 when the E1 gate says KILL (<0.80)
     eval_splits: List[str] = field(default_factory=list)  # A6: per-epoch held-out evaluation splits
     eval_limit: int = 500                  # row cap per eval split to keep epoch wall-time bounded
+    resolver_eval_split: str = ""          # E2E-hook: raw-mode resolver eval split ("" = disabled)
+    resolver_eval_limit: int = 40          # row cap for the resolver e2e hook
+    resolver_factory: Any = None           # callable(out_ckpt_dir) -> SpanCallResolver (injected)
 
     @classmethod
     def from_yaml(cls, path: Union[str, Path]) -> "TrainingConfig":
@@ -273,6 +279,13 @@ class TrainingConfig:
                 or cfg.eval_splits
             ),
             eval_limit=int(training.get("eval_limit", cfg.eval_limit)),
+            resolver_eval_split=str(
+                training.get("resolver_eval_split", cfg.resolver_eval_split) or ""
+            ),
+            resolver_eval_limit=int(
+                training.get("resolver_eval_limit", cfg.resolver_eval_limit)
+            ),
+            resolver_factory=cfg.resolver_factory,
             seed=experiment.get("seed", cfg.seed),
             output_dir=experiment.get("output_dir", cfg.output_dir),
             experiment_name=experiment.get("name", cfg.experiment_name),
