@@ -87,7 +87,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 # --- experiment knobs (single source of truth) -----------------------------
-EXPERIMENT_NAME  = "spancall_verify"     # artifacts namespace under RESULTS_DIR
+# 1K re-run: the 74-row/18-step baseline (spancall_verify) confirmed the
+# training-signal hypothesis with recall 0.083 (F-only) and loss still falling
+# (5.33 -> 2.87), so this run scales rows up ~10x and epochs 2x while keeping
+# the dev slice identical for direct comparison.
+EXPERIMENT_NAME  = "spancall_verify_1k"  # artifacts namespace under RESULTS_DIR
 SEED             = 13                    # seeds all deterministic subsampling
 BACKBONE         = "Qwen/Qwen3-Embedding-0.6B"
 MAX_SEQ_LEN      = 4096
@@ -100,10 +104,11 @@ SPLIT_INPUTS = {
     "exp_dev":   "hermes_dev.jsonl",
 }
 # F-heavy mix: keep ALL F rows up to TRAIN_LIMIT, then sample A rows at ~3:1 F:A
-TRAIN_LIMIT = 800     # max rows read from hermes_train
-DEV_LIMIT   = 200     # max rows read from hermes_dev
-F_A_RATIO   = 3.0     # F : A mixing ratio for the training subset
-MIN_F_ROWS  = 60      # stop early once this many F rows are in the train subset
+TRAIN_LIMIT = 1000    # max rows read from hermes_train (was 800; 1K re-run)
+DEV_LIMIT   = 200     # max rows read from hermes_dev (unchanged for comparison)
+F_A_RATIO   = 3.0     # F : A mixing ratio for the training subset (unchanged)
+MIN_F_ROWS  = 700     # stop early once this many F rows are in the train subset
+                     # (was 60 — the actual F-row lever; must rise to use the 1K budget)
 
 # --- which experiments to run (independent flags) ---
 RUN_SETUP         = True
@@ -114,10 +119,10 @@ RUN_MINITRAIN     = True   # H-T2
 RUN_POST_EVAL     = True   # H-T2 + H-E2
 
 # --- training knobs (H-T2) ---
-NUM_EPOCHS        = 2
+NUM_EPOCHS        = 4      # was 2; loss still descending at 2, scale up (1K re-run)
 BATCH_SIZE        = 8
 GRAD_ACCUM        = 4
-ABSTAIN_WEIGHT    = 0.5    # HALF of the default 1.0 — the H-T2 knob
+ABSTAIN_WEIGHT    = 0.5    # HALF of the default 1.0 — the H-T2 knob (confirmed)
 MIXED_PRECISION   = "bf16"
 EVAL_LIMIT        = 200
 
