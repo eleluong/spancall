@@ -171,11 +171,20 @@ import span_template
 import transformers
 import datasets
 import huggingface_hub
+from spancall.lean.eval_p1 import (
+    EXTRACTABLE_TARGET_TYPES,
+    NON_EXTRACTABLE_TARGET_TYPES,
+    e3_aligner_violation,
+    eval_param_extraction_lean,
+)
 
 print("spancall     :", spancall.__file__)
 print("spancall.lean:", lean.__file__)
 print("span_template:", span_template.__file__)
-print("transformers :", transformers.__version__, "| datasets:", datasets.__version__)'''
+print("transformers :", transformers.__version__, "| datasets:", datasets.__version__)
+print("retrieval-first eval ready; extractable target types:", sorted(EXTRACTABLE_TARGET_TYPES))
+print("out-of-scope target types:", sorted(NON_EXTRACTABLE_TARGET_TYPES),
+      "| E3 tripwire:", callable(e3_aligner_violation))'''
 
 MARKDOWN_DRIVE = """### 1b. (Optional) Google Drive mount (Colab only)
 
@@ -240,12 +249,26 @@ MARKDOWN_TENSOR_INTRO = """---
 
 Uses [`spancall.lean.tensorize.tensorize_sample_lean`](../spancall/lean/tensorize.py) directly:
 - **0-indexed `pos_indices` in `[0, C)`** (no column-0 abstain slot; `-1` is padding).
-- Omitted optional/nullable parameters on Stratum-F rows automatically point to the `<|null|>` candidate token.
+- Omitted optional/nullable parameters on Stratum-F rows point at a **deterministic** `<|null|>` candidate slot (resolved per param, never a best-effort region search).
 - Rows without any positive groundable target (`has_positive_targets(row) == False`, e.g., empty Stratum-A rows) are filtered out cleanly so every training step has active pointer + tool supervision.
+
+### Param supervision audit (retrieval-first contract)
+
+A Stratum-F param with no matched positive receives **no pointer loss term** (the loss zeroes rows where `n_pos == 0`). That silent exclusion is only correct for some reasons, so the tensorizer classifies **every** drop into a 5-way taxonomy:
+
+| drop reason | meaning | severity |
+|---|---|---|
+| `unresolved_target` | GT target type is `unresolved` — the value must be generated/transformed, not retrieved | **expected**: out of scope for the fast path |
+| `absent_from_gt` | no aligned target and no GT arg — the param is not part of this call | **benign** |
+| `match_missed` | an *extractable* target existed but the span matcher failed to find it | **bug**: a groundable param is silently unsupervised — must be driven to ~0 |
+| `unaligned_target` | a target row exists but carries neither `canonical_value` nor `char_start` | **bug**: aligner produced an unusable target |
+| `null_slot_missing` | GT is null / `null_ctx` but the mask builder emitted no `<|null|>` candidate | **bug**: cannot supervise a known-null answer |
+
+Explicit `null` GT arguments are supervised: they map to the deterministic `<|null|>` slot. The cell below prints every reason per split, flags the two defect classes, and ends with three tripwires — `match_missed total`, `aligner/null-slot defects total`, and `tensorize exceptions total` — all of which must be `0`. Exceptions raised inside the fork worker are now **counted by class** instead of being silently swallowed into a smaller training set.
 """
 
 CODE_TENSOR_SETUP = '''import json, os, random
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing as mp
 
@@ -284,9 +307,23 @@ def _serialize(row):
     return {k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in row.items()}
 
 def _tensorize_lean_task(args):
+    """Tensorize one sample; returns (row_or_None, param_drop_reasons, errors).
+
+    The drop-reason audit travels back through the return value because the
+    fork pool cannot mutate a parent dict. It is reported even for rows that
+    are filtered out (all params dropped => no positives), which is exactly
+    the case that used to vanish silently.
+
+    Exceptions are NO LONGER swallowed. The exception class name is counted
+    and returned so a tokenizer/schema mismatch shows up as a number instead
+    of silently shrinking the training set.
+    """
     d, pack_multi = args
+    drops = {}
+    errors = {}
     try:
         s = UnifiedSample.from_dict(d)
+        ts_stats = {}
         row = tensorize_sample_lean(
             s,
             tokenizer=tokenizer,
@@ -295,12 +332,24 @@ def _tensorize_lean_task(args):
             max_cands=MAX_CANDS,
             max_pos=int(MAX_POS),
             pack_multi_tools=pack_multi,
+            stats=ts_stats,
         )
+        # L1 audit: classify Stratum-F params that ended up with NO positive.
+        #   unresolved_target -> needs generation/transform; OUT OF SCOPE for the
+        #                        retrieval-first fast path (correct exclusion).
+        #   unaligned_target  -> target row carried neither value nor span (data bug).
+        #   null_slot_missing -> answer is null but no <|null|> candidate exists (bug).
+        #   absent_from_gt    -> param is not part of this call (benign).
+        #   match_missed      -> groundable target existed but the matcher failed
+        #                        => a supervision bug, silently excluded from loss.
+        drops = dict(ts_stats.get("param_drop_reasons", {}))
         if row is None or not has_positive_targets(row):
-            return None
-        return _serialize(row)
-    except Exception:
-        return None
+            return None, drops, errors
+        return _serialize(row), drops, errors
+    except Exception as exc:  # noqa: BLE001 - counted, not swallowed
+        cls = type(exc).__name__
+        errors[cls] = errors.get(cls, 0) + 1
+        return None, drops, errors
 
 _CHUNK = 256
 
@@ -308,6 +357,19 @@ def _tensorize_many(raw, pack_multi: bool, need, workers: int):
     if need is None:
         need = len(raw)
     rows = []
+    drops_total = Counter()
+    errors_total = Counter()
+
+    def _take(res):
+        row, drops, errors = res
+        for k, v in (drops or {}).items():
+            drops_total[k] += v
+        for k, v in (errors or {}).items():
+            errors_total[k] += v
+        if row is not None:
+            rows.append(row)
+        return len(rows) >= need
+
     ctx = None
     if workers > 1:
         try:
@@ -317,23 +379,26 @@ def _tensorize_many(raw, pack_multi: bool, need, workers: int):
     if ctx is not None:
         try:
             with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
+                done = False
                 for start in range(0, len(raw), _CHUNK):
                     batch = raw[start:start + _CHUNK]
                     for res in ex.map(_tensorize_lean_task, [(d, pack_multi) for d in batch]):
-                        if res is not None:
-                            rows.append(res)
-                            if len(rows) >= need:
-                                return rows
-            return rows
-        except Exception:
+                        if _take(res):
+                            done = True
+                            break
+                    if done:
+                        break
+            return rows, drops_total, errors_total
+        except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+            print(f"  [!] process pool failed ({type(exc).__name__}: {exc}); "
+                  f"falling back to single-process")
             rows = []
+            drops_total = Counter()
+            errors_total = Counter()
     for d in raw:
-        res = _tensorize_lean_task((d, pack_multi))
-        if res is not None:
-            rows.append(res)
-            if len(rows) >= need:
-                break
-    return rows
+        if _take(_tensorize_lean_task((d, pack_multi))):
+            break
+    return rows, drops_total, errors_total
 
 groups = defaultdict(list)
 for out_name, in_name in SPLIT_INPUTS.items():
@@ -342,6 +407,8 @@ for out_name, in_name in SPLIT_INPUTS.items():
 
 os.makedirs(TENSOR_DIR, exist_ok=True)
 stats = {}
+drop_summary = {}
+error_summary = {}
 
 for (in_name, pack_multi), out_names in groups.items():
     src = os.path.join(DATA_DIR, in_name)
@@ -355,7 +422,12 @@ for (in_name, pack_multi), out_names in groups.items():
         lim = SAMPLE_LIMITS.get(on)
         if lim is not None:
             need = lim if need is None else max(need, lim)
-    rows = _tensorize_many(raw, pack_multi, need, TENSORIZE_WORKERS)
+    rows, drops, errors = _tensorize_many(raw, pack_multi, need, TENSORIZE_WORKERS)
+    missed = int(drops.get("match_missed", 0))
+    unresolved = int(drops.get("unresolved_target", 0))
+    drop_summary[in_name] = dict(drops)
+    if errors:
+        error_summary[in_name] = dict(errors)
     for on in out_names:
         limit = SAMPLE_LIMITS.get(on)
         out_rows = rows if limit is None else rows[:limit]
@@ -370,11 +442,47 @@ for (in_name, pack_multi), out_names in groups.items():
             "fraction": DATA_FRACTION,
             "pack_multi": pack_multi,
             "limit": limit,
+            "param_drop_match_missed": missed,
+            "param_drop_unresolved": unresolved,
+            "param_drop_other": {k: v for k, v in drops.items()
+                                 if k not in ("match_missed", "unresolved_target")},
+            "tensorize_errors": dict(errors),
         }
         print(f"wrote {on}.jsonl: {len(out_rows)} groundable rows "
               f"({len(raw) - len(rows)} ungroundable/Stratum-A/over-length filtered)")
+    if missed:
+        print(f"  [!] MATCH_MISSED={missed} on {in_name}: extractable targets the matcher "
+              f"failed on -> these params get NO pointer supervision (real bug).")
+    other = {k: v for k, v in drops.items()
+             if k not in ("match_missed", "unresolved_target")}
+    for k in sorted(other):
+        label = "BUG" if k in ("unaligned_target", "null_slot_missing") else "note"
+        print(f"  [{label}] {k}={other[k]} on {in_name}")
+    if unresolved:
+        print(f"  [i] unresolved_target={unresolved} on {in_name}: needs generation/transform; "
+              f"out of scope for the retrieval-first fast path (correct exclusion).")
+    for cls_name in sorted(errors):
+        print(f"  [!!] tensorize raised {cls_name} x{errors[cls_name]} on {in_name} "
+              f"-> samples silently lost from training. Investigate.")
 
 print("\\nLean tensorize summary:", json.dumps(stats, indent=2))
+print("\\nParam supervision audit (Stratum-F params dropped from pointer loss):",
+      json.dumps(drop_summary, indent=2))
+if error_summary:
+    print("\\nTensorize exceptions (samples lost from training):",
+          json.dumps(error_summary, indent=2))
+missed_total = sum(d.get("match_missed", 0) for d in drop_summary.values())
+print(f"match_missed total = {missed_total} (must be ~0; >0 means the span matcher "
+      f"is losing groundable targets).")
+bug_drops = sum(
+    d.get("unaligned_target", 0) + d.get("null_slot_missing", 0)
+    for d in drop_summary.values()
+)
+print(f"aligner/null-slot defects total = {bug_drops} (must be ~0; >0 means target "
+      f"rows are unusable or the <|null|> candidate is missing).")
+error_total = sum(v for e in error_summary.values() for v in e.values())
+print(f"tensorize exceptions total = {error_total} (must be 0; >0 means samples "
+      f"silently vanished from the training set).")
 
 fingerprint = {
     "experiment_name": EXPERIMENT_NAME,
@@ -394,9 +502,12 @@ with open(fp_path, "w") as fh:
 print("wrote config fingerprint ->", fp_path)
 '''
 
-MARKDOWN_TENSOR_SANITY = """### Sanity: verify 0-indexed positive targets on `dev.jsonl`"""
+MARKDOWN_TENSOR_SANITY = """### Sanity: verify 0-indexed positive targets on `dev.jsonl`
+
+Also re-runs the drop-reason audit over the *serialized* rows (`_param_drop_reasons`) to confirm the per-row classification survived serialization, and cross-checks that every param with zero positives has a recorded reason (no silent drops)."""
 
 CODE_TENSOR_SANITY = '''import json, os
+from collections import Counter
 dev_path = os.path.join(TENSOR_DIR, "dev.jsonl")
 if os.path.exists(dev_path):
     with open(dev_path) as fh:
@@ -415,6 +526,46 @@ if os.path.exists(dev_path):
         c_len = len(r["cand_starts"][0]) if r.get("cand_starts") and len(r["cand_starts"]) > 0 else 0
         print("input_ids:", len(r.get("input_ids", [])), "seq_len; params K =", len(r.get("param_positions", [])),
               "cand (K,C) =", len(r.get("cand_starts", [])), "x", c_len)
+
+        # ---- L1 audit on serialized rows: every supervised-clean param must be
+        # explained. A param with all -1 positives and NO drop reason would be a
+        # silent loss-hole. Reasons are split into EXPECTED (repairable only by
+        # a slower path) vs BUG (must be ~0):
+        #   expected : unresolved_target (needs generation), absent_from_gt
+        #   bugs     : match_missed, unaligned_target, null_slot_missing
+        reason_counts = Counter()
+        unexplained = 0
+        n_audited_rows = 0
+        for r in rows:
+            if "_param_drop_reasons" not in r:
+                continue           # not a Stratum-F row: no audit applies
+            n_audited_rows += 1
+            reasons = r.get("_param_drop_reasons") or []
+            reason_counts.update(reasons)
+            n_zero_pos = sum(1 for p_pos in r.get("pos_indices", []) if not any(pi >= 0 for pi in p_pos))
+            if n_zero_pos > len(reasons):
+                unexplained += n_zero_pos - len(reasons)
+        print(f"param drop reasons (dev, {n_audited_rows} audited Stratum-F rows):",
+              dict(reason_counts) or "{}")
+        print(f"params with zero positives and no recorded reason: {unexplained} "
+              f"(must be 0 — otherwise loss silently ignores a groundable param)")
+        EXPECTED_DROPS = ("unresolved_target", "absent_from_gt")
+        BUG_DROPS = ("match_missed", "unaligned_target", "null_slot_missing")
+        n_expected = sum(reason_counts.get(k, 0) for k in EXPECTED_DROPS)
+        print(f"  expected exclusions (fast path out of scope): {n_expected} "
+              f"{ {k: reason_counts[k] for k in EXPECTED_DROPS if reason_counts.get(k)} }")
+        n_bugs = sum(reason_counts.get(k, 0) for k in BUG_DROPS)
+        print(f"  supervision defects (must be 0): {n_bugs} "
+              f"{ {k: reason_counts[k] for k in BUG_DROPS if reason_counts.get(k)} }")
+        if reason_counts.get("match_missed"):
+            print(f"[!] match_missed={reason_counts['match_missed']} on dev — matcher is losing "
+                  f"extractable targets; check target_spans/token offsets.")
+        if reason_counts.get("null_slot_missing"):
+            print(f"[!] null_slot_missing={reason_counts['null_slot_missing']} on dev — the mask "
+                  f"builder emitted no <|null|> candidate for a null GT param.")
+        if reason_counts.get("unaligned_target"):
+            print(f"[!] unaligned_target={reason_counts['unaligned_target']} on dev — target rows "
+                  f"carry neither canonical_value nor char_start.")
 else:
     print("dev.jsonl not found — run the tensorizer cell first")'''
 
@@ -666,136 +817,56 @@ if encoder is not None and hasattr(encoder, "eval"):
 print("LeanResolver ready (checkpoint =", CHECKPOINT_DIR, ")")'''
 
 MARKDOWN_EVAL_PART1 = """---
-## 5a. Evaluation Part 1 — Lean Parameter Extraction (Oracle Tool Given)
+## 5a. Evaluation Part 1 — Lean Parameter Extraction (Oracle Tool Given, Retrieval-First)
 
-Evaluates `resolver.try_resolve(gt_tool, ...)` directly on ground-truth tools. Because Lean Flow has no abstain head or gate vetoes, `res.payload_partial` and `res.parameters[p].value` directly reflect the decoded pointer predictions (with R4 equal-value aggregation and greedy top-1 fallback)."""
+Evaluates `resolver.try_resolve(gt_tool, ...)` directly on ground-truth tools. Because Lean Flow has no abstain head or gate vetoes, `res.payload_partial` and `res.parameters[p].value` directly reflect the decoded pointer predictions (with R4 equal-value aggregation and greedy top-1 fallback).
 
-CODE_EVAL_PART1 = '''import json, os
-from collections import Counter, defaultdict
-from spancall.data.schema import Stratum, UnifiedSample
+**Retrieval-first contract** (`docs/param_extraction_eval_coverage.md`): the pointer head can only *retrieve* a value that already exists in the context (utterance, recent context, time, enum, boolean, null). Params whose ground truth is `unresolved` (needs generation/transformation) are **out of scope** — refusing them is correct behaviour and routes the call to a slower path. So this cell reports:
 
-def _norm(v):
-    if v is None:
-        return None
-    s = str(v).strip()
-    return s.lower() if s.lower() in ("true", "false", "none", "null") else s
+- **extraction_recall / precision / F1** — headline quality, scored over *extractable* params only (the fast path's actual job). `n/a` means the denominator was empty (no predictions / no params), **not** a perfect score.
+- **fast_path_param_coverage / fast_path_call_coverage** — how much of the workload the fast path can serve at all.
+- **refused_unextractable vs missed_extractable** — splits the old `pointer_empty` bucket into *correct refusals* (routing signal) and *real fast-path failures* (the number to drive down).
+- **recall_all** — legacy blended view over every GT arg, kept as a diagnostic only (always ≤ extractable recall by construction).
+- **pointer_wrong** — predicted a value where GT expects a different value *or* `null`. Null-param false positives are counted here (they used to be invisible).
+- **exact_payload_match_F** — full-call match; **resolver_hit_rate_F** is the resolver's own schema-validity flag and is *not* GT accuracy (kept as a separate, clearly named diagnostic).
+- **E3 aligner drift** — Stratum-F samples whose GT args lack an extractable target. Non-zero is a **data** bug (aligner drift), not a model miss; it is printed with up to 10 example `sample_id:param` pairs.
+- **truncation** — `evaluated / total_available` so a `limit`-capped run is never mistaken for a full-split number.
 
-def eval_param_extraction_lean(split_name: str, limit: Optional[int] = 500):
-    src = os.path.join(DATA_DIR, f"{split_name}.jsonl")
-    if not os.path.exists(src):
-        print(f"File not found: {src}")
-        return
+Explicit `null` GT arguments are part of the GT universe (the fast path should select `<|null|>`), so they count in coverage and every denominator.
 
-    total = 0
-    stratum_f_total = 0
-    stratum_f_exact = 0
-    stratum_f_hits = 0
-    param_tp = 0
-    param_fp = 0
-    param_fn = 0
-    extracted = 0
-    confs = []
-    buckets = Counter()
-    pointer_wrong = 0
-    pointer_empty = 0
-    per_param = defaultdict(lambda: {"gt": 0, "tp": 0, "fp": 0, "fn": 0})
+Implementation lives in `spancall/lean/eval_p1.py` so it is unit-tested, not notebook-local."""
 
-    with open(src) as fh:
-        for line in fh:
-            if not line.strip():
-                continue
-            s = UnifiedSample.from_dict(json.loads(line))
-            if not s.ground_truth_calls or not s.tools:
-                continue
-            gt_call = s.ground_truth_calls[0]
-            gt_tool = next((t for t in s.tools if t.name == gt_call.tool_name), None)
-            if not gt_tool:
-                continue
+CODE_EVAL_PART1 = '''import math
+from spancall.lean.eval_p1 import eval_param_extraction_lean
 
-            total += 1
-            res = resolver.try_resolve(gt_tool, s.utterance, s.recent_context, s.current_time_iso)
-            gt_args = gt_call.arguments or {}
+def _m(key):
+    """Read a required metric; NaN renders as n/a (empty denominator, not 1.0)."""
+    v = p1_metrics[key]              # KeyError is intentional: no silent fallback
+    return "n/a" if isinstance(v, float) and math.isnan(v) else v
 
-            pred_args = {}
-            for p in gt_tool.parameters:
-                pr = res.parameters.get(p.name)
-                if pr is None:
-                    continue
-                buckets[pr.source_type] += 1
-                confs.append(pr.confidence)
-                if pr.value is not None:
-                    pred_args[p.name] = pr.value
+# Retrieval-first quality metrics live in spancall/lean/eval_p1.py (unit-tested).
+# NOTE: raises FileNotFoundError if EVAL_SPLIT was never built — loud by design.
+p1_metrics = eval_param_extraction_lean(
+    EVAL_SPLIT,
+    resolver=resolver,
+    data_dir=DATA_DIR,
+    limit=EVAL_LIMIT,
+    max_param_gap_report=25,
+)
 
-            norm_pred = {k: _norm(v) for k, v in pred_args.items()}
-            norm_gt = {k: _norm(v) for k, v in gt_args.items() if v is not None}
-            if s.stratum == Stratum.F:
-                stratum_f_total += 1
-                if norm_pred == norm_gt:
-                    stratum_f_exact += 1
-                if res.hit:
-                    stratum_f_hits += 1
-            if pred_args:
-                extracted += 1
-
-            for k, v in norm_pred.items():
-                if k in norm_gt and norm_gt[k] == v:
-                    param_tp += 1
-                else:
-                    param_fp += 1
-                    if k in norm_gt:
-                        pointer_wrong += 1
-            for k in norm_gt:
-                if k not in norm_pred:
-                    param_fn += 1
-                    pr = res.parameters.get(k)
-                    if pr is None or pr.value is None:
-                        pointer_empty += 1
-
-            if s.stratum == Stratum.F:
-                for p in gt_tool.parameters:
-                    pn = p.name
-                    st = per_param[pn]
-                    if pn in norm_gt:
-                        st["gt"] += 1
-                    if pn in norm_pred:
-                        if pn in norm_gt and norm_pred[pn] == norm_gt[pn]:
-                            st["tp"] += 1
-                        else:
-                            st["fp"] += 1
-                    elif pn in norm_gt:
-                        st["fn"] += 1
-
-            if limit is not None and total >= limit:
-                break
-
-    p = param_tp / max(1, param_tp + param_fp)
-    r = param_tp / max(1, param_tp + param_fn)
-    f1 = 2 * p * r / max(1e-8, p + r)
-    f_exact = stratum_f_exact / max(1, stratum_f_total)
-    f_hit = stratum_f_hits / max(1, stratum_f_total)
-    mean_conf = sum(confs) / max(1, len(confs))
-
-    print(f"=== Lean Parameter Extraction (Oracle Tool) on {split_name} (N={total}) ===")
-    print(f"Param Precision: {p:.4f} | Recall: {r:.4f} | F1: {f1:.4f}")
-    print(f"Exact Payload Match (Stratum F): {f_exact:.4f} ({stratum_f_exact}/{stratum_f_total})")
-    print(f"Schema-Valid Hit Rate (Stratum F): {f_hit:.4f} ({stratum_f_hits}/{stratum_f_total})")
-    print(f"Extraction Rate (>=1 param): {extracted/max(1,total):.4f} ({extracted}/{total})")
-    print(f"Mean candidate confidence: {mean_conf:.4f}")
-    print(f"Pointer wrong (pred != GT): {pointer_wrong} | Pointer empty/null: {pointer_empty}")
-    print(f"Per-param source_type distribution: {dict(buckets)}")
-
-    if per_param:
-        print("\\n--- Per-parameter extraction (Stratum F only; sorted by most false-negatives) ---")
-        print(f"{'param':<26}{'gt':>5}{'tp':>5}{'fp':>5}{'fn':>5}{'prec':>7}{'rec':>7}{'f1':>7}")
-        for pn, st in sorted(per_param.items(), key=lambda kv: (-kv[1]["fn"], -kv[1]["gt"])):
-            prec = st["tp"] / max(1, st["tp"] + st["fp"])
-            rec = st["tp"] / max(1, st["gt"])
-            f1p = 2 * prec * rec / max(1e-8, prec + rec)
-            print(f"{pn:<26}{st['gt']:>5}{st['tp']:>5}{st['fp']:>5}{st['fn']:>5}"
-                  f"{prec:>7.3f}{rec:>7.3f}{f1p:>7.3f}")
-    print("============================================================================")
-
-eval_param_extraction_lean(EVAL_SPLIT, limit=EVAL_LIMIT)'''
+tr = p1_metrics["truncation"]
+print("\\n--- Fast-path value proposition ---")
+print(f"split                  = {p1_metrics['split']}  "
+      f"(scored {tr['evaluated']} / {tr['total_available']} available"
+      f"{', TRUNCATED' if tr['truncated'] else ''})")
+print(f"extraction_recall        = {_m('extraction_recall')}")
+print(f"fast_path_param_coverage = {_m('fast_path_param_coverage')}")
+print(f"fast_path_call_coverage  = {_m('fast_path_call_coverage')}")
+print(f"correct refusals         = {_m('refused_unextractable')} "
+      f"| real fast-path misses = {_m('missed_extractable')} "
+      f"| pointer_wrong = {_m('pointer_wrong')}")
+print(f"E3 aligner drift         = {_m('e3_aligner_drift')} sample(s) "
+      f"(>0 is a DATA bug, not a model miss)")'''
 
 MARKDOWN_EVAL_PART2 = """---
 ## 5b. Evaluation Part 2 — Lean Function (Tool) Prediction (H1)
@@ -1281,7 +1352,7 @@ What ran:
   2. HF dataset ({HF_DATASET_ID}) → {DATA_DIR}
   3. 0-indexed Lean tensorizer → {TENSOR_DIR}
   4. Lean T2 training (scripts/train_lean.py) → {RESULTS_DIR}
-  5. LeanResolver eval Part 1 (Oracle Param Extraction) & Part 2 (H1 Tool Selection)
+  5. LeanResolver eval Part 1 (retrieval-first param extraction) & Part 2 (H1 Tool Selection)
   6. Eval Part 3 (End-to-End Function Calling: B1a vs Legacy vs Lean) on {EVAL_SPLIT}
   7. OOD / Adversarial test splits: {TEST_SPLITS}
   8. Optional Drive mirror @ {DRIVE_OUT}

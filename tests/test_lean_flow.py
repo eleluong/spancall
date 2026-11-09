@@ -6,9 +6,22 @@ import pytest
 import torch
 import torch.nn as nn
 
-from spancall.data.schema import GroundTruthCall, ParameterSchema, Stratum, ToolDefinition, UnifiedSample
+from spancall.data.schema import (
+    GroundTruthCall,
+    ParameterSchema,
+    SpanTarget,
+    Stratum,
+    ToolDefinition,
+    UnifiedSample,
+)
 from spancall.infer.resolver import FakeTokenizer
 from spancall.lean.decode import LeanJointDecoder
+from spancall.lean.eval_p1 import (
+    EXTRACTABLE_TARGET_TYPES,
+    e3_aligner_violation,
+    eval_param_extraction_lean,
+    param_is_groundable,
+)
 from spancall.lean.loss import LeanLossContainer, compute_lean_pointer_loss
 from spancall.lean.model import LeanPointerHead, LeanSpanCallModel
 from spancall.lean.resolver import LeanResolver
@@ -287,4 +300,504 @@ def test_lean_trainer_load_rows_filters_empty_abstain(tmp_path) -> None:
     # Full train(stages=("T2",)) over tmp_path
     summary = trainer.train(stages=("T2",))
     assert summary["T2"]["status"] == "ok"
+
+
+# --------------------------------------------------------------------------- #
+# Retrieval-first contract: supervision audit + groundable-only eval
+# --------------------------------------------------------------------------- #
+
+def _weather_schema(*params: ParameterSchema) -> ToolDefinition:
+    return ToolDefinition(
+        name="get_weather",
+        description="Get weather for a city",
+        parameters=list(params),
+    )
+
+
+def test_tensorize_classifies_unresolved_target_drop() -> None:
+    """A param whose only target is `unresolved` is excluded from pointer loss.
+
+    Under the retrieval-first contract that exclusion is CORRECT (the value must
+    be generated), but it must be *classified*, not silently swallowed.
+    """
+    tok = FakeTokenizer()
+    mb = CandidateMaskBuilder(max_seq_len=512, max_span_width=16)
+    schema = _weather_schema(
+        ParameterSchema(name="city", description="City name", param_type="string", required=True),
+        ParameterSchema(name="advice", description="Free-form advice", param_type="string", required=True),
+    )
+    sample = UnifiedSample(
+        sample_id="s-unresolved",
+        source_dataset="test",
+        utterance="weather in Tokyo",
+        tools=[schema],
+        ground_truth_calls=[
+            GroundTruthCall(tool_name="get_weather", arguments={"city": "Tokyo", "advice": "bring an umbrella"})
+        ],
+        current_time_iso="2026-11-09",
+        stratum=Stratum.F,
+        target_spans={
+            "city": [SpanTarget(param_name="city", target_type="utterance_span", canonical_value="Tokyo")],
+            "advice": [SpanTarget(param_name="advice", target_type="unresolved")],
+        },
+    )
+
+    stats: dict = {}
+    row = tensorize_sample_lean(sample, tok, mb, max_seq_len=512, pack_multi_tools=True, stats=stats)
+    assert row is not None
+    # city still supervised; advice dropped with the *expected* reason.
+    assert (row["pos_indices"][0] >= 0).any()
+    assert stats["param_drop_reasons"] == {"unresolved_target": 1}
+    assert row["_param_drop_reasons"] == ["unresolved_target"]
+
+
+def test_tensorize_flags_match_missed_for_extractable_target() -> None:
+    """An *extractable* target the matcher cannot resolve is a bug indicator.
+
+    `match_missed` must be reported separately from `unresolved_target`; it is
+    the counter that proves loss is not silently ignoring groundable params.
+    """
+    tok = FakeTokenizer()
+    mb = CandidateMaskBuilder(max_seq_len=512, max_span_width=16)
+    schema = _weather_schema(
+        ParameterSchema(name="city", description="City name", param_type="string", required=True),
+        ParameterSchema(name="secret", description="Hidden token", param_type="string", required=True),
+    )
+    sample = UnifiedSample(
+        sample_id="s-missed",
+        source_dataset="test",
+        utterance="weather in Tokyo",
+        tools=[schema],
+        ground_truth_calls=[
+            GroundTruthCall(tool_name="get_weather", arguments={"city": "Tokyo", "secret": "ZZZ-not-present"})
+        ],
+        current_time_iso="2026-11-09",
+        stratum=Stratum.F,
+        target_spans={
+            "city": [SpanTarget(param_name="city", target_type="utterance_span", canonical_value="Tokyo")],
+            # extractable in *type*, but absent from the context -> matcher miss
+            "secret": [SpanTarget(param_name="secret", target_type="utterance_span", canonical_value="ZZZ-not-present")],
+        },
+    )
+
+    stats: dict = {}
+    row = tensorize_sample_lean(sample, tok, mb, max_seq_len=512, pack_multi_tools=True, stats=stats)
+    assert stats["param_drop_reasons"] == {"match_missed": 1}
+    assert row["_param_drop_reasons"] == ["match_missed"]
+
+
+def test_tensorize_required_param_without_gt_is_not_match_missed() -> None:
+    """C3 regression: a targetless param with no GT arg is `absent_from_gt`.
+
+    The old classifier called this `match_missed`, producing a false alarm in
+    the tripwire for a param that simply is not part of the call.
+    """
+    tok = FakeTokenizer()
+    mb = CandidateMaskBuilder(max_seq_len=512, max_span_width=16)
+    schema = _weather_schema(
+        ParameterSchema(name="city", description="City name", param_type="string", required=True),
+        ParameterSchema(name="note", description="Free note", param_type="string", required=True),
+    )
+    sample = UnifiedSample(
+        sample_id="s-absent",
+        source_dataset="test",
+        utterance="weather in Tokyo",
+        tools=[schema],
+        ground_truth_calls=[GroundTruthCall(tool_name="get_weather", arguments={"city": "Tokyo"})],
+        current_time_iso="2026-11-09",
+        stratum=Stratum.F,
+        target_spans={
+            "city": [SpanTarget(param_name="city", target_type="utterance_span", canonical_value="Tokyo")],
+            # no target for "note" and no GT arg -> benign absence
+        },
+    )
+
+    stats: dict = {}
+    row = tensorize_sample_lean(sample, tok, mb, max_seq_len=512, pack_multi_tools=True, stats=stats)
+    assert row is not None
+    assert stats["param_drop_reasons"] == {"absent_from_gt": 1}
+
+
+def test_tensorize_unresolved_only_call_has_no_supervision_bug() -> None:
+    """C1 regression: an explicit-null GT param is supervised, not dropped.
+
+    `unit=None` with a `null_ctx` target must map to the deterministic
+    `<|null|>` slot, so it must NOT produce a drop reason at all.
+    """
+    tok = FakeTokenizer()
+    mb = CandidateMaskBuilder(max_seq_len=512, max_span_width=16)
+    schema = _weather_schema(
+        ParameterSchema(name="city", description="City name", param_type="string", required=True),
+        ParameterSchema(name="unit", description="Unit", param_type="string", required=False),
+    )
+    sample = UnifiedSample(
+        sample_id="s-null-supervised",
+        source_dataset="test",
+        utterance="weather in Tokyo",
+        tools=[schema],
+        ground_truth_calls=[
+            GroundTruthCall(tool_name="get_weather", arguments={"city": "Tokyo", "unit": None})
+        ],
+        current_time_iso="2026-11-09",
+        stratum=Stratum.F,
+        target_spans={
+            "city": [SpanTarget(param_name="city", target_type="utterance_span", canonical_value="Tokyo")],
+            "unit": [SpanTarget(param_name="unit", target_type="null_ctx")],
+        },
+    )
+
+    stats: dict = {}
+    row = tensorize_sample_lean(sample, tok, mb, max_seq_len=512, pack_multi_tools=True, stats=stats)
+    assert row is not None
+    assert stats.get("param_drop_reasons", {}) == {}
+    assert "_param_drop_reasons" not in row
+    # both params carry a positive slot
+    assert all((p >= 0).any() for p in row["pos_indices"])
+
+
+def test_tensorize_null_target_uses_single_deterministic_slot() -> None:
+    """`null_ctx` supervision resolves to exactly one candidate index."""
+    tok = FakeTokenizer()
+    mb = CandidateMaskBuilder(max_seq_len=512, max_span_width=16)
+    schema = _weather_schema(
+        ParameterSchema(name="city", description="City name", param_type="string", required=True),
+        ParameterSchema(name="unit", description="Unit", param_type="string", required=False),
+    )
+    sample = UnifiedSample(
+        sample_id="s-null",
+        source_dataset="test",
+        utterance="weather in Tokyo",
+        tools=[schema],
+        ground_truth_calls=[GroundTruthCall(tool_name="get_weather", arguments={"city": "Tokyo", "unit": None})],
+        current_time_iso="2026-11-09",
+        stratum=Stratum.F,
+        target_spans={
+            "city": [SpanTarget(param_name="city", target_type="utterance_span", canonical_value="Tokyo")],
+            "unit": [SpanTarget(param_name="unit", target_type="null_ctx")],
+        },
+    )
+
+    row = tensorize_sample_lean(sample, tok, mb, max_seq_len=512, pack_multi_tools=True)
+    assert row is not None
+    unit_pos = [pi for pi in row["pos_indices"][1].tolist() if pi >= 0]
+    assert len(unit_pos) == 1, f"null_ctx must map to exactly one slot, got {unit_pos}"
+
+
+def test_param_is_groundable_uses_extractable_target_types() -> None:
+    schema = _weather_schema(
+        ParameterSchema(name="city", description="c", param_type="string", required=True),
+        ParameterSchema(name="advice", description="a", param_type="string", required=True),
+    )
+    sample = UnifiedSample(
+        sample_id="s-ground",
+        source_dataset="test",
+        utterance="weather in Tokyo",
+        tools=[schema],
+        ground_truth_calls=[GroundTruthCall(tool_name="get_weather", arguments={"city": "Tokyo", "advice": "x"})],
+        target_spans={
+            "city": [SpanTarget(param_name="city", target_type="utterance_span", canonical_value="Tokyo")],
+            "advice": [SpanTarget(param_name="advice", target_type="unresolved")],
+        },
+    )
+    assert "utterance_span" in EXTRACTABLE_TARGET_TYPES
+    assert param_is_groundable(sample, "city") is True
+    assert param_is_groundable(sample, "advice") is False
+    assert param_is_groundable(sample, "missing") is False
+
+
+class _StubResolution(SimpleNamespace):
+    """Minimal LeanParameterResolution stand-in (value/confidence/source_type)."""
+
+
+class _StubResolveResult(SimpleNamespace):
+    pass
+
+
+class _StubResolver:
+    """Resolver stub returning scripted per-param values (keyed by param name)."""
+
+    def __init__(self, scripted: dict) -> None:
+        self.scripted = scripted
+
+    def try_resolve(self, tool, utterance, recent_context=None, now=None):
+        params = {
+            name: _StubResolution(value=value, confidence=0.9, source_type="utterance")
+            for name, value in self.scripted.items()
+        }
+        pred = {k: v.value for k, v in params.items() if v.value is not None}
+        return _StubResolveResult(
+            parameters=params,
+            payload_partial=pred,
+            hit=bool(pred),
+            tool_name=getattr(tool, "name", ""),
+        )
+
+
+def test_eval_param_extraction_scores_groundable_params_only(tmp_path) -> None:
+    """Eval must not punish the fast path for refusing a generation-only param.
+
+    `city` is extractable and predicted correctly; `advice` is `unresolved` and
+    refused. Headline extraction metrics must be perfect (1.0), while the legacy
+    blended `recall_all` drops to 0.5, and the refusal is booked as
+    `refused_unextractable` (NOT as a fast-path miss).
+    """
+    schema = _weather_schema(
+        ParameterSchema(name="city", description="City name", param_type="string", required=True),
+        ParameterSchema(name="advice", description="Free-form advice", param_type="string", required=True),
+    )
+    record = {
+        "sample_id": "e1",
+        "source_dataset": "test",
+        "utterance": "weather in Tokyo",
+        "tools": [
+            {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": [
+                    {"name": "city", "description": "City", "param_type": "string", "required": True},
+                    {"name": "advice", "description": "Advice", "param_type": "string", "required": True},
+                ],
+            }
+        ],
+        "ground_truth_calls": [
+            {"tool_name": "get_weather", "arguments": {"city": "Tokyo", "advice": "bring an umbrella"}}
+        ],
+        "current_time_iso": "2026-11-09",
+        "stratum": "F",
+        "target_spans": {
+            "city": [{"param_name": "city", "target_type": "utterance_span", "canonical_value": "Tokyo"}],
+            "advice": [{"param_name": "advice", "target_type": "unresolved"}],
+        },
+    }
+    import json
+    with open(tmp_path / "eval_split.jsonl", "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(record) + "\n")
+
+    metrics = eval_param_extraction_lean(
+        "eval_split",
+        resolver=_StubResolver({"city": "Tokyo"}),
+        data_dir=str(tmp_path),
+        limit=10,
+        max_param_gap_report=5,
+    )
+
+    assert metrics["n"] == 1
+    # Headline: the extractable param was retrieved correctly.
+    assert metrics["extraction_recall"] == 1.0
+    assert metrics["extraction_precision"] == 1.0
+    assert metrics["extraction_f1"] == 1.0
+    # Legacy blended view mixes in the out-of-scope param -> 0.5.
+    assert metrics["recall_all"] == 0.5
+    # Coverage + refusal accounting.
+    assert metrics["fast_path_param_coverage"] == 0.5
+    assert metrics["fast_path_call_coverage"] == 0.0
+    assert metrics["missed_extractable"] == 0
+    assert metrics["refused_unextractable"] == 1
+    # Exact match requires the out-of-scope param too -> correctly 0 here.
+    assert metrics["exact_payload_match_F"] == 0.0
+    assert metrics["exact_payload_match_F_n"] == 0
+    assert metrics["stratum_f_n"] == 1
+    # S5: the resolver's own hit flag is reported under a non-misleading name.
+    assert "hit_rate_F" not in metrics
+    assert "resolver_hit_rate_F" in metrics
+    # S6: truncation accounting is present.
+    assert metrics["truncation"] == {
+        "evaluated": 1,
+        "total_available": 1,
+        "truncated": False,
+    }
+
+
+def _write_split(tmp_path, records, name="eval_split"):
+    import json
+    with open(tmp_path / f"{name}.jsonl", "w", encoding="utf-8") as fh:
+        for rec in records:
+            fh.write(json.dumps(rec) + "\n")
+    return name
+
+
+def _weather_record(arguments, target_spans, sample_id="r", stratum="F"):
+    return {
+        "sample_id": sample_id,
+        "source_dataset": "test",
+        "utterance": "weather in Tokyo",
+        "tools": [
+            {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": [
+                    {"name": "city", "description": "City", "param_type": "string", "required": True},
+                    {"name": "unit", "description": "Unit", "param_type": "string?null", "required": False},
+                ],
+            }
+        ],
+        "ground_truth_calls": [{"tool_name": "get_weather", "arguments": arguments}],
+        "current_time_iso": "2026-11-09",
+        "stratum": stratum,
+        "target_spans": target_spans,
+    }
+
+
+def test_eval_counts_explicit_null_gt_param_as_groundable(tmp_path) -> None:
+    """C1+C2 regression: a null-only call is 100% fast-path coverable.
+
+    Before the fix, `unit=None` was filtered out of the GT universe, so
+    coverage was 0.5 and a null-only call could never be "fully extractable".
+    """
+    name = _write_split(tmp_path, [
+        _weather_record(
+            {"city": "Tokyo", "unit": None},
+            {
+                "city": [{"param_name": "city", "target_type": "utterance_span", "canonical_value": "Tokyo"}],
+                "unit": [{"param_name": "unit", "target_type": "null_ctx"}],
+            },
+        )
+    ])
+
+    class _NullResolver:
+        def try_resolve(self, tool, utterance, recent_context=None, now=None):
+            params = {
+                "city": _StubResolution(value="Tokyo", confidence=0.9, source_type="utterance"),
+                "unit": _StubResolution(value=None, confidence=0.9, source_type="null"),
+            }
+            return _StubResolveResult(
+                parameters=params,
+                payload_partial={"city": "Tokyo"},
+                hit=True,
+                tool_name=getattr(tool, "name", ""),
+            )
+
+    metrics = eval_param_extraction_lean(
+        name, resolver=_NullResolver(), data_dir=str(tmp_path), limit=10, max_param_gap_report=5
+    )
+    # Both GT params are in scope and both were retrieved correctly.
+    assert metrics["fast_path_param_coverage"] == 1.0
+    assert metrics["fast_path_call_coverage"] == 1.0
+    assert metrics["extraction_recall"] == 1.0
+    assert metrics["extraction_precision"] == 1.0
+    assert metrics["missed_extractable"] == 0
+    assert metrics["pointer_wrong"] == 0
+    assert metrics["exact_payload_match_F"] == 1.0
+    assert metrics["param_counts"]["total_gt_params"] == 2
+
+
+def test_eval_counts_null_param_false_positive_as_pointer_wrong(tmp_path) -> None:
+    """C4 regression: predicting a value for a null GT param is `pointer_wrong`.
+
+    Previously the param was absent from the GT universe, so the FP silently
+    vanished from `pointer_wrong` while still hurting precision.
+    """
+    name = _write_split(tmp_path, [
+        _weather_record(
+            {"city": "Tokyo", "unit": None},
+            {
+                "city": [{"param_name": "city", "target_type": "utterance_span", "canonical_value": "Tokyo"}],
+                "unit": [{"param_name": "unit", "target_type": "null_ctx"}],
+            },
+        )
+    ])
+
+    class _BadResolver:
+        def try_resolve(self, tool, utterance, recent_context=None, now=None):
+            params = {
+                "city": _StubResolution(value="Tokyo", confidence=0.9, source_type="utterance"),
+                "unit": _StubResolution(value="fahrenheit", confidence=0.9, source_type="utterance"),
+            }
+            return _StubResolveResult(
+                parameters=params,
+                payload_partial={"city": "Tokyo", "unit": "fahrenheit"},
+                hit=True,
+                tool_name=getattr(tool, "name", ""),
+            )
+
+    metrics = eval_param_extraction_lean(
+        name, resolver=_BadResolver(), data_dir=str(tmp_path), limit=10, max_param_gap_report=5
+    )
+    assert metrics["pointer_wrong"] == 1
+    assert metrics["param_counts"]["extractable_fp"] == 1
+    # A wrong value is a false POSITIVE, so precision halves but recall holds.
+    assert metrics["extraction_precision"] == 0.5
+    assert metrics["extraction_recall"] == 1.0
+
+
+def test_eval_reports_nan_precision_when_nothing_predicted(tmp_path) -> None:
+    """S1 regression: zero predictions must be `n/a`, not a fake precision of 1.0."""
+    import math
+    name = _write_split(tmp_path, [
+        _weather_record(
+            {"city": "Tokyo"},
+            {"city": [{"param_name": "city", "target_type": "utterance_span", "canonical_value": "Tokyo"}]},
+        )
+    ])
+
+    class _RefusingResolver:
+        def try_resolve(self, tool, utterance, recent_context=None, now=None):
+            return _StubResolveResult(parameters={}, payload_partial={}, hit=False, tool_name="get_weather")
+
+    metrics = eval_param_extraction_lean(
+        name, resolver=_RefusingResolver(), data_dir=str(tmp_path), limit=10, max_param_gap_report=5
+    )
+    assert math.isnan(metrics["extraction_precision"])
+    assert metrics["extraction_recall"] == 0.0
+    assert math.isnan(metrics["extraction_f1"])
+    assert metrics["missed_extractable"] == 1
+
+
+def test_eval_e3_tripwire_flags_stratum_f_aligner_drift(tmp_path) -> None:
+    """E3 regression: a Stratum-F GT arg with no extractable target is drift."""
+    name = _write_split(tmp_path, [
+        _weather_record(
+            {"city": "Tokyo", "unit": None},
+            {"city": [{"param_name": "city", "target_type": "utterance_span", "canonical_value": "Tokyo"}]},
+            sample_id="drift-1",
+        )
+    ])
+
+    class _OkResolver:
+        def try_resolve(self, tool, utterance, recent_context=None, now=None):
+            params = {"city": _StubResolution(value="Tokyo", confidence=0.9, source_type="utterance")}
+            return _StubResolveResult(
+                parameters=params, payload_partial={"city": "Tokyo"}, hit=True, tool_name="get_weather"
+            )
+
+    metrics = eval_param_extraction_lean(
+        name, resolver=_OkResolver(), data_dir=str(tmp_path), limit=10, max_param_gap_report=5
+    )
+    # `unit` has a GT arg but no target row at all -> aligner drift.
+    assert metrics["e3_aligner_drift"] == 1
+    assert metrics["e3_examples"] == ["drift-1:unit:no_target"]
+
+
+def test_e3_aligner_violation_accepts_clean_and_unresolved_cases() -> None:
+    schema = _weather_schema(
+        ParameterSchema(name="city", description="c", param_type="string", required=True),
+        ParameterSchema(name="advice", description="a", param_type="string", required=True),
+    )
+    clean = UnifiedSample(
+        sample_id="ok",
+        source_dataset="test",
+        utterance="weather in Tokyo",
+        tools=[schema],
+        ground_truth_calls=[
+            GroundTruthCall(tool_name="get_weather", arguments={"city": "Tokyo", "advice": "x"})
+        ],
+        target_spans={
+            "city": [SpanTarget(param_name="city", target_type="utterance_span", canonical_value="Tokyo")],
+            "advice": [SpanTarget(param_name="advice", target_type="unresolved")],
+        },
+    )
+    assert e3_aligner_violation(clean, {"city": "Tokyo"}, schema) is None
+    # An `unresolved` target is NOT extractable -> violation for that param.
+    assert e3_aligner_violation(clean, {"advice": "x"}, schema) == "advice:unresolved"
+
+
+def test_eval_raises_for_missing_split(tmp_path) -> None:
+    """S4 regression: a missing split must be loud, not a silent zero-metric run."""
+    with pytest.raises(FileNotFoundError, match="Eval split not found"):
+        eval_param_extraction_lean(
+            "does_not_exist",
+            resolver=_StubResolver({}),
+            data_dir=str(tmp_path),
+            limit=10,
+        )
 

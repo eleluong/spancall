@@ -134,11 +134,20 @@ def tensorize_sample_lean(
     max_cands: int = 512,
     max_pos: int = 8,
     pack_multi_tools: bool = False,
+    stats: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Direct tensorization of UnifiedSample into Lean training format.
 
     Eliminates column-0 abstain: candidate positions are 0-indexed in [0, C).
     Rows with no positive candidate are padded with -1.
+
+    Under the retrieval-first contract (docs/param_extraction_eval_coverage.md),
+    unmatched Stratum-F params are classified instead of silently dropped:
+    ``unresolved_target`` (genuinely unextractable → in-scope exclusion) vs
+    ``match_missed`` (groundable target but matcher failed → bug indicator).
+    Counts are accumulated into ``stats["param_drop_reasons"]`` when supplied,
+    and the per-row classification is attached as ``_param_drop_reasons`` for
+    the tensorize/sanity cells to report.
     """
     if not sample.tools or not sample.ground_truth_calls:
         return None
@@ -239,14 +248,31 @@ def tensorize_sample_lean(
     cand_start_rows: List[List[int]] = []
     cand_end_rows: List[List[int]] = []
     pos_rows: List[List[int]] = []
+    # L1: per-param drop-reason audit (only populated for Stratum-F rows when
+    # a param ends up with NO matched positive). ``stats`` is an optional
+    # mutable dict the caller (tensorize stats cell / sanity cell) can read.
+    drop_reasons: List[str] = []
 
     gt_args = dict(gt_call.arguments or {})
     is_stratum_f = (sample.stratum == Stratum.F) or (str( getattr(sample.stratum, "value", sample.stratum)) == "F")
+
+    # L2: deterministic <|null|> supervision — the <|null|> slot is resolved
+    # per param (candidate sets differ per param), always at the SAME position
+    # the mask builder emitted it, with no best-effort region search that can
+    # silently vanish when the mask builder changes.
+    def _find_null_idx(cands_list: List[Any]) -> Optional[int]:
+        for ci, c in enumerate(cands_list):
+            if getattr(c, "region", "") == "null":
+                return ci
+        return None
 
     for idx, param in enumerate(gt_tool.parameters):
         masks = mask_builder.build_param_masks(param, out.entries, offsets, out.text)
         cands = list(masks["candidates"])
 
+        # Per-param deterministic <|null|> slot (appended last by
+        # _null_candidates; absent for required non-nullable params).
+        null_ci: Optional[int] = _find_null_idx(cands)
         matched_cis: List[int] = []
         targets = (sample.target_spans or {}).get(param.name, [])
 
@@ -255,10 +281,9 @@ def tensorize_sample_lean(
                 if t.target_type == "unresolved":
                     continue
                 if t.target_type == "null_ctx":
-                    for ci, c in enumerate(cands):
-                        if c.region == "null" and ci not in matched_cis:
-                            matched_cis.append(ci)
-                            break
+                    # L2: deterministic null slot instead of worst-effort search
+                    if null_ci is not None and null_ci not in matched_cis:
+                        matched_cis.append(null_ci)
                     continue
                 found = False
                 if t.canonical_value is not None:
@@ -281,7 +306,12 @@ def tensorize_sample_lean(
 
             # Direct argument fallback if target_spans missed
             if not matched_cis:
+                # C1: distinguish "GT arg is explicitly null" from "GT arg absent".
+                # ``.get()`` returns None for both; only the former is a real
+                # supervision signal that must map to the <|null|> slot.
+                gt_present = param.name in gt_args
                 gt_val = gt_args.get(param.name)
+                gt_is_null = gt_present and gt_val is None
                 if gt_val is not None:
                     for ci, c in enumerate(cands):
                         if c.canon_value is not None:
@@ -290,12 +320,49 @@ def tensorize_sample_lean(
                             if c.canon_value == gt_val or c_val == g_val:
                                 if ci not in matched_cis:
                                     matched_cis.append(ci)
-                elif not param.required or "null" in (param.param_type or "").lower():
-                    # Optional/nullable parameter omitted or None -> point to <|null|>
-                    for ci, c in enumerate(cands):
-                        if c.region == "null" and ci not in matched_cis:
-                            matched_cis.append(ci)
-                            break
+                elif gt_is_null or not param.required or "null" in (param.param_type or "").lower():
+                    # Explicit null GT, or an optional/nullable param omitted by
+                    # the utterance -> deterministic <|null|> slot.
+                    if null_ci is not None and null_ci not in matched_cis:
+                        matched_cis.append(null_ci)
+
+            # L1: classify WHY a Stratum-F param ended up with no positive.
+            # Only ONE of these is expected under the retrieval-first contract
+            # ('unresolved_target'); everything else is a data-pipeline or
+            # alignment defect that must not hide behind the legitimate
+            # exclusion. See docs/param_extraction_eval_coverage.md §4.
+            if not matched_cis:
+                has_unresolved = any(t.target_type == "unresolved" for t in targets)
+                has_null_target = any(t.target_type == "null_ctx" for t in targets)
+                all_unaligned = bool(targets) and all(
+                    getattr(t, "canonical_value", None) is None
+                    and getattr(t, "char_start", None) is None
+                    for t in targets
+                )
+                gt_present = param.name in gt_args
+                gt_is_null = gt_present and gt_args.get(param.name) is None
+                if has_unresolved:
+                    # Expected: needs generation -> fast path must refuse.
+                    why = "unresolved_target"
+                elif all_unaligned and not has_null_target:
+                    # Target row exists but carries neither a canonical value
+                    # nor a span -> the aligner produced an unusable target.
+                    why = "unaligned_target"
+                elif (has_null_target or gt_is_null) and null_ci is None:
+                    # We know the answer is "null" but the mask builder emitted
+                    # no <|null|> candidate for this param -> cannot supervise.
+                    why = "null_slot_missing"
+                elif not targets and not gt_present:
+                    # No target and no GT arg: the param simply is not part of
+                    # this call's supervision set (e.g. optional, omitted).
+                    why = "absent_from_gt"
+                else:
+                    # Extractable target existed but the matcher failed: BUG.
+                    why = "match_missed"
+                drop_reasons.append(why)
+                if stats is not None:
+                    stats.setdefault("param_drop_reasons", {})
+                    stats["param_drop_reasons"][why] = stats["param_drop_reasons"].get(why, 0) + 1
 
         # Cap candidates if necessary
         if len(cands) > max_cands:
@@ -350,6 +417,11 @@ def tensorize_sample_lean(
         "pos_indices": torch.tensor(pos_rows, dtype=torch.long),
         "_lean_converted": True,
     }
+
+    # L1: expose the per-row drop-reason classification (names, not just counts)
+    # so callers can surface ``match_missed`` rates without re-deriving them.
+    if drop_reasons:
+        row["_param_drop_reasons"] = drop_reasons
 
     if pack_multi_tools and tool_positions:
         row["tool_positions"] = torch.tensor(tool_positions, dtype=torch.long)
