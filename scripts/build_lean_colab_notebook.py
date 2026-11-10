@@ -278,12 +278,32 @@ from transformers import AutoTokenizer
 from span_template import SPECIAL_MARKER_TOKENS
 from spancall.data.schema import UnifiedSample
 from spancall.model.masks import CandidateMaskBuilder
-from spancall.lean.tensorize import tensorize_sample_lean, has_positive_targets
+from spancall.lean.tensorize import ToolPool, tensorize_sample_lean, has_positive_targets
 
 tokenizer = AutoTokenizer.from_pretrained(BACKBONE, use_fast=True)
 tokenizer.add_special_tokens({"additional_special_tokens": list(SPECIAL_MARKER_TOKENS)})
 mask_builder = CandidateMaskBuilder(max_seq_len=MAX_SEQ_LEN, max_span_width=MAX_SPAN_WIDTH)
-print("tokenizer ready; vocab =", len(tokenizer), "| MAX_SEQ_LEN =", MAX_SEQ_LEN)'''
+
+# ---- H1 candidate breadth -------------------------------------------------
+# Hermes rows ship ONE tool each, so packing only s.tools renders a single
+# <|tool|> anchor: tool_logits is (B, 1), argmax is always 0, tool_targets is
+# always 0 => tool_acc = 1.0 for ANY weights and CE over one class = 0 (H1 gets
+# no gradient). PACK_TOOLS > 1 packs real distractor schemas from the corpus so
+# H1 becomes an actual discrimination task.
+import yaml
+# Guarded read: a missing/unparsable config must not kill the notebook, and a
+# silent fallback of 1 would reintroduce the vacuous single-candidate H1.
+PACK_TOOLS = 1
+try:
+    with open(os.path.join(str(PROJECT_ROOT), "configs", "default.yaml")) as _fh:
+        _default_cfg = yaml.safe_load(_fh) or {}
+    PACK_TOOLS = int((_default_cfg.get("data") or {}).get("pack_tools", 1) or 1)
+except Exception as _exc:  # noqa: BLE001 - reported, never silent
+    print(f"[!] configs/default.yaml unreadable ({type(_exc).__name__}: {_exc}); "
+          f"defaulting PACK_TOOLS=1 -> H1 will be a single-class softmax (CE == 0).")
+TOOL_POOL = None  # bound (once) in the tensorize cell, before forking
+print("tokenizer ready; vocab =", len(tokenizer), "| MAX_SEQ_LEN =", MAX_SEQ_LEN,
+      "| PACK_TOOLS =", PACK_TOOLS)'''
 
 CODE_TENSOR_RUN = '''# ---- tensorize splits into Lean 0-indexed format (parallel fork pool) ----
 
@@ -333,7 +353,22 @@ def _tensorize_lean_task(args):
             max_pos=int(MAX_POS),
             pack_multi_tools=pack_multi,
             stats=ts_stats,
+            # Read the pool from the MODULE GLOBAL, not the task tuple. Under the
+            # "fork" context every child already inherits the parent's globals,
+            # so passing the pool in the tuple only pickled the entire schema
+            # corpus once per row (measured: 4.2 GB of redundant pickling on a
+            # 50k-row split). Rebind ``TOOL_POOL``/``PACK_TOOLS_EPH`` before
+            # calling _tensorize_many; the fallback path reads the same globals.
+            tool_pool=TOOL_POOL,
+            pack_tools=PACK_TOOLS_EPH,
         )
+        # Anchor-snap misses must be visible: a bridge_text tool line the
+        # tokenizer could not map back to tokens means that H1 candidate was
+        # emitted as PAD_INDEX (-1) and is invisible to the tool head.
+        if ts_stats.get("tool_snap_misses"):
+            drops["tool_snap_miss"] = drops.get("tool_snap_miss", 0) + int(
+                ts_stats["tool_snap_misses"]
+            )
         # L1 audit: classify Stratum-F params that ended up with NO positive.
         #   unresolved_target -> needs generation/transform; OUT OF SCOPE for the
         #                        retrieval-first fast path (correct exclusion).
@@ -382,7 +417,10 @@ def _tensorize_many(raw, pack_multi: bool, need, workers: int):
                 done = False
                 for start in range(0, len(raw), _CHUNK):
                     batch = raw[start:start + _CHUNK]
-                    for res in ex.map(_tensorize_lean_task, [(d, pack_multi) for d in batch]):
+                    for res in ex.map(
+                        _tensorize_lean_task,
+                        [(d, pack_multi) for d in batch],
+                    ):
                         if _take(res):
                             done = True
                             break
@@ -410,6 +448,41 @@ stats = {}
 drop_summary = {}
 error_summary = {}
 
+# ---- ONE distractor pool, built from TRAIN rows only ----------------------
+# Two independent reasons this is a single pool hoisted out of the split loop:
+#  1. LEAKAGE: building the pool per split seeded the dev/eval distractor set
+#     with dev/eval schemas, i.e. held-out schemas influenced the very
+#     candidate list the model is scored on. Train-only removes that channel
+#     (a dev row's GT tool still comes from the row itself, never the pool).
+#  2. The pool is a plain Python object. Binding it ONCE to the module global
+#     below lets the fork pool inherit it by reference: it never enters the
+#     task tuple, so it is never re-pickled per row.
+POOL_SOURCE = SPLIT_INPUTS.get("t2") or next(iter(SPLIT_INPUTS.values()))
+_pool_path = os.path.join(DATA_DIR, POOL_SOURCE)
+if PACK_TOOLS > 1:
+    if not os.path.exists(_pool_path):
+        print(f"[!] tool-pool source missing ({_pool_path}) -> H1 distractors "
+              f"disabled; tool_acc will be a single-class artifact.")
+        TOOL_POOL = None
+    else:
+        TOOL_POOL = ToolPool.from_row_dicts(_iter_raw_lines(_pool_path), seed=SEED)
+        print(f"[tool-pool] built once from {POOL_SOURCE}: {len(TOOL_POOL)} "
+              f"distinct schemas (pack_tools={PACK_TOOLS})")
+        if len(TOOL_POOL) < PACK_TOOLS:
+            print(f"[!VACUOUS-H1] pool holds {len(TOOL_POOL)} schemas but "
+                  f"pack_tools={PACK_TOOLS}: no row can reach T={PACK_TOOLS}. "
+                  f"Lower data.pack_tools or ingest more schemas.")
+        if TOOL_POOL.n_duplicates:
+            print(f"[tool-pool] {TOOL_POOL.n_duplicates} duplicate schema name(s) "
+                  f"collapsed; {len(TOOL_POOL.name_collisions)} of them had a "
+                  f"DIFFERING definition (first kept): "
+                  f"{TOOL_POOL.name_collisions[:10]}")
+else:
+    TOOL_POOL = None
+    print("[tool-pool] pack_tools=1 -> no distractors (H1 will be vacuous: "
+          "CE == 0, tool_acc == 1.0 for any weights).")
+PACK_TOOLS_EPH = int(PACK_TOOLS) if TOOL_POOL is not None else 1
+
 for (in_name, pack_multi), out_names in groups.items():
     src = os.path.join(DATA_DIR, in_name)
     if not os.path.exists(src):
@@ -422,7 +495,9 @@ for (in_name, pack_multi), out_names in groups.items():
         lim = SAMPLE_LIMITS.get(on)
         if lim is not None:
             need = lim if need is None else max(need, lim)
-    rows, drops, errors = _tensorize_many(raw, pack_multi, need, TENSORIZE_WORKERS)
+    rows, drops, errors = _tensorize_many(
+        raw, pack_multi, need, TENSORIZE_WORKERS,
+    )
     missed = int(drops.get("match_missed", 0))
     unresolved = int(drops.get("unresolved_target", 0))
     drop_summary[in_name] = dict(drops)
@@ -435,6 +510,20 @@ for (in_name, pack_multi), out_names in groups.items():
         with open(out_path, "w") as fh:
             for r in out_rows:
                 fh.write(json.dumps(r) + "\\n")
+        # LIVE anchors only (>= 0). A row with zero live anchors carries NO H1
+        # supervision, so counting it as "1 candidate" would dilute the mean
+        # toward the vacuity threshold and hide a real problem. n_rows_h1 is
+        # the honest denominator: rows H1 can actually learn from.
+        cand_counts = [
+            int(r.get("_n_tool_candidates", 0)) for r in out_rows
+            if int(r.get("_n_tool_candidates", 0)) > 0
+        ]
+        cand_hist: Dict[int, int] = {}
+        for c in cand_counts:
+            cand_hist[c] = cand_hist.get(c, 0) + 1
+        mean_cands = (sum(cand_counts) / len(cand_counts)) if cand_counts else float("nan")
+        n_rows_h1 = len(cand_counts)
+        n_rows_no_h1 = len(out_rows) - n_rows_h1
         stats[on] = {
             "rows": len(out_rows),
             "filtered_or_dropped": len(raw) - len(rows),
@@ -442,6 +531,15 @@ for (in_name, pack_multi), out_names in groups.items():
             "fraction": DATA_FRACTION,
             "pack_multi": pack_multi,
             "limit": limit,
+            "pack_tools": PACK_TOOLS_EPH,
+            "tool_pool_size": len(TOOL_POOL) if TOOL_POOL is not None else 0,
+            "rows_with_h1_supervision": n_rows_h1,
+            "rows_without_h1_supervision": n_rows_no_h1,
+            # NaN (not 0.0) when H1 has nothing to score: 0.0 reads as a real
+            # measurement and silently passes any `< 1.5` check downstream.
+            "mean_n_candidates": (round(mean_cands, 3)
+                                  if mean_cands == mean_cands else None),
+            "n_candidates_hist": {str(k): v for k, v in sorted(cand_hist.items())},
             "param_drop_match_missed": missed,
             "param_drop_unresolved": unresolved,
             "param_drop_other": {k: v for k, v in drops.items()
@@ -450,6 +548,23 @@ for (in_name, pack_multi), out_names in groups.items():
         }
         print(f"wrote {on}.jsonl: {len(out_rows)} groundable rows "
               f"({len(raw) - len(rows)} ungroundable/Stratum-A/over-length filtered)")
+        if n_rows_h1 == 0:
+            print(f"  [!VACUOUS-H1] {on}: NO row carries an H1 anchor at all "
+                  f"(pack_tools={PACK_TOOLS_EPH}, pool="
+                  f"{len(TOOL_POOL) if TOOL_POOL is not None else 0}). tool_acc is "
+                  f"undefined here, not 1.0 — check the tensorize errors above.")
+        elif mean_cands < 1.5:
+            print(f"  [!VACUOUS-H1] {on}: mean candidates/row={mean_cands:.2f} over "
+                  f"{n_rows_h1} H1 rows (hist={dict(sorted(cand_hist.items()))}) -> "
+                  f"tool_acc is an artifact and H1 gets ~zero gradient. "
+                  f"Check pack_tools/tool pool.")
+        else:
+            print(f"  [tool] {on}: mean candidates/row={mean_cands:.2f} over "
+                  f"{n_rows_h1} H1 rows (hist={dict(sorted(cand_hist.items()))}) -> "
+                  f"H1 is a real {int(round(mean_cands))}-way discrimination task.")
+        if n_rows_no_h1:
+            print(f"  [i] {on}: {n_rows_no_h1} row(s) have no live H1 anchor "
+                  f"(no candidates packed, or the GT anchor failed to snap).")
     if missed:
         print(f"  [!] MATCH_MISSED={missed} on {in_name}: extractable targets the matcher "
               f"failed on -> these params get NO pointer supervision (real bug).")
@@ -458,6 +573,10 @@ for (in_name, pack_multi), out_names in groups.items():
     for k in sorted(other):
         label = "BUG" if k in ("unaligned_target", "null_slot_missing") else "note"
         print(f"  [{label}] {k}={other[k]} on {in_name}")
+    if other.get("tool_snap_miss"):
+        print(f"  [!] tool_snap_miss={other['tool_snap_miss']} on {in_name}: "
+              f"<|tool|> bridge lines the tokenizer could not map to tokens. Those "
+              f"candidates are PAD_INDEX(-1), i.e. invisible to H1.")
     if unresolved:
         print(f"  [i] unresolved_target={unresolved} on {in_name}: needs generation/transform; "
               f"out of scope for the retrieval-first fast path (correct exclusion).")
@@ -526,6 +645,79 @@ if os.path.exists(dev_path):
         c_len = len(r["cand_starts"][0]) if r.get("cand_starts") and len(r["cand_starts"]) > 0 else 0
         print("input_ids:", len(r.get("input_ids", [])), "seq_len; params K =", len(r.get("param_positions", [])),
               "cand (K,C) =", len(r.get("cand_starts", [])), "x", c_len)
+
+        # ---- H1 trainability probe: T = number of <|tool|> candidate anchors
+        # per row. T == 1 => softmax over a single class => CE == 0 (zero
+        # gradient, H1 never trains) and argmax(-1) == 0 == gt => tool_acc is a
+        # vacuous 1.0000 for ANY weights. T > 1 => H1 is a real task. This is
+        # THE number that explains a "perfect" tool_acc, so it is printed on
+        # its face instead of hidden behind the accuracy.
+        def _tool_positions(r):
+            """Unwrap tool_positions; the row may have been serialized as [[...]]."""
+            tp = r.get("tool_positions") or []
+            if tp and isinstance(tp[0], list):
+                return tp[0]
+            return tp
+
+        tool_rows = [r for r in rows if "tool_positions" in r]
+        t_hist = Counter()
+        n_dead_slots = 0
+        for r in tool_rows:
+            # LIVE anchors only: a slot that failed to snap is PAD_INDEX (-1) and
+            # is masked out of the logits, so it is NOT a choice H1 can make.
+            # Counting raw list length would report T=3 for a row with one live
+            # anchor plus two dead slots and claim H1 is a 3-way task.
+            tp = _tool_positions(r)
+            live = sum(1 for p in tp if int(p) >= 0)
+            n_dead_slots += len(tp) - live
+            t_hist[live] += 1
+        n_tool_rows = len(tool_rows)
+        n_h1_rows = sum(v for k, v in t_hist.items() if k > 0)
+        mean_t = (sum(k * v for k, v in t_hist.items()) / n_h1_rows) if n_h1_rows else 0.0
+        n_multi = sum(v for k, v in t_hist.items() if k > 1)
+        print(f"H1 live candidates/row T: mean={mean_t:.2f} over {n_h1_rows} trainable rows; "
+              f"hist={dict(sorted(t_hist.items()))}; dead (unsnapped) slots={n_dead_slots}")
+        if n_tool_rows:
+            print(f"  rows with T>1 (real discrimination): {n_multi}/{n_h1_rows} "
+                  f"({(n_multi/max(n_h1_rows, 1)):.1%})")
+        else:
+            print("  no tool-supervised rows at all")
+        if n_dead_slots:
+            print(f"  [!] {n_dead_slots} <|tool|> anchor(s) failed to snap to tokens and "
+                  f"are PAD_INDEX(-1) (invisible to H1). Non-zero means the bridge_text "
+                  f"offset mapping and the tokenizer disagree.")
+        if n_h1_rows and mean_t < 1.5:
+            print("[!VACUOUS-H1] mean T < 1.5: tool_acc=1.0000 is an artifact — the H1 "
+                  "softmax has a single class, CE is identically 0, and H1 receives NO "
+                  "gradient. Set data.pack_tools > 1 in configs/default.yaml and rebuild "
+                  "the tool pool (ToolPool.from_row_dicts).")
+        if tool_rows:
+            # tool_targets must be a valid index into [0, T) AND must point at a
+            # LIVE anchor; -1 is the collate padding sentinel and must NOT appear
+            # pre-collate. A target pointing at a dead slot is unbounded H1
+            # supervision (the logit is -1e4, so CE explodes instead of training).
+            bad_t = 0
+            bad_examples = []
+            gt_hist = Counter()
+            for r in tool_rows:
+                gt = r.get("tool_targets")
+                if isinstance(gt, list):
+                    gt = gt[0] if gt else -1
+                tp = _tool_positions(r)
+                gi = int(gt) if gt is not None else -1
+                ok = 0 <= gi < len(tp) and int(tp[gi]) >= 0
+                if not ok:
+                    bad_t += 1
+                    if len(bad_examples) < 5:
+                        bad_examples.append((r.get("sample_id", "?"), gi, len(tp)))
+                gt_hist[gi] += 1
+            print(f"  tool_targets in-range AND live: {n_tool_rows - bad_t}/{n_tool_rows} "
+                  f"(must equal rows; out-of-range/dead targets are silently wrong H1 "
+                  f"supervision)")
+            if bad_t:
+                print(f"  [!] bad tool_targets examples (sample_id, gt, T): {bad_examples}")
+            print(f"  gt tool index distribution (should be ~uniform if shuffled): "
+                  f"{dict(sorted(gt_hist.items()))}")
 
         # ---- L1 audit on serialized rows: every supervised-clean param must be
         # explained. A param with all -1 positives and NO drop reason would be a
@@ -598,12 +790,22 @@ cfg["training"]["eval_limit"] = 500
 cfg["model"]["freeze_encoder_stages"] = []
 cfg["model"]["max_seq_len"] = MAX_SEQ_LEN
 
+# fraction is a TRAINER-side subsample; pack_tools is a TENSORIZER-side knob, so
+# it must be pinned to the value the tensorize cell ACTUALLY used or the recorded
+# config would disagree with the data on disk. That effective value is
+# PACK_TOOLS_EPH (1 when no pool could be built), not the raw config request.
+_EFFECTIVE_PACK_TOOLS = int(globals().get("PACK_TOOLS_EPH", PACK_TOOLS) or 1)
 cfg.setdefault("data", {})["fraction"] = TRAIN_FRACTION
+cfg["data"]["pack_tools"] = _EFFECTIVE_PACK_TOOLS
 
 out = "configs/colab_lean.yaml"
 with open(out, "w") as fh:
     yaml.safe_dump(cfg, fh)
-print(f"wrote {out} (epochs={NUM_EPOCHS}, bs=8, accum=4, bf16=True, freeze=[], data_fraction={TRAIN_FRACTION})")
+print(f"wrote {out} (epochs={NUM_EPOCHS}, bs=8, accum=4, bf16=True, freeze=[], "
+      f"data_fraction={TRAIN_FRACTION}, pack_tools={_EFFECTIVE_PACK_TOOLS})")
+if _EFFECTIVE_PACK_TOOLS < 2:
+    print("[!VACUOUS-H1] effective pack_tools < 2: H1 is a single-class softmax "
+          "(CE == 0). Any tool_acc printed as 1.000 is an artifact.")
 CONFIG_PATH = out
 '''
 
@@ -624,13 +826,35 @@ MARKDOWN_TRAIN_TELEMETRY = """### Training Telemetry (Epoch Curves & Lean Loss C
 
 Replays `results_lean/{exp}_seed{seed}/train_log.jsonl`:
 - Per-stage summary (rows, epochs, final loss, steps)
-- Per-epoch held-out eval curve (`span_acc`, `exact_payload_match`)
+- Per-epoch held-out eval curve (`span_acc`, `exact_call`, plus the H1 columns
+  `tool_acc` / `n_tool` / `cands/row`)
 - Per-epoch mean train loss
-- LR + loss-component trajectory (`pointer`, `tool`)"""
+- LR + loss-component trajectory (`pointer`, `tool`)
+
+`exact_call` (formerly `exact_payload_match`) is **row-level**: a row counts only
+if every supervised param AND the selected tool are correct. `span_acc` is
+per-(row, param) and is therefore not bounded by `exact_call`. A `tool_acc` of
+`1.000` with `cands/row = 1.0` is a **single-class softmax artifact** (CE == 0,
+H1 receives no gradient), flagged as `VACUOUS H1` below."""
 
 CODE_TRAIN_TELEMETRY = '''# ---- training telemetry: replay train_log.jsonl into readable tables ----
-import json, os
+import json, os, math
 from collections import defaultdict
+
+def _num(rec, key):
+    """Return a float, or None for missing / None / NaN.
+
+    NaN is reported as an em-dash, never formatted as a real number: a NaN means
+    "never measured" and must not read as 0.000 (or pass a `< 1.5` threshold).
+    """
+    v = rec.get(key)
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
 
 def _load_train_log():
     p = os.path.join(RESULTS_DIR, f"{EXPERIMENT_NAME}_seed{SEED}", "train_log.jsonl")
@@ -663,10 +887,40 @@ if train_log:
     print("=" * 78)
     evals = [r for r in train_log if r.get("event") == "epoch_eval"]
     if evals:
-        print(f"  {'stage':<8}{'epoch':>6}{'n':>6}{'span_acc':>10}{'exact_payload':>15}")
+        # H1 columns (tool_acc / n_tool / cands) are printed alongside the
+        # pointer metrics so a vacuous single-candidate 1.0000 is immediately
+        # readable: tool_acc only means something when cands/row > 1. Missing
+        # and NaN values render as "—" rather than as a plausible 0.000.
+        print(f"  {'stage':<7}{'ep':>3}{'n':>5}{'span_acc':>10}{'exact_call':>12}"
+              f"{'tool_acc':>10}{'n_tool':>8}{'cands/row':>11}")
         for r in evals:
-            print(f"  {str(r.get('stage','?')):<8}{r.get('epoch','?'):>6}{r.get('n','?'):>6}"
-                  f"{r.get('span_acc', 0):>10.3f}{r.get('exact_payload_match', 0):>15.3f}")
+            span = _num(r, "span_acc")
+            exact = _num(r, "exact_call")
+            tool_acc = _num(r, "tool_acc")
+            n_tool = _num(r, "n_tool")
+            cands = _num(r, "mean_n_candidates")
+            sp = f"{span:>10.3f}" if span is not None else f"{'—':>10}"
+            ex = f"{exact:>12.3f}" if exact is not None else f"{'—':>12}"
+            ta = f"{tool_acc:>10.3f}" if tool_acc is not None else f"{'—':>10}"
+            nt = f"{int(n_tool):>8}" if n_tool is not None else f"{'—':>8}"
+            cd = f"{cands:>11.2f}" if cands is not None else f"{'—':>11}"
+            if cands is None:
+                vac = "  <-- H1 NOT EVALUATED"
+            elif cands < 1.5:
+                vac = "  <-- VACUOUS H1"
+            else:
+                vac = ""
+            print(f"  {str(r.get('stage','?')):<7}{r.get('epoch','?'):>3}{r.get('n','?'):>5}"
+                  f"{sp}{ex}{ta}{nt}{cd}{vac}")
+        _cand = [_num(r, "mean_n_candidates") for r in evals]
+        _cand = [c for c in _cand if c is not None]
+        if _cand and max(_cand) < 1.5:
+            print("\\n  [!] H1 WARNING: every eval epoch had < 1.5 candidates/row, so the")
+            print("      tool_acc column above is a single-class softmax artifact (CE == 0,")
+            print("      H1 gets no gradient). Set data.pack_tools > 1 and rebuild the pool.")
+        elif not _cand:
+            print("\\n  [!] H1 WARNING: no epoch recorded candidates/row, so tool_acc is not")
+            print("      interpretable. Re-generate the notebook so epoch_eval emits it.")
     else:
         print("  no epoch_eval events")
 

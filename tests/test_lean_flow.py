@@ -26,7 +26,10 @@ from spancall.lean.loss import LeanLossContainer, compute_lean_pointer_loss
 from spancall.lean.model import LeanPointerHead, LeanSpanCallModel
 from spancall.lean.resolver import LeanResolver
 from spancall.lean.tensorize import (
+    PAD_INDEX,
     LeanBatchCollate,
+    ToolPool,
+    _snap_token_range,
     convert_legacy_batch_to_lean,
     tensorize_sample_lean,
 )
@@ -800,4 +803,376 @@ def test_eval_raises_for_missing_split(tmp_path) -> None:
             data_dir=str(tmp_path),
             limit=10,
         )
+
+
+# --------------------------------------------------------------------------- #
+# H1 vacuity fix: distractor candidate packing, -1 padding, masked tool_acc
+# --------------------------------------------------------------------------- #
+
+def _schema(name: str, params: int = 1) -> ToolDefinition:
+    return ToolDefinition(
+        name=name,
+        description=f"{name} tool",
+        parameters=[
+            ParameterSchema(name=f"p{i}", description=f"param {i}", param_type="string", required=False)
+            for i in range(params)
+        ],
+    )
+
+
+def test_tool_pool_packs_gt_plus_distractors() -> None:
+    """The GT tool must always be present, at a shuffled index, with T == budget."""
+    gt = _schema("get_weather", params=2)
+    others = [_schema(f"tool_{i}") for i in range(6)]
+    pool = ToolPool([gt, *others], seed=7)
+
+    sample = UnifiedSample(
+        sample_id="pack-1",
+        source_dataset="test",
+        utterance="weather in Tokyo",
+        tools=[gt],  # the Hermes reality: exactly ONE native tool
+        ground_truth_calls=[GroundTruthCall(tool_name="get_weather", arguments={"p0": "Tokyo"})],
+        current_time_iso="2026-11-09",
+        stratum=Stratum.F,
+    )
+    cands, gt_idx = pool.candidates_for(sample, gt, pack_tools=3)
+    assert len(cands) == 3
+    assert cands[gt_idx].name == "get_weather"
+    assert len({c.name for c in cands}) == 3  # no duplicate distractor
+    assert 0 <= gt_idx < 3
+
+
+def test_tool_pool_is_deterministic_across_instances() -> None:
+    """Same (sample_id, seed) => same distractors, even from a fresh pool object.
+
+    This is what keeps tensorization reproducible inside the fork process pool.
+    """
+    gt = _schema("get_weather")
+    tools = [gt, *[_schema(f"tool_{i}") for i in range(20)]]
+    sample = UnifiedSample(
+        sample_id="det-1",
+        source_dataset="test",
+        utterance="weather",
+        tools=[gt],
+        ground_truth_calls=[GroundTruthCall(tool_name="get_weather", arguments={})],
+        stratum=Stratum.F,
+    )
+    a = ToolPool(tools, seed=42).candidates_for(sample, gt, 4)
+    b = ToolPool(tools, seed=42).candidates_for(sample, gt, 4)
+    assert [t.name for t in a[0]] == [t.name for t in b[0]]
+    assert a[1] == b[1]
+
+
+def test_tool_pool_degrades_to_single_candidate_when_disabled() -> None:
+    """pack_tools=1 must be honest: one candidate, GT at index 0 (the vacuous case)."""
+    gt = _schema("get_weather")
+    pool = ToolPool([gt, _schema("tool_x")], seed=42)
+    sample = UnifiedSample(
+        sample_id="single",
+        source_dataset="test",
+        utterance="weather",
+        tools=[gt],
+        ground_truth_calls=[GroundTruthCall(tool_name="get_weather", arguments={})],
+        stratum=Stratum.F,
+    )
+    cands, gt_idx = pool.candidates_for(sample, gt, pack_tools=1)
+    assert len(cands) == 1 and gt_idx == 0 and cands[0].name == "get_weather"
+
+
+def test_tensorize_emits_multi_candidate_tool_targets() -> None:
+    """With a pool, tensorize must emit T > 1 and an in-range GT index.
+
+    Uses a 1024-token budget: packing 3 tool schemas + the time window exceeds
+    512 tokens, and over-length rows are (correctly) dropped by the tensorizer.
+    """
+    tok = FakeTokenizer()
+    mb = CandidateMaskBuilder(max_seq_len=1024, max_span_width=16)
+    gt = _schema("get_weather", params=2)
+    pool = ToolPool([gt, *[_schema(f"tool_{i}") for i in range(5)]], seed=11)
+    sample = UnifiedSample(
+        sample_id="t-multi",
+        source_dataset="test",
+        utterance="weather in Tokyo",
+        tools=[gt],
+        ground_truth_calls=[GroundTruthCall(tool_name="get_weather", arguments={"p0": "Tokyo"})],
+        current_time_iso="2026-11-09",
+        stratum=Stratum.F,
+    )
+    row = tensorize_sample_lean(
+        sample, tok, mb, max_seq_len=1024, pack_multi_tools=True,
+        tool_pool=pool, pack_tools=3,
+    )
+    assert row is not None
+    n_cands = int(row["_n_tool_candidates"])
+    assert n_cands == 3, f"expected 3 packed candidates, got {n_cands}"
+    assert row["tool_positions"].shape[0] == n_cands
+    gt_idx = int(row["tool_targets"])
+    assert 0 <= gt_idx < n_cands
+
+
+def test_collate_pads_missing_tool_targets_with_minus_one() -> None:
+    """A row without H1 supervision must be padded with -1, never 0."""
+    row_a = {
+        "input_ids": torch.tensor([1, 2, 3]),
+        "param_positions": torch.tensor([1]),
+        "pos_indices": torch.tensor([[0]]),
+        "tool_positions": torch.tensor([0, 1]),
+        "tool_targets": torch.tensor(1),
+        "_lean_converted": True,
+    }
+    row_b = {  # no tool_positions / tool_targets at all
+        "input_ids": torch.tensor([4, 5, 6]),
+        "param_positions": torch.tensor([1]),
+        "pos_indices": torch.tensor([[0]]),
+        "_lean_converted": True,
+    }
+    batch = LeanBatchCollate()([row_a, row_b])
+    assert "tool_targets" in batch, "tool_targets dropped => H1 supervision lost"
+    assert batch["tool_targets"].tolist() == [1, -1]
+    assert batch["tool_positions"][1].tolist() == [-1, -1]
+
+
+def test_loss_ignores_padded_tool_targets() -> None:
+    """-1 targets must be skipped, not raise, and must not dilute the gradient."""
+    loss_fn = LeanLossContainer(lambda_pointer=1.0, lambda_tool=1.0)
+    logits = torch.tensor([[0.0, 5.0], [3.0, -3.0]])
+    preds = {"tool_logits": logits}
+    # Row 0 supervised on tool 1; row 1 padded.
+    out_mixed = loss_fn(preds, {"tool_targets": torch.tensor([1, -1])})
+    out_row0 = loss_fn({"tool_logits": logits[:1]}, {"tool_targets": torch.tensor([1])})
+    assert torch.isfinite(out_mixed["tool"])
+    assert torch.allclose(out_mixed["tool"], out_row0["tool"], atol=1e-6)
+
+    # All rows padded => tool term skipped entirely (no NaN poison).
+    out_none = loss_fn(preds, {"tool_targets": torch.tensor([-1, -1])})
+    assert float(out_none["tool"].item()) == 0.0
+    assert torch.isfinite(out_none["loss"])
+
+
+def test_trainer_tool_acc_is_masked_and_persisted() -> None:
+    """tool_acc must ignore padded rows and epoch_eval must carry the H1 fields."""
+    encoder = TinyDummyEncoder(hidden_dim=32)
+    model = LeanSpanCallModel(encoder=encoder, head_dim=16, hidden_dim=32)
+    trainer = LeanTrainer(model=model, lr_encoder=1e-3, lr_head=1e-3, device="cpu", use_amp=False)
+
+    B, L, K, C = 2, 15, 2, 4
+    batch = {
+        "input_ids": torch.randint(0, 100, (B, L)),
+        "attention_mask": torch.ones(B, L, dtype=torch.long),
+        "param_positions": torch.tensor([[1, 3], [2, 4]]),
+        "cand_starts": torch.randint(0, 5, (B, K, C)),
+        "cand_ends": torch.randint(5, 10, (B, K, C)),
+        "pos_indices": torch.tensor([[[0, -1], [1, -1]], [[-1, -1], [2, -1]]]),
+        "tool_positions": torch.tensor([[0, 5, 6], [0, 5, 6]]),
+        "tool_targets": torch.tensor([1, -1]),  # second row unsupervised
+        "_lean_converted": True,
+    }
+    metrics = trainer.train_step(batch)
+    assert metrics.get("n_tool") == 1.0, "padded row leaked into the tool_acc denominator"
+    assert metrics.get("mean_n_candidates") == 3.0
+
+    ev = trainer.evaluate([batch])
+    assert ev["n_tool"] == 1.0
+    assert "mean_n_candidates" in ev and ev["mean_n_candidates"] == 3.0
+    assert "tool_acc" in ev
+
+    # exact_payload_match is ROW-level (denominator = B = 2 rows): a row counts
+    # only when ALL its supervised params AND its tool are right. It is
+    # therefore a multiple of 1/B and is NOT interchangeable with span_acc,
+    # whose denominator is the 3 active (row, param) pairs (multiples of 1/3).
+    exact = ev["exact_payload_match"]
+    assert 0.0 <= exact <= 1.0
+    assert abs(exact * B - round(exact * B)) < 1e-6, (
+        f"exact_payload_match={exact} is not row-level over {B} rows; "
+        f"it was probably aliased back to span_acc"
+    )
+    assert abs(ev["span_acc"] * 3 - round(ev["span_acc"] * 3)) < 1e-6
+    # ``exact_call`` is the canonical name; the old key stays as a deprecated
+    # alias so pre-rename train_log.jsonl files still parse.
+    assert ev["exact_call"] == ev["exact_payload_match"]
+
+
+# --------------------------------------------------------------------------- #
+# C2 / C1 / S5 regressions found in review
+# --------------------------------------------------------------------------- #
+
+def test_snap_token_range_returns_none_on_miss() -> None:
+    """A range past the last token overlaps nothing => None (not a silent 0)."""
+    offsets = [(0, 3), (3, 6), (6, 9)]
+    assert _snap_token_range(0, 3, offsets, 3) == (0, 0)
+    assert _snap_token_range(999, 1005, offsets, 3) is None
+    assert _snap_token_range(5, 5, offsets, 3) is None  # degenerate range
+
+
+def test_pad_index_is_negative_so_live_mask_excludes_it() -> None:
+    """C2 contract: PAD_INDEX must be < 0, because callers mask on ``p < 0``."""
+    assert PAD_INDEX < 0
+
+
+def test_tensorize_drops_row_when_gt_tool_anchor_cannot_snap(monkeypatch) -> None:
+    """C2: a dead GT anchor must DROP the row, not become ``<|cls|>``.
+
+    ``_snap_token_range`` returns None when the bridge_text tool line cannot be
+    mapped onto tokens. The old code fell back to index 0 (``<|cls|>``), which is
+    a real token and is never masked (``< 0``), so H1 silently trained against
+    the CLS embedding. Now the whole row is dropped because there is no valid
+    supervision for it.
+    """
+    from spancall.lean import tensorize as tz
+
+    real_snap = tz._snap_token_range
+
+    def fake_snap(cs, ce, offsets, max_seq_len):
+        # Calls arrive in order: utterance, then <|tool|> anchors, then params.
+        # Kill every tool anchor (all calls after the first until the
+        # param-anchor phase); the simplest robust rule is "kill every
+        # non-utterance call", which makes the GT anchor dead by construction.
+        res = real_snap(cs, ce, offsets, max_seq_len)
+        if fake_snap.n == 0:
+            fake_snap.n += 1
+            return res
+        fake_snap.n += 1
+        return None
+
+    fake_snap.n = 0
+    monkeypatch.setattr(tz, "_snap_token_range", fake_snap)
+
+    tok = FakeTokenizer()
+    mb = CandidateMaskBuilder(max_seq_len=1024, max_span_width=16)
+    gt = _schema("get_weather", params=1)
+    pool = ToolPool([gt, _schema("tool_a"), _schema("tool_b")], seed=3)
+    sample = UnifiedSample(
+        sample_id="snap-miss",
+        source_dataset="test",
+        utterance="weather in Tokyo",
+        tools=[gt],
+        ground_truth_calls=[GroundTruthCall(tool_name="get_weather", arguments={"p0": "Tokyo"})],
+        current_time_iso="2026-11-09",
+        stratum=Stratum.F,
+    )
+    row = tensorize_sample_lean(
+        sample, tok, mb, max_seq_len=1024, pack_multi_tools=True,
+        tool_pool=pool, pack_tools=3,
+    )
+    assert row is None, (
+        "a row whose GT tool anchor cannot snap must be dropped; keeping it "
+        "with position 0 trains H1 against <|cls|>"
+    )
+
+
+def test_tensorize_encodes_unsnapped_distractor_as_pad_index(monkeypatch) -> None:
+    """C2: a dead DISTRACTOR anchor is -1 (masked), never 0 (live CLS slot)."""
+    from spancall.lean import tensorize as tz
+
+    real_snap = tz._snap_token_range
+
+    def fake_snap(cs, ce, offsets, max_seq_len):
+        # Only the FIRST tool anchor dies; the utterance and the rest are real.
+        res = real_snap(cs, ce, offsets, max_seq_len)
+        fake_snap.calls += 1
+        if fake_snap.calls == 2:  # call 1 = utterance, call 2 = first <|tool|>
+            return None
+        return res
+
+    fake_snap.calls = 0
+    monkeypatch.setattr(tz, "_snap_token_range", fake_snap)
+
+    tok = FakeTokenizer()
+    mb = CandidateMaskBuilder(max_seq_len=1024, max_span_width=16)
+    gt = _schema("get_weather", params=1)
+    pool = ToolPool([gt, _schema("tool_a"), _schema("tool_b")], seed=5)
+    sample = UnifiedSample(
+        sample_id="snap-partial",
+        source_dataset="test",
+        utterance="weather in Tokyo",
+        tools=[gt],
+        ground_truth_calls=[GroundTruthCall(tool_name="get_weather", arguments={"p0": "Tokyo"})],
+        current_time_iso="2026-11-09",
+        stratum=Stratum.F,
+    )
+    stats: dict = {}
+    row = tensorize_sample_lean(
+        sample, tok, mb, max_seq_len=1024, pack_multi_tools=True,
+        tool_pool=pool, pack_tools=3, stats=stats,
+    )
+    if row is None:
+        # The dead slot happened to be the GT: dropping is the correct policy.
+        assert stats.get("tool_snap_misses", 0) >= 1
+        return
+    tp = row["tool_positions"].tolist()
+    assert tp[0] == PAD_INDEX, f"dead anchor encoded as {tp[0]}, expected {PAD_INDEX}"
+    assert 0 not in [tp[0]], "index 0 is <|cls|> and is never masked"
+    # Live count excludes the dead slot, and the GT index still points at a live
+    # anchor (otherwise the row would have been dropped).
+    assert int(row["_n_tool_candidates"]) == sum(1 for p in tp if p >= 0)
+    assert tp[int(row["tool_targets"])] >= 0
+    assert stats.get("tool_snap_misses", 0) >= 1
+
+
+def test_tool_pool_degrades_honestly_when_smaller_than_pack_tools() -> None:
+    """C3: a 2-schema pool cannot produce T=5 — it must return T=2, not lie."""
+    gt = _schema("get_weather")
+    pool = ToolPool([gt, _schema("tool_a")], seed=42)
+    assert len(pool) == 2
+    sample = UnifiedSample(
+        sample_id="small-pool",
+        source_dataset="test",
+        utterance="weather",
+        tools=[gt],
+        ground_truth_calls=[GroundTruthCall(tool_name="get_weather", arguments={})],
+        stratum=Stratum.F,
+    )
+    cands, gt_idx = pool.candidates_for(sample, gt, pack_tools=5)
+    assert len(cands) == 2, "pool cannot invent schemas it does not have"
+    assert cands[gt_idx].name == "get_weather"
+    assert len(pool) < 5, "caller is expected to warn when len(pool) < pack_tools"
+
+
+def test_tool_pool_reports_name_collisions() -> None:
+    """S5: duplicate schema names are counted (and differing ones named)."""
+    a = _schema("dup", params=1)
+    b = _schema("dup", params=3)  # same name, DIFFERENT definition
+    c = _schema("dup", params=1)  # same name, identical definition
+    pool = ToolPool([a, b, c, _schema("unique")], seed=42)
+    assert len(pool) == 2, "names are deduplicated"
+    assert pool.n_duplicates == 2
+    assert pool.name_collisions == ["dup"], (
+        "only differing definitions are reported as collisions; an identical "
+        "duplicate is harmless"
+    )
+    assert len(pool.by_name["dup"].parameters) == 1, "first definition wins"
+
+
+def test_trainer_mean_n_candidates_ignores_fully_dead_rows() -> None:
+    """C1: a row with all-dead anchors must not dilute mean_n_candidates.
+
+    Review probe: 3 live candidates + 1 all-(-1) row reported 1.5 (the average of
+    3 and 0) — which also slipped under the ``< 1.5`` vacuity warning. Only rows
+    with >= 1 live anchor may enter the denominator.
+    """
+    encoder = TinyDummyEncoder(hidden_dim=32)
+    model = LeanSpanCallModel(encoder=encoder, head_dim=16, hidden_dim=32)
+    trainer = LeanTrainer(model=model, lr_encoder=1e-3, lr_head=1e-3, device="cpu", use_amp=False)
+
+    B, L, K, C = 2, 15, 1, 4
+    batch = {
+        "input_ids": torch.randint(0, 100, (B, L)),
+        "attention_mask": torch.ones(B, L, dtype=torch.long),
+        "param_positions": torch.tensor([[1], [2]]),
+        "cand_starts": torch.randint(0, 5, (B, K, C)),
+        "cand_ends": torch.randint(5, 10, (B, K, C)),
+        "pos_indices": torch.tensor([[[0]], [[0]]]),
+        # Row 0: three live anchors. Row 1: all anchors dead (padded/MISS).
+        "tool_positions": torch.tensor([[0, 5, 6], [-1, -1, -1]]),
+        "tool_targets": torch.tensor([1, -1]),
+        "_lean_converted": True,
+    }
+    metrics = trainer.train_step(batch)
+    assert metrics.get("mean_n_candidates") == 3.0, (
+        f"dead row diluted the mean to {metrics.get('mean_n_candidates')} "
+        f"(expected 3.0, the mean over live rows only)"
+    )
+    ev = trainer.evaluate([batch])
+    assert ev["mean_n_candidates"] == 3.0
+    assert ev["n_tool"] == 1.0
 

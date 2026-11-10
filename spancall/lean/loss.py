@@ -14,6 +14,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Shared sentinel with the tensorizer/collator. Kept as a literal fallback so
+# this module has no import cycle with ``tensorize``.
+PAD_INDEX: int = -1
+
 
 def compute_lean_pointer_loss(
     candidate_logits: torch.Tensor,
@@ -120,10 +124,22 @@ class LeanLossContainer(nn.Module):
         if "tool_logits" in predictions and "tool_targets" in targets:
             tool_logits = predictions["tool_logits"]
             tool_targets = targets["tool_targets"]
+            # tool_targets uses PAD_INDEX (-1) as the "no supervised tool"
+            # sentinel (rows whose H1 anchors the collator padded out, or rows
+            # whose GT tool failed to render). Passing -1 straight to
+            # cross_entropy would raise IndexError, hence ignore_index. When
+            # EVERY row is ignored the reduction would be NaN, so the term is
+            # skipped entirely instead of poisoning ``total_loss``.
             if tool_targets is not None and tool_logits.numel() > 0:
-                t_loss = F.cross_entropy(tool_logits, tool_targets)
-                out["tool"] = t_loss.detach()
-                total_loss = total_loss + self.lambda_tool * t_loss
+                has_sup = (tool_targets >= 0) & (tool_targets < tool_logits.size(-1))
+                if bool(has_sup.any()):
+                    t_loss = F.cross_entropy(
+                        tool_logits, tool_targets, ignore_index=PAD_INDEX
+                    )
+                    out["tool"] = t_loss.detach()
+                    total_loss = total_loss + self.lambda_tool * t_loss
+                else:
+                    out["tool"] = torch.zeros((), device=tool_logits.device)
 
         out["loss"] = total_loss
         return out

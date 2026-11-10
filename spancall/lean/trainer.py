@@ -218,6 +218,23 @@ class LeanTrainer:
         if cfg is not None and hasattr(cfg, "use_cache"):
             cfg.use_cache = False
 
+    @staticmethod
+    def _live_candidate_counts(batch: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
+        """Per-row count of REAL ``<|tool|>`` anchors, dropping unsupervised rows.
+
+        ``-1`` is the collator's pad sentinel, so a row with no H1 supervision
+        has an all-``-1`` row and a count of 0. Including those rows both
+        under-reports breadth and hides the vacuity warning, so they are
+        filtered out here: the question is "how many candidates does a row that
+        H1 is actually trained on see?", not "what is the batch-wide density?".
+        """
+        tp = batch.get("tool_positions")
+        if tp is None or not isinstance(tp, torch.Tensor) or tp.numel() == 0:
+            return None
+        counts = (tp >= 0).sum(-1).float()
+        live = counts > 0
+        return counts[live] if bool(live.any()) else None
+
     def exact_span_match(
         self,
         span_logits: torch.Tensor,
@@ -278,9 +295,12 @@ class LeanTrainer:
                 tl = self.model.tool_head(tool_h, cls_h)
                 tl = tl.masked_fill(b["tool_positions"] < 0, -1e4)
                 preds["tool_logits"] = tl
+                # -1 (not 0): 0 would inject a false "tool 0 is correct" target
+                # for rows with no supervised tool anchor. LeanLossContainer
+                # consumes this via cross_entropy(ignore_index=-1).
                 targs["tool_targets"] = b.get(
                     "tool_targets",
-                    torch.zeros(H.size(0), dtype=torch.long, device=self.device),
+                    torch.full((H.size(0),), -1, dtype=torch.long, device=self.device),
                 )
 
         # Compute loss in fp32 for numerical stability
@@ -315,8 +335,19 @@ class LeanTrainer:
             out_metrics["span_acc"] = float(span_acc.item())
 
         if "tool_logits" in fp32_preds and "tool_targets" in targs:
-            t_correct = (fp32_preds["tool_logits"].argmax(-1) == targs["tool_targets"]).float().mean()
-            out_metrics["tool_acc"] = float(t_correct.item())
+            t_logits = fp32_preds["tool_logits"]
+            t_targets = targs["tool_targets"]
+            # Mask padded (-1) / out-of-range targets: an unmasked batch mean
+            # lets -1e4-masked anchors (whose argmax ties to index 0) pollute
+            # the metric, and a batch holding only padded rows is not a result.
+            valid_t = (t_targets >= 0) & (t_targets < t_logits.size(-1))
+            if bool(valid_t.any()):
+                t_correct = (t_logits.argmax(-1)[valid_t] == t_targets[valid_t]).float().mean()
+                out_metrics["tool_acc"] = float(t_correct.item())
+                out_metrics["n_tool"] = float(int(valid_t.sum().item()))
+            n_cand = self._live_candidate_counts(b)
+            if n_cand is not None and n_cand.numel():
+                out_metrics["mean_n_candidates"] = float(n_cand.mean().item())
 
         return out_metrics
 
@@ -347,12 +378,20 @@ class LeanTrainer:
         if isinstance(split_or_batches, str):
             rows = self.load_rows(split_or_batches)
             if not rows:
+                # NaN, not 0.0: a zero is indistinguishable from "predicted
+                # everything wrong" once it reaches telemetry. ``run_stage``
+                # skips non-finite values instead of recording a fake score.
+                nan = float("nan")
                 return {
-                    "eval_loss": 0.0,
-                    "eval_pointer_loss": 0.0,
-                    "eval_span_acc": 0.0,
-                    "span_acc": 0.0,
-                    "exact_payload_match": 0.0,
+                    "eval_loss": nan,
+                    "eval_pointer_loss": nan,
+                    "eval_span_acc": nan,
+                    "span_acc": nan,
+                    "exact_call": nan,
+                    "exact_payload_match": nan,
+                    "tool_acc": nan,
+                    "n_tool": 0.0,
+                    "mean_n_candidates": nan,
                     "n": 0.0,
                 }
             if limit is not None and len(rows) > limit:
@@ -375,6 +414,10 @@ class LeanTrainer:
         n_span = 0
         tool_hits = 0
         n_tool = 0
+        tool_cand_sum = 0.0
+        tool_cand_rows = 0
+        exact_hits = 0.0
+        n_exact = 0
 
         with torch.no_grad():
             for raw_batch in batches:
@@ -407,9 +450,11 @@ class LeanTrainer:
                         tl = self.model.tool_head(tool_h, cls_h)
                         tl = tl.masked_fill(b["tool_positions"] < 0, -1e4)
                         preds["tool_logits"] = tl
+                        # -1 (not 0) when absent: 0 would masquerade as a real
+                        # "tool 0 is correct" target for every row in the batch.
                         targs["tool_targets"] = b.get(
                             "tool_targets",
-                            torch.zeros(H.size(0), dtype=torch.long, device=self.device),
+                            torch.full((H.size(0),), -1, dtype=torch.long, device=self.device),
                         )
 
                 fp32_preds = {k: (v.float() if isinstance(v, torch.Tensor) else v) for k, v in preds.items()}
@@ -418,49 +463,103 @@ class LeanTrainer:
                 if "pointer" in loss_out:
                     total_ptr_loss += float(loss_out["pointer"].item())
 
+                # Per-row whole-call exactness: every supervised param must land
+                # on a positive candidate AND the predicted tool must be the GT
+                # one. This is the metric the name ``exact_payload_match``
+                # promises; it used to be aliased to span_acc, which silently
+                # reported a param-level number as a call-level one.
+                row_ok = torch.ones(int(H.size(0)), dtype=torch.bool, device=H.device)
+
                 if "span_logits" in fp32_preds and "pos_indices" in b:
                     _, acc_t, valid = self.exact_span_match(fp32_preds["span_logits"], b["pos_indices"])
                     span_hits += float((acc_t * valid).sum().item())
                     n_span += int(valid.sum().item())
                     n_span_batches += 1
+                    # vacuous / unsupervised params (valid == False) do not
+                    # block an exact call match; supervised ones must all hit.
+                    row_ok = row_ok & ((acc_t >= 0.5) | ~valid).all(-1)
 
                 if "tool_logits" in fp32_preds and "tool_targets" in b:
                     pred_tools = fp32_preds["tool_logits"].argmax(-1)
                     tt = b["tool_targets"]
-                    valid_tool = tt >= 0
+                    # A target is only scoreable when it addresses a real
+                    # candidate column; -1 is the "absent/padded" sentinel.
+                    valid_tool = (tt >= 0) & (tt < fp32_preds["tool_logits"].size(-1))
                     if valid_tool.any():
                         tool_hits += int(((pred_tools == tt) & valid_tool).sum().item())
                         n_tool += int(valid_tool.sum().item())
+                    # rows without a supervised tool target are not penalised.
+                    row_ok = row_ok & ((pred_tools == tt) | ~valid_tool)
+                    # Diagnostic: mean number of real candidate tools per row.
+                    # 1.0 => H1 is a singleton softmax, so tool_acc is vacuous
+                    # (see docs/param_recall_diagnosis.md §7b). Rows without a
+                    # live anchor are excluded rather than counted as 0.
+                    n_cand_b = self._live_candidate_counts(b)
+                    if n_cand_b is not None:
+                        tool_cand_sum += float(n_cand_b.sum().item())
+                        tool_cand_rows += int(n_cand_b.numel())
 
+                exact_hits += float(row_ok.sum().item())
+                n_exact += int(row_ok.numel())
                 n_batches += 1
 
         if n_batches == 0:
+            # NaN (not 0.0) so "never evaluated" cannot be mistaken for
+            # "evaluated and scored zero" downstream.
+            nan = float("nan")
             return {
-                "eval_loss": 0.0,
-                "eval_pointer_loss": 0.0,
-                "eval_span_acc": 0.0,
-                "span_acc": 0.0,
-                "exact_payload_match": 0.0,
+                "eval_loss": nan,
+                "eval_pointer_loss": nan,
+                "eval_span_acc": nan,
+                "span_acc": nan,
+                "exact_payload_match": nan,
+                "exact_call": nan,
+                "tool_acc": nan,
+                "n_tool": 0.0,
+                "mean_n_candidates": nan,
                 "n": 0.0,
             }
 
         overall_span_acc = span_hits / max(n_span, 1)
+        overall_exact = exact_hits / max(n_exact, 1)
         res: Dict[str, float] = {
             "eval_loss": total_loss / n_batches,
             "eval_pointer_loss": total_ptr_loss / max(n_span_batches, 1),
             "eval_span_acc": overall_span_acc,
             "span_acc": overall_span_acc,
-            "exact_payload_match": overall_span_acc,
+            # Call-level exactness: EVERY supervised param correct AND the tool
+            # correct. Distinct from ``span_acc`` (per-param, so usually larger).
+            #
+            # ``exact_call`` is the canonical name. ``exact_payload_match`` is
+            # kept as a deprecated alias because it USED to be a straight alias
+            # of ``span_acc``; its meaning changed here, so any historical log or
+            # checkpoint keyed on the old name is NOT comparable. Consumers should
+            # read ``exact_call`` and treat old ``exact_payload_match`` series as
+            # a different metric.
+            "exact_call": overall_exact,
+            "exact_payload_match": overall_exact,
             "n": float(n_span),
             "n_span": float(n_span),
         }
         if n_tool > 0:
             res["tool_acc"] = tool_hits / n_tool
             res["n_tool"] = float(n_tool)
+        if tool_cand_rows > 0:
+            res["mean_n_candidates"] = tool_cand_sum / tool_cand_rows
 
         if isinstance(split_or_batches, str):
             self._log_event({"event": "eval", "split": split_label, "stage": self.stage, "step": self.global_step, **res})
-            tool_str = f" tool_acc={res['tool_acc']:.4f} (n={n_tool})" if n_tool > 0 else ""
+            tool_str = ""
+            if n_tool > 0:
+                tool_str = f" tool_acc={res['tool_acc']:.4f} (n={n_tool})"
+                mean_c = res.get("mean_n_candidates")
+                if mean_c is not None:
+                    # Surface the degeneracy: with ~1.0 candidates per row the
+                    # softmax has a single class, so tool_acc is 1.0 by
+                    # construction and means nothing.
+                    tool_str += f" candidates/row={mean_c:.2f}"
+                    if mean_c < 1.5:
+                        tool_str += " [!vacuous: single-candidate H1]"
             print(
                 f"[lean-eval:{split_label}] span_acc={overall_span_acc:.4f} (n={n_span}) "
                 f"loss={res['eval_loss']:.4f}{tool_str}",
@@ -636,26 +735,49 @@ class LeanTrainer:
             eval_limit = getattr(self.config, "eval_limit", 500) if self.config else 500
             for es in eval_splits:
                 ev_res = self.evaluate(es, limit=eval_limit)
+
+                def _f(key: str) -> float:
+                    # Preserve NaN ("never evaluated") instead of coercing it to a
+                    # real-looking 0.0; ``.get(default)`` only covers a MISSING key.
+                    v = ev_res.get(key, float("nan"))
+                    return float(v) if v is not None else float("nan")
+
                 ep_rec = {
                     "stage": stage,
                     "epoch": epoch,
                     "split": es,
-                    "span_acc": float(ev_res.get("span_acc", 0.0)),
-                    "exact_payload_match": float(ev_res.get("exact_payload_match", 0.0)),
+                    "span_acc": _f("span_acc"),
+                    # canonical name; ``exact_payload_match`` is the deprecated
+                    # alias whose MEANING changed (it used to equal span_acc), so
+                    # it is persisted under both names to keep old logs readable
+                    # while new consumers read exact_call.
+                    "exact_call": _f("exact_call"),
+                    "exact_payload_match": _f("exact_call"),
                     "abstain_acc": 0.0,
-                    "n": float(ev_res.get("n", 0.0)),
+                    "n": _f("n"),
+                    # H1 (tool selection) — persisted so a vacuous single-candidate
+                    # 1.0 is distinguishable from a real multi-tool result after
+                    # the fact. ``mean_n_candidates`` ~1.0 => vacuous.
+                    "tool_acc": _f("tool_acc"),
+                    "n_tool": _f("n_tool"),
+                    "mean_n_candidates": _f("mean_n_candidates"),
                 }
                 self.history["epoch_eval"].append(ep_rec)
                 self._log_event({"event": "epoch_eval", **ep_rec})
 
-                cur_metric = float(ev_res.get("exact_payload_match", 0.0))
-                if not hasattr(self, "_best_curve_metric") or cur_metric > self._best_curve_metric:
+                cur_metric = _f("exact_call")
+                # A NaN metric (empty split / nothing supervised) must not win the
+                # best-checkpoint race, and must not overwrite a real best.
+                if math.isfinite(cur_metric) and (
+                    not hasattr(self, "_best_curve_metric") or cur_metric > self._best_curve_metric
+                ):
                     self._best_curve_metric = cur_metric
                     if self.config is not None:
                         out = Path(self.config.output_dir)
                         best_cp = out / f"{self.config.experiment_name}_seed{self.config.seed}" / "best_checkpoint"
                         self.save_checkpoint(str(best_cp))
-                        print(f"[lean-train:{stage}:epoch {epoch}] NEW BEST on {es}: span_acc={cur_metric:.4f} -> saved to {best_cp}", flush=True)
+                        print(f"[lean-train:{stage}:epoch {epoch}] NEW BEST on {es}: "
+                              f"exact_call={cur_metric:.4f} -> saved to {best_cp}", flush=True)
 
         pbar.close()
         if self._accum_i > 0:

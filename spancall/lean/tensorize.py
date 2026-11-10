@@ -10,6 +10,8 @@ Provides:
 
 from __future__ import annotations
 
+import random
+import zlib
 from datetime import date
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -18,6 +20,29 @@ import torch
 from spancall.data.align import tooldef_to_template_tool
 from spancall.data.schema import ParameterSchema, Stratum, ToolDefinition, UnifiedSample
 from span_template.template import RecentRow, build_input, build_input_multi
+
+# The one and only "absent / padded" sentinel for integer index tensors.
+# ``0`` is a *real* index (the first candidate span, the ``<|cls|>`` token,
+# candidate 0 of the tool packet), so it must never double as padding —
+# otherwise a pad silently becomes a supervision target. Exported so
+# ``spancall/lean/loss.py`` can use the same value as ``ignore_index``.
+PAD_INDEX: int = -1
+
+# Keys whose padding value is ``PAD_INDEX``. This is an EXPLICIT set, not a
+# substring test on the key name: a substring test (``"cand_" in k``) silently
+# mis-pads any future key that merely contains one of those words, which is
+# exactly how a padding bug becomes invisible instead of loud.
+PAD_INDEX_KEYS = frozenset(
+    {
+        "cand_starts",
+        "cand_ends",
+        "pos_indices",
+        "pointer_positives",
+        "param_positions",
+        "tool_positions",
+        "tool_targets",
+    }
+)
 
 
 def is_legacy_batch(batch_or_row: Dict[str, Any]) -> bool:
@@ -126,6 +151,126 @@ def _recent_rows(sample: UnifiedSample) -> List[RecentRow]:
     return rows_out
 
 
+class ToolPool:
+    """Deterministic corpus-level pool of ``ToolDefinition`` distractors for H1.
+
+    Why this exists: Hermes rows carry exactly ONE tool in their ``tools`` column
+    (json-mode rows carry a single synthetic ``json_output``). Packing just
+    ``sample.tools`` therefore renders **one** ``<|tool|>`` anchor, so
+    ``tool_logits`` has shape ``(B, 1)`` and ``argmax(-1)`` is identically 0 —
+    while ``tool_targets`` is also identically 0. H1 accuracy is then 1.0 for
+    *any* weights and ``L_tool = CE over one class = 0``, i.e. H1 receives no
+    gradient at all. ``docs/param_recall_diagnosis.md`` calls this the
+    "vacuous 1.0, single-tool" baseline.
+
+    This pool supplies the missing distractors: for each row we keep the GT tool
+    and append ``pack_tools - 1`` other real tool schemas drawn from the corpus,
+    shuffle the candidate order, and recompute ``tool_targets``. That makes H1
+    a genuine discrimination task over ``T`` candidates.
+
+    Selection is deterministic per ``(sample_id, seed)`` so tensorization stays
+    reproducible under the fork pool (no shared RNG state).
+
+    Args:
+        tools: every tool schema observed in the corpus (deduplicated by name).
+        seed: deterministic salt; same seed => same distractors per row.
+    """
+
+    def __init__(self, tools: Sequence[ToolDefinition], seed: int = 42) -> None:
+        by_name: Dict[str, ToolDefinition] = {}
+        # Two different schemas can share a name across datasets. The pool keys
+        # on the name, so only the FIRST definition survives and the candidate
+        # packet renders that one. Counted here (rather than silently dropped)
+        # so callers can print it: a big collision rate means the distractor
+        # packet shows a *different* schema than some rows were trained on.
+        self.n_duplicates: int = 0
+        self.name_collisions: List[str] = []
+        _collided: set = set()
+        for t in tools:
+            if not t.name:
+                continue
+            prev = by_name.get(t.name)
+            if prev is not None:
+                self.n_duplicates += 1
+                if prev != t and t.name not in _collided:
+                    _collided.add(t.name)
+                    self.name_collisions.append(t.name)
+                continue
+            by_name[t.name] = t
+        self.by_name: Dict[str, ToolDefinition] = by_name
+        # Sorted for a stable, process-independent draw order.
+        self.names: List[str] = sorted(by_name)
+        self.seed = int(seed)
+
+    def __len__(self) -> int:
+        return len(self.names)
+
+    @classmethod
+    def from_row_dicts(cls, rows: Sequence[Dict[str, Any]], seed: int = 42) -> "ToolPool":
+        """Build a pool from raw canonical split records (``tools`` JSON lists)."""
+        tools: List[ToolDefinition] = []
+        for row in rows:
+            for t in row.get("tools") or []:
+                # ``tools`` may be dicts (raw JSON) or already-parsed definitions.
+                tools.append(t if isinstance(t, ToolDefinition) else ToolDefinition.from_dict(t))
+        return cls(tools, seed=seed)
+
+    def _rng(self, sample_id: str) -> random.Random:
+        # zlib.crc32 (not hash()) because per-process string hashing is salted.
+        salt = zlib.crc32(f"{self.seed}::{sample_id}".encode("utf-8"))
+        return random.Random(salt)
+
+    def candidates_for(
+        self,
+        sample: UnifiedSample,
+        gt_tool: ToolDefinition,
+        pack_tools: int,
+    ) -> Tuple[List[ToolDefinition], int]:
+        """Return ``(candidates, gt_index)`` with the GT tool plus distractors.
+
+        The GT tool is always present (at a shuffled index). ``pack_tools <= 1``
+        or a pool with no alternatives returns ``([gt_tool], 0)`` — the honest
+        single-candidate case, which callers report rather than score.
+        """
+        budget = max(int(pack_tools), 1)
+        native = [t for t in (sample.tools or []) if t.name != gt_tool.name]
+        candidates: List[ToolDefinition] = [gt_tool]
+        seen = {gt_tool.name}
+
+        # Keep any tools the row genuinely shipped alongside the GT tool.
+        for t in native:
+            if len(candidates) >= budget:
+                break
+            if t.name not in seen:
+                candidates.append(t)
+                seen.add(t.name)
+
+        # Then fill with corpus distractors (deterministic per row).
+        if len(candidates) < budget and self.names:
+            rng = self._rng(sample.sample_id or gt_tool.name)
+            # ``rng.sample`` with a small ``k`` uses CPython's set-based path,
+            # i.e. O(k). Building ``[n for n in self.names if n not in seen]``
+            # and shuffling it was O(N) *per row* (~5 ms/row at N=20k, i.e.
+            # >4 min extra for a 50k-row split).
+            want = budget - len(candidates)
+            k = min(len(self.names), want + len(seen))
+            for name in rng.sample(self.names, k):
+                if len(candidates) >= budget:
+                    break
+                if name in seen:
+                    continue
+                candidates.append(self.by_name[name])
+                seen.add(name)
+
+        # Shuffle so the GT tool is not always at index 0 (positional cheating).
+        rng = self._rng(f"shuffle::{sample.sample_id or gt_tool.name}")
+        order = list(range(len(candidates)))
+        rng.shuffle(order)
+        shuffled = [candidates[i] for i in order]
+        gt_index = next(i for i, t in enumerate(shuffled) if t.name == gt_tool.name)
+        return shuffled, gt_index
+
+
 def tensorize_sample_lean(
     sample: UnifiedSample,
     tokenizer: Any,
@@ -135,6 +280,8 @@ def tensorize_sample_lean(
     max_pos: int = 8,
     pack_multi_tools: bool = False,
     stats: Optional[Dict[str, Any]] = None,
+    tool_pool: Optional[ToolPool] = None,
+    pack_tools: int = 1,
 ) -> Optional[Dict[str, Any]]:
     """Direct tensorization of UnifiedSample into Lean training format.
 
@@ -148,18 +295,33 @@ def tensorize_sample_lean(
     Counts are accumulated into ``stats["param_drop_reasons"]`` when supplied,
     and the per-row classification is attached as ``_param_drop_reasons`` for
     the tensorize/sanity cells to report.
+
+    H1 candidate sets: when ``tool_pool`` is supplied and ``pack_tools > 1``,
+    the GT tool is packed together with ``pack_tools - 1`` real distractor
+    ``ToolDefinition``s drawn deterministically from the corpus pool, and the
+    candidate list is shuffled (``tool_targets`` recomputed accordingly). This
+    is what makes ``tool_acc`` a real metric instead of the structurally forced
+    1.0 produced by a single candidate (see :class:`ToolPool`).
     """
     if not sample.tools or not sample.ground_truth_calls:
         return None
 
     gt_call = sample.ground_truth_calls[0]
     gt_tool_name = gt_call.tool_name
-    gt_idx = next((i for i, t in enumerate(sample.tools) if t.name == gt_tool_name), None)
-    if gt_idx is None:
+    src_gt_idx = next((i for i, t in enumerate(sample.tools) if t.name == gt_tool_name), None)
+    if src_gt_idx is None:
         return None
-    gt_tool = sample.tools[gt_idx]
+    gt_tool = sample.tools[src_gt_idx]
     if not gt_tool.parameters:
         return None
+
+    # Build the H1 candidate set (GT tool + distractors), shuffled. Without a
+    # pool this degrades to sample.tools (honest single-candidate case).
+    if tool_pool is not None and int(pack_tools) > 1:
+        tool_candidates, gt_idx = tool_pool.candidates_for(sample, gt_tool, int(pack_tools))
+    else:
+        tool_candidates = list(sample.tools)
+        gt_idx = src_gt_idx
 
     # Resolve date
     base_date = date(2026, 1, 1)
@@ -174,7 +336,7 @@ def tensorize_sample_lean(
     try:
         if pack_multi_tools:
             out = build_input_multi(
-                [tooldef_to_template_tool(t) for t in sample.tools],
+                [tooldef_to_template_tool(t) for t in tool_candidates],
                 sample.utterance,
                 recent_context=recent_rows,
                 now=base_date,
@@ -213,9 +375,31 @@ def tensorize_sample_lean(
             e for e in out.entries
             if getattr(e, "kind", None) == "bridge_text" and getattr(e, "tool", None) is not None
         ]
+        tool_snap_misses = 0
         for e in t_entries:
             tsnap = _snap_token_range(e.char_start, e.char_end, offsets, max_seq_len)
-            tool_positions.append(tsnap[0] if tsnap else 0)
+            if tsnap is None:
+                # ``PAD_INDEX`` (-1), NEVER 0: the trainer masks dead anchors with
+                # ``tool_positions < 0`` and 0 is a real token (``<|cls|>``), so a
+                # 0 here would resurrect the slot as a live candidate pointing at
+                # the CLS embedding.
+                tool_positions.append(PAD_INDEX)
+                tool_snap_misses += 1
+            else:
+                tool_positions.append(tsnap[0])
+        # Record the misses BEFORE the drop guard below: a row dropped because
+        # its GT anchor failed to snap is precisely the case an operator must
+        # see counted, not the case that silently reports zero.
+        if tool_snap_misses and stats is not None:
+            stats["tool_snap_misses"] = (
+                int(stats.get("tool_snap_misses", 0)) + tool_snap_misses
+            )
+        # The GT anchor must itself be live. If it is not, H1 has nothing to
+        # teach on this row and cross-entropy against a -1e4-masked logit would
+        # explode rather than train: drop the row (same policy as the
+        # ``gt_idx >= len(t_entries)`` guard below).
+        if gt_idx >= len(tool_positions) or tool_positions[gt_idx] < 0:
+            return None
 
     # Param anchors
     K = len(gt_tool.parameters)
@@ -224,6 +408,10 @@ def tensorize_sample_lean(
             e for e in out.entries
             if getattr(e, "kind", None) == "bridge_text" and getattr(e, "tool", None) is not None
         ]
+        # The renderer can drop a tool whose name/desc sanitizes badly; fall back
+        # to the single-tool slice rather than raising an IndexError here.
+        if gt_idx >= len(t_entries):
+            return None
         s_cs = t_entries[gt_idx].char_start
         s_ce = t_entries[gt_idx + 1].char_start if gt_idx + 1 < len(t_entries) else min(e.char_start for e in utt_entries)
         p_entries = [
@@ -426,6 +614,12 @@ def tensorize_sample_lean(
     if pack_multi_tools and tool_positions:
         row["tool_positions"] = torch.tensor(tool_positions, dtype=torch.long)
         row["tool_targets"] = torch.tensor(gt_idx, dtype=torch.long)
+        # Diagnostic: H1 is only a real task when this is > 1. Reported by the
+        # trainer as ``mean_n_candidates`` so a single-candidate (vacuous
+        # tool_acc=1.0) run is visible on its face instead of looking perfect.
+        # Counts LIVE anchors: dead (unsnapped) slots are -1 and must not inflate
+        # the number of choices H1 actually has.
+        row["_n_tool_candidates"] = int(sum(1 for p in tool_positions if p >= 0))
 
     return row
 
@@ -436,15 +630,44 @@ class LeanBatchCollate:
     def __call__(self, batch: Sequence[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         if not batch:
             return {}
-        keys = [k for k in batch[0].keys() if not k.startswith("_")]
+        # Union of keys (not batch[0]'s keys): tool_positions/tool_targets can be
+        # present on only some rows (e.g. rows whose GT tool failed to render),
+        # and taking batch[0] would silently drop H1 supervision for the batch.
+        keys: List[str] = []
+        for b in batch:
+            for k in b:
+                if not k.startswith("_") and k not in keys:
+                    keys.append(k)
         out: Dict[str, torch.Tensor] = {}
-
+        # PAD_INDEX (-1) is the "absent/padded" sentinel for every index tensor,
+        # INCLUDING tool_targets: padding it with 0 would inject a fake "tool 0
+        # is correct" supervision signal, and the trainer's validity mask is
+        # ``tt >= 0``. Membership is tested against an explicit key set, not a
+        # substring of the key name.
         for k in keys:
-            vals = [b[k] for b in batch]
+            vals = [b.get(k) for b in batch]
+            pad_val = PAD_INDEX if k in PAD_INDEX_KEYS else 0
+            # A row missing this tensor is pad-filled, not dropped.
+            if any(v is None for v in vals):
+                ref = next(v for v in vals if isinstance(v, torch.Tensor))
+                filled: List[torch.Tensor] = []
+                for v in vals:
+                    if isinstance(v, torch.Tensor):
+                        filled.append(v)
+                    else:
+                        filled.append(
+                            torch.full(
+                                (ref.size(0),) if ref.dim() >= 1 else (),
+                                pad_val,
+                                dtype=ref.dtype,
+                            )
+                        )
+                vals = filled
             if not isinstance(vals[0], torch.Tensor):
                 continue
-            pad_val = -1 if any(sub in k for sub in ("cand_starts", "cand_ends", "pos_indices", "tool_positions")) else 0
-            if vals[0].dim() == 1:
+            if vals[0].dim() == 0:
+                out[k] = torch.stack([v.long() for v in vals], dim=0)
+            elif vals[0].dim() == 1:
                 out[k] = torch.nn.utils.rnn.pad_sequence(vals, batch_first=True, padding_value=pad_val)
             elif vals[0].dim() == 2:
                 B = len(vals)
