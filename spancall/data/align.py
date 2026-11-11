@@ -360,6 +360,16 @@ def _param_kind(p: ParameterSchema) -> str:
     return "str"
 
 
+def _reason_key(call_index: int, param_name: str, multi_call: bool) -> str:
+    """Key space for ``target_spans`` / ``h4_reasons`` (R0.4).
+
+    Multi-call samples qualify by call so two calls declaring the same parameter
+    name do not overwrite each other. Single-call samples keep the bare name so
+    every existing reader sees byte-identical output.
+    """
+    return f"{int(call_index)}::{param_name}" if multi_call else param_name
+
+
 # ---------------------------------------------------------------------------
 # The aligner
 # ---------------------------------------------------------------------------
@@ -404,16 +414,26 @@ class ReverseAligner(BaseAligner):
 
         reason_for: Dict[str, Optional[str]] = {}
         all_grounded = True
-        for gt_call in sample.ground_truth_calls:
+        # R0.4: when a sample carries more than one GT call, span keys and H4
+        # reasons are qualified with the call index so two calls that declare
+        # the same parameter name (e.g. both ask for ``query``) stop colliding.
+        # Single-call samples keep bare keys, which is what every existing
+        # reader (augment, diagnose scripts, tensorize) expects.
+        multi_call = len(sample.ground_truth_calls) > 1
+        for call_index, gt_call in enumerate(sample.ground_truth_calls):
             tool_def = _find_tool(sample.tools, gt_call.tool_name)
             if tool_def is None:
                 # call tool not among the ambient tools -> ungroundable (Stratum A)
                 for pname in gt_call.arguments:
-                    reason_for[pname] = "OFF_WINDOW"
+                    reason_for[_reason_key(call_index, pname, multi_call)] = "OFF_WINDOW"
                 all_grounded = False
                 continue
-            per_param, ok = self._align_call(sample, gt_call, tool_def, base)
-            reason_for.update(per_param)
+            per_param, ok = self._align_call(
+                sample, gt_call, tool_def, base,
+                call_index=call_index, multi_call=multi_call,
+            )
+            for pname, reason in per_param.items():
+                reason_for[_reason_key(call_index, pname, multi_call)] = reason
             all_grounded = all_grounded and ok
 
         if all_grounded:
@@ -450,8 +470,15 @@ class ReverseAligner(BaseAligner):
         gt_call: GroundTruthCall,
         tool_def: ToolDefinition,
         base: date,
+        call_index: int = 0,
+        multi_call: bool = False,
     ) -> Tuple[Dict[str, Optional[str]], bool]:
-        """Align one GT call; returns ``({param: reason}, all_grounded)``."""
+        """Align one GT call; returns ``({param: reason}, all_grounded)``.
+
+        ``call_index``/``multi_call`` route every emitted target into the
+        call-qualified key space (R0.4). They default to the legacy behaviour so
+        direct callers and single-call corpora are byte-identical to before.
+        """
         # Always render so deterministic <|ctx_time|>/<|ctx_enum|> pools are available.
         try:
             output = self._render(sample, tool_def, base)
@@ -472,17 +499,20 @@ class ReverseAligner(BaseAligner):
                 # Case A: omitted / None
                 if not p.required:
                     reasons[p.name] = "OK"
-                    self._emit(sample, p.name, [self._null_target(p)])
+                    self._emit(sample, p.name, [self._null_target(p)],
+                               call_index=call_index, multi_call=multi_call)
                 else:
                     reasons[p.name] = "ABSENT"
-                    self._emit(sample, p.name, [self._unresolved_target(p)])
+                    self._emit(sample, p.name, [self._unresolved_target(p)],
+                               call_index=call_index, multi_call=multi_call)
                     ok = False
                 continue
             targets, p_ok, reason = self._align_value(
                 p, args[p.name], output, base, sample
             )
             if targets:
-                self._emit(sample, p.name, targets)
+                self._emit(sample, p.name, targets,
+                           call_index=call_index, multi_call=multi_call)
             if not p_ok:
                 ok = False
                 reasons[p.name] = reason or "NEEDS_REASONING"
@@ -727,8 +757,22 @@ class ReverseAligner(BaseAligner):
     def _fail(self, p: ParameterSchema, reason: str) -> Tuple[List[SpanTarget], bool, str]:
         return [self._unresolved_target(p)], False, reason
 
-    def _emit(self, sample: UnifiedSample, pname: str, targets: List[SpanTarget]) -> None:
-        sample.target_spans.setdefault(pname, []).extend(targets)
+    def _emit(
+        self,
+        sample: UnifiedSample,
+        pname: str,
+        targets: List[SpanTarget],
+        call_index: int = 0,
+        multi_call: bool = False,
+    ) -> None:
+        """Record one parameter's targets under its (possibly call-qualified) key.
+
+        Multi-call samples key by ``f"{call_index}::{pname}"``; single-call
+        samples keep the bare ``pname`` so every existing reader is untouched
+        (R0.4, ``UnifiedSample.targets_for_call``).
+        """
+        key = _reason_key(call_index, pname, multi_call)
+        sample.target_spans.setdefault(key, []).extend(targets)
 
     def _fuzzy_occ(self, utt: Any, s_val: str) -> List[Tuple[int, int]]:
         """Case-insensitive fallback used when ``fuzzy_matching=True``."""

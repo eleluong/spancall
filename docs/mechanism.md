@@ -62,7 +62,7 @@ With `c_s/c_L ≈ 0.07`, `p = 0.95`, `c_w ≈ c_L`: break-even `h ≈ 0.07 / (1 
 ```mermaid
 flowchart LR
   U[Utterance + session state] --> S{Candidate schema<br/>selection}
-  S --> B[build_input<br/>template + sanitize R7]
+  S --> B[build_input_multi<br/>template + sanitize R7]
   B --> T[Tokenize<br/>+ offset map]
   T --> E[Encoder<br/>H = Enc X]
   E --> P[Pointer head<br/>per-param logits]
@@ -79,7 +79,33 @@ Stages in detail follow. The fallback path is the agent's existing pipeline (e.g
 
 ## 3. Stage 1 — Input Construction and Tokenization
 
-**3.1 Render.** [`template.jinja`](../span_template/template.jinja) → text; [`parser.py`](../span_template/parser.py) → `entries` with absolute char offsets (the legend). The legend is derived from the *rendered* text so training and serving cannot drift.
+**3.0 Two invariants this stage enforces.**
+
+*Grammar uniformity.* Exactly one template renders the Lean prompt at every
+`T >= 1`: [`template_multi.jinja`](../span_template/template_multi.jinja), via
+[`build_input_multi`](../span_template/template.py). The single-tool
+[`template.jinja`](../span_template/template.jinja) / `build_input` pair survives
+for the legacy path but is unreachable from `spancall/lean/` — training on a
+grammar that inference never emits is an unfixable train/serve mismatch, so the
+`pack_multi_tools=False` escape hatch was removed outright.
+
+*Tool coverage.* For every function-calling sample, `render_T >= len(sample.tools)`
+and each native tool appears exactly once as a `<|tool|>` block:
+
+```
+T = max(pack_tools, 1 + len(native_tools), jitter_draw)
+```
+
+`data.pack_tools` is a **floor**, not a cap — it only ever *adds* corpus
+distractors, never removes a native tool. `data.max_tools` is the single knob
+allowed to reduce `T` (an emergency VRAM brake, off by default); when it fires
+the row is counted in `stats["tool_truncated_rows"]` and printed loudly, because
+a native tool missing from the prompt can never be selected by H1 no matter how
+good the weights are. `jitter_pack_tools` draws `T` uniformly from
+`[min_tools, floor]` per row so that `T = 1` (the oracle-tool eval layout) stays
+inside the training distribution.
+
+**3.1 Render.** [`template_multi.jinja`](../span_template/template_multi.jinja) → text; [`parser.py`](../span_template/parser.py) → `entries` with absolute char offsets (the legend). The legend is derived from the *rendered* text so training and serving cannot drift.
 
 **3.2 Special tokens.** Markers (`[PARAM]`, `[CTX_TIME]`, `[CTX_ENUM]`, `[CTX_RECENT]`, `[NULL]`, `[UNRESOLVED]`, `[SEP]`, …) are added to the tokenizer as **atomic special tokens**, and their embeddings are newly initialized and trained. Two effects: (a) the encoder sees a clean structural signal instead of subword fragments; (b) R7 becomes enforceable at the tokenizer level — user text is tokenized with special-token parsing **disabled**, so a typed `[SEP]` can never become the real token. *Status: this is the design target — the P6 tokenizer/vocabulary setup is marked 🚧 pending in [Part C](pipeline_io.md); the current reference implementation renders literal `[…]` markers as plain text and defends R7 string-side in `sanitize.py`.*
 

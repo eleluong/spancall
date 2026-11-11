@@ -306,6 +306,132 @@ def test_eval_package_exports_contract() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# R0.4 / J6 — set-level multi-call scoring
+# --------------------------------------------------------------------------- #
+
+
+def _two_tool_sample(sid: str = "multi") -> UnifiedSample:
+    """One Stratum-F row whose GT is TWO calls to different tools."""
+    weather = _weather()
+    book = _tool(ParameterSchema("city", "", "string", required=True), name="book")
+    return UnifiedSample(
+        sample_id=sid,
+        source_dataset="test",
+        utterance="weather in Tokyo and book a hotel in Osaka",
+        tools=[weather, book],
+        ground_truth_calls=[
+            GroundTruthCall("weather", {"city": "Tokyo"}),
+            GroundTruthCall("book", {"city": "Osaka"}),
+        ],
+        stratum=Stratum.F,
+    )
+
+
+def test_multi_call_set_match_scores_every_gt_call() -> None:
+    sample = _two_tool_sample()
+    pred = {
+        "hit": False,  # call-0-only hit flag deliberately does not decide the set
+        "tool_name": "weather",
+        "payload": {"city": "Tokyo"},
+        "calls": [
+            {"tool_name": "weather", "payload": {"city": "Tokyo"}},
+            {"tool_name": "book", "payload": {"city": "Osaka"}},
+        ],
+        "confidence": 0.9,
+    }
+    m = ToolCallEvaluator().evaluate([sample], [pred])
+    assert m.call_exact_set_match == pytest.approx(1.0)
+    assert m.call_count_acc == pytest.approx(1.0)
+    assert m.n_calls_hist == {"2": 1}
+    assert m.pred_n_calls_hist == {"2": 1}
+    # the historical call-0 view is untouched: call 0 matched exactly.
+    assert m.exact_payload_match == pytest.approx(1.0)
+
+
+def test_multi_call_set_match_is_order_insensitive() -> None:
+    sample = _two_tool_sample()
+    pred = {
+        "calls": [
+            {"tool_name": "book", "payload": {"city": "Osaka"}},
+            {"tool_name": "weather", "payload": {"city": "Tokyo"}},
+        ],
+        "confidence": 0.9,
+    }
+    m = ToolCallEvaluator().evaluate([sample], [pred])
+    assert m.call_exact_set_match == pytest.approx(1.0)
+
+
+def test_multi_call_set_match_rejects_a_dropped_call() -> None:
+    """The legacy flattened view says "exact"; the set says otherwise."""
+    sample = _two_tool_sample()
+    pred = {"hit": True, "tool_name": "weather", "payload": {"city": "Tokyo"}}
+    m = ToolCallEvaluator().evaluate([sample], [pred])
+    assert m.exact_payload_match == pytest.approx(1.0)  # call 0 matched
+    assert m.call_exact_set_match == pytest.approx(0.0)  # second call is gone
+    assert m.call_count_acc == pytest.approx(0.0)
+    assert m.pred_n_calls_hist == {"1": 1}
+
+
+def test_multi_call_set_match_rejects_an_extra_call() -> None:
+    sample = _two_tool_sample()
+    pred = {
+        "calls": [
+            {"tool_name": "weather", "payload": {"city": "Tokyo"}},
+            {"tool_name": "book", "payload": {"city": "Osaka"}},
+            {"tool_name": "book", "payload": {"city": "Kyoto"}},
+        ],
+        "confidence": 0.9,
+    }
+    m = ToolCallEvaluator().evaluate([sample], [pred])
+    assert m.call_count_acc == pytest.approx(0.0)
+    assert m.call_exact_set_match == pytest.approx(0.0)
+    assert m.pred_n_calls_hist == {"3": 1}
+
+
+def test_multi_call_set_match_rejects_a_wrong_payload_on_the_second_call() -> None:
+    sample = _two_tool_sample()
+    pred = {
+        "calls": [
+            {"tool_name": "weather", "payload": {"city": "Tokyo"}},
+            {"tool_name": "book", "payload": {"city": "WRONG"}},
+        ],
+        "confidence": 0.9,
+    }
+    m = ToolCallEvaluator().evaluate([sample], [pred])
+    # count agrees, so the set must still fail on the payload.
+    assert m.call_count_acc == pytest.approx(1.0)
+    assert m.call_exact_set_match == pytest.approx(0.0)
+
+
+def test_multi_call_set_metrics_appear_per_stratum() -> None:
+    sample = _two_tool_sample()
+    pred = {
+        "calls": [
+            {"tool_name": "weather", "payload": {"city": "Tokyo"}},
+            {"tool_name": "book", "payload": {"city": "Osaka"}},
+        ],
+        "confidence": 0.9,
+    }
+    m = ToolCallEvaluator().evaluate([sample], [pred])
+    f = m.metrics_by_stratum["F"]
+    assert f["call_exact_set_match"] == pytest.approx(1.0)
+    assert f["call_count_acc"] == pytest.approx(1.0)
+
+
+def test_single_call_prediction_has_no_calls_key_backward_compatible() -> None:
+    """Legacy prediction files have no ``calls``; they must read as one call."""
+    tool = _weather()
+    sample = _sample("f", Stratum.F, tool, GroundTruthCall("weather", {"city": "SF"}))
+    m = ToolCallEvaluator().evaluate(
+        [sample],
+        [{"hit": True, "tool_name": "weather", "payload": {"city": "SF"}, "confidence": 0.9}],
+    )
+    assert m.n_calls_hist == {"1": 1}
+    assert m.call_count_acc == pytest.approx(1.0)
+    assert m.call_exact_set_match == pytest.approx(1.0)
+
+
+# --------------------------------------------------------------------------- #
 # B1aBaseline — deterministic extraction
 # --------------------------------------------------------------------------- #
 

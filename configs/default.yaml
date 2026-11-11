@@ -16,6 +16,13 @@ data:
   # DEFAULT so H1 is actually trained against distractor candidate sets instead
   # of the old single-tool (pack_tools=1) path where tool_acc=1.0 was vacuous.
   pack_tools: 3
+  # R0.4: the resolver's call budget. ``1`` makes multi-call predictions
+  # structurally impossible, which pins call_exact_set_match / pred_n_calls_hist
+  # to the single-call share regardless of model quality. 4 covers the observed
+  # GT tail; call_min_prob / call_min_prob_ratio gate an extra call on H1.
+  max_calls: 4
+  call_min_prob: 0.25
+  call_min_prob_ratio: 0.5
   # F:Abstain mixing ratio for the trainer subsample. >0 forces F-heavy rows so
   # H3 sees positive targets (train/fraction subsampling in
   # SpanCallTrainer.load_rows keeps F rows first, then samples A to the ratio).

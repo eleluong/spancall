@@ -18,6 +18,13 @@ class ToolCallMetrics:
     per_param_accuracy: float = 0.0
     exact_payload_match: float = 0.0
 
+    # Multi-call (R0.4 / J6). ``exact_payload_match`` stays call-0-only so its
+    # historical meaning is unchanged; these score the predicted call SET.
+    call_exact_set_match: float = 0.0
+    call_count_acc: float = 0.0
+    n_calls_hist: Dict[str, int] = field(default_factory=dict)
+    pred_n_calls_hist: Dict[str, int] = field(default_factory=dict)
+
     # Partial extraction performance (P5)
     partial_extraction_rate: float = 0.0
     param_precision: float = 0.0

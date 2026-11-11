@@ -171,6 +171,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"[SpanCall Eval: ToolCall] Stratum F (N={f_n}): exact_payload_match={f_exact:.3f} hit_rate={f_hit:.3f} | "
           f"Stratum A: false_hit_rate={metrics.false_hit_rate_on_a:.4f} | "
           f"Overall exact={metrics.exact_payload_match:.3f} hit={metrics.hit_rate:.3f} ECE={metrics.ece:.4f}")
+    # R0.4 / J6: the call-0-only number above cannot see a dropped or invented
+    # second call, so surface the set-level view and the call-count histograms.
+    print(f"[SpanCall Eval: ToolCall] call set exact={getattr(metrics, 'call_exact_set_match', 0.0):.3f} "
+          f"call count acc={getattr(metrics, 'call_count_acc', 0.0):.3f} | "
+          f"GT n_calls={getattr(metrics, 'n_calls_hist', {})} "
+          f"pred n_calls={getattr(metrics, 'pred_n_calls_hist', {})}")
     print("[SpanCall Eval: ToolCall] OK")
     return 0
 
@@ -179,6 +185,12 @@ def _metrics_to_dict(m: Any) -> Dict[str, Any]:
     return {
         "total_samples": m.total_samples,
         "tool_accuracy": m.tool_accuracy,
+        # R0.4 / J6: set-level call metrics. ``getattr`` defaults keep an older
+        # metrics object (or a stub) serialisable instead of raising.
+        "call_exact_set_match": getattr(m, "call_exact_set_match", 0.0),
+        "call_count_acc": getattr(m, "call_count_acc", 0.0),
+        "n_calls_hist": getattr(m, "n_calls_hist", {}),
+        "pred_n_calls_hist": getattr(m, "pred_n_calls_hist", {}),
         "per_param_accuracy": m.per_param_accuracy,
         "exact_payload_match": m.exact_payload_match,
         "hit_rate": m.hit_rate,

@@ -113,11 +113,37 @@ Representation for the GPU: two forms.
 
 ## P5. Render and Pack
 
-Two template files, both in [`span_template/`](../span_template/):
-- *Single tool* — [`template.jinja`](../span_template/template.jinja): one `[TOOL] … [PARAM] …` block, shared context, utterance. No `[NONE]` anchor. **This is the default shipped path** (`data.pack_tools: 1`, D5).
-- *Multi-tool pack* — [`template_multi.jinja`](../span_template/template_multi.jinja): one `[TOOL] … [PARAM] …` block per tool, a `[NONE]` anchor, shared context and utterance. **Not invoked by the default pipeline** — constructed only when `data.pack_tools > 1`, which the measured tool-ambiguity slice of stratum F gates (D5).
+**Invariant 2 — grammar uniformity.** The Lean workflow renders with exactly one
+template at every `T >= 1`:
+[`template_multi.jinja`](../span_template/template_multi.jinja), via
+[`build_input_multi`](../span_template/template.py). [`build_input`](../span_template/template.py)
+and [`template.jinja`](../span_template/template.jinja) remain for the legacy
+(non-Lean) path but are **not reachable from `spancall/lean/`**. Rendering a
+different grammar in training than inference ever consumes is a train/serve
+mismatch that no amount of model capacity can fix, so `build_input_multi` is the
+only entry point and the `pack_multi_tools=False` escape hatch was deleted.
 
-Parse the rendered text with [`parser.py`](../span_template/parser.py) into entries with absolute char offsets (per-tool entries tagged `tool=` from the `[NONE]`-aware parse). Param order within a tool is the schema order at serving (shuffled in training). The reference implementation renders the single-tool form via [`build_input`](../span_template/template.py) (default) and the packed form via [`build_input_multi`](../span_template/template.py).
+**Invariant 1 — tool coverage contract.** For every function-calling sample,
+`render_T >= len(sample.tools)`, and every `sample.tools[*].name` appears
+exactly once as a `<|tool|>` block in the rendered prompt. Concretely:
+
+```
+T = max(pack_tools, 1 + len(native_tools), jitter_draw)
+```
+
+`data.pack_tools` is a **floor, never a cap**: it adds distractors from the
+corpus [`ToolPool`](../spancall/lean/tensorize.py) up to the floor, and can never
+remove a native tool. `data.max_tools` is the *only* knob that may reduce `T`
+(an emergency VRAM brake, `None`/off by default); when it does fire, the row is
+counted in `stats["tool_truncated_rows"]` and reported loudly — a silently
+dropped native tool is unlearnable, because H1 can never select an anchor that
+was never rendered.
+
+`jitter_pack_tools` (default on) draws `T` uniformly from `[min_tools, floor]`
+per row, which is what keeps the oracle-tool eval layout (`T = 1`) inside the
+training distribution (**invariant 3**).
+
+Parse the rendered text with [`parser.py`](../span_template/parser.py) into entries with absolute char offsets (per-tool entries tagged `tool=` from the `[NONE]`-aware parse). Param order within a tool is the schema order at serving (shuffled in training).
 
 ## P6. Tokenization and Offset Safety
 
@@ -131,6 +157,23 @@ Parse the rendered text with [`parser.py`](../span_template/parser.py) into entr
 The current `SpanTemplateOutput.tokenize` is a best-effort stand-in; production uses the offset-mapping path above.
 
 ## P7. Tensorize and Batch
+
+**Invariant 7 — multi-call completeness (target).** A sample with `n` GT calls
+must produce `n` predicted calls, every GT call is supervised, and eval scores
+the sample as a *set* of calls rather than `ground_truth_calls[0]`. The data
+contract is call-aware `target_spans` keyed `f"{call_index}::{param_name}"`, with
+a legacy single-call fallback so existing corpora keep loading. Until that lands,
+every Lean path is single-call: [`tensorize_sample_lean`](../spancall/lean/tensorize.py)
+supervises `ground_truth_calls[0]` only.
+
+**Invariant 6 — recent-context parity.** Training and serving run the *same*
+`sanitize_key` / `_normalize_recent_value` / dedupe / `k_recent` / token-budget
+pipeline ([`select_recent_context`](../spancall/agent/context.py)), and the
+effective budget is reported to the caller as
+`features["recent_budget_effective"]` (plus `recent_budget_tokens` and
+`recent_budget_clamped`). The budget is
+`min(context_budget_tokens, max(64, max_seq_len // 2))`, i.e. it is clamped so
+the schema and utterance can never be starved by context.
 
 Outputs of pre-process for one request:
 

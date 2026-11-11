@@ -442,12 +442,19 @@ def build_input_multi(
     )
 
 
-def tokenize_offset_mapping(
+def tokenize_legend(
     output: SpanTemplateOutput,
     tokenizer: Any,
     max_len: Optional[int] = None,
-) -> Tuple[List[int], List[Optional[Entry]]]:
-    """P6 production path: tokenize with `return_offsets_mapping` + boundary check.
+) -> Tuple[List[int], List[Optional[Entry]], List[Tuple[int, int]]]:
+    """Tokenize once and return ``(ids, per_token_entry, offsets)``.
+
+    This is the *single* tokenization primitive: the ``offsets`` are the same
+    ``offset_mapping`` used to derive ``per_token_entry``, so callers that also
+    need character→token geometry (the candidate-mask builder) must reuse them
+    instead of re-tokenizing the same text. Re-tokenizing was a full encode pass
+    per call and silently produced a *different* list identity, which defeated
+    the ``_RowCtx`` identity check and forced a rebuild of every per-row index.
 
     Returns (token_ids, per_token_entry) where per_token_entry[i] is the legend
     entry whose char span the token is **wholly** inside, or None for
@@ -500,6 +507,21 @@ def tokenize_offset_mapping(
 
     if max_len is not None and len(ids) > max_len:
         raise SanitizeError("overflow", f"{len(ids)} tokens > L_max={max_len}")
+    return ids, per_token, offsets
+
+
+def tokenize_offset_mapping(
+    output: SpanTemplateOutput,
+    tokenizer: Any,
+    max_len: Optional[int] = None,
+) -> Tuple[List[int], List[Optional[Entry]]]:
+    """Back-compat wrapper over :func:`tokenize_legend` (drops the offsets).
+
+    Kept because several call sites only need ``per_token``; every caller that
+    also masks candidates should migrate to ``tokenize_legend`` so it can reuse
+    the offsets rather than paying for a second encode pass.
+    """
+    ids, per_token, _offsets = tokenize_legend(output, tokenizer, max_len=max_len)
     return ids, per_token
 
 

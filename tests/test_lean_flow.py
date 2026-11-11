@@ -22,7 +22,11 @@ from spancall.lean.eval_p1 import (
     eval_param_extraction_lean,
     param_is_groundable,
 )
-from spancall.lean.loss import LeanLossContainer, compute_lean_pointer_loss
+from spancall.lean.loss import (
+    LeanLossContainer,
+    compute_lean_pointer_loss,
+    compute_lean_tool_loss,
+)
 from spancall.lean.model import LeanPointerHead, LeanSpanCallModel
 from spancall.lean.resolver import LeanResolver
 from spancall.lean.tensorize import (
@@ -31,6 +35,7 @@ from spancall.lean.tensorize import (
     ToolPool,
     _snap_token_range,
     convert_legacy_batch_to_lean,
+    jitter_pack_tools,
     tensorize_sample_lean,
 )
 from spancall.lean.trainer import LeanTrainer
@@ -108,6 +113,81 @@ def test_lean_decoder_greedy_fallback() -> None:
     assert len(assignment) == 2
     assert assignment["arg1"] == "value_A"
     assert assignment["arg2"] == "value_B"
+
+
+# ---------------------------------------------------------------------------
+# R0.4 / J4 — multi-call decoding
+# ---------------------------------------------------------------------------
+
+
+def _j4_cand(value: str, cs: int, ce: int, score: float) -> SimpleNamespace:
+    return SimpleNamespace(
+        canon_value=value, char_start=cs, char_end=ce, region="utterance", entry_index=0
+    )
+
+
+def test_decode_calls_allows_two_calls_to_share_one_span() -> None:
+    """J4: cross-call span reuse is legal; exclusivity is scoped per call."""
+    decoder = LeanJointDecoder(overlap_allowed=False, free_string_overlap_allowed=False)
+
+    # Both calls resolve "city" to the SAME utterance span ("Tokyo"). Under
+    # single-call exclusivity that is a conflict, but these are two different
+    # tool invocations and reusing the span is exactly right.
+    shared = _j4_cand("Tokyo", 10, 15, 0.9)
+    per_call = {
+        0: {"city": [(shared, 0.9)]},
+        1: {"city": [(shared, 0.9)]},
+    }
+    calls = decoder.decode_calls(per_call)
+    assert len(calls) == 2
+    assert [c.call_index for c in calls] == [0, 1]
+    assert calls[0].values == {"city": "Tokyo"}
+    assert calls[1].values == {"city": "Tokyo"}
+
+
+def test_decode_calls_still_prunes_conflicts_inside_one_call() -> None:
+    """J4: intra-call exclusivity must survive the multi-call split."""
+    decoder = LeanJointDecoder(overlap_allowed=False, free_string_overlap_allowed=False)
+    a = _j4_cand("A", 10, 20, 0.9)
+    b = _j4_cand("B", 10, 20, 0.8)
+    per_call = {0: {"arg1": [(a, 0.9)], "arg2": [(b, 0.8)]}}
+
+    calls = decoder.decode_calls(per_call)
+    assert len(calls) == 1
+    single_assignment, _, _, _ = decoder.decode_detailed(per_call[0])
+    # Same fallback as the single-call path: greedy top-1 keeps both values.
+    assert calls[0].values == single_assignment
+    assert calls[0].values == {"arg1": "A", "arg2": "B"}
+
+
+def test_decode_calls_preserves_positional_alignment_for_empty_calls() -> None:
+    """J4: a call with no candidates must still occupy its slot."""
+    decoder = LeanJointDecoder()
+    per_call = {0: {"q": [(_j4_cand("x", 0, 1, 0.5), 0.5)]}, 1: {}}
+    calls = decoder.decode_calls(per_call)
+    assert len(calls) == 2
+    assert calls[1].call_index == 1
+    assert calls[1].values == {}
+
+    # A plain sequence is accepted too, and enumeration order defines the index.
+    seq_calls = decoder.decode_calls([per_call[0], per_call[1]])
+    assert [c.call_index for c in seq_calls] == [0, 1]
+    assert seq_calls[0].values == calls[0].values
+
+
+def test_decode_calls_single_call_matches_decode_detailed() -> None:
+    """J4: n_calls == 1 must be byte-identical to today's fast path."""
+    decoder = LeanJointDecoder(top_k=3)
+    per_param = {
+        "city": [(_j4_cand("Tokyo", 10, 15, 0.7), 0.7), (_j4_cand("Osaka", 20, 25, 0.3), 0.3)],
+        "unit": [(_j4_cand("celsius", 30, 37, 0.6), 0.6)],
+    }
+    values, delta, _chosen, n_nodes = decoder.decode_detailed(per_param)
+    calls = decoder.decode_calls({0: per_param})
+    assert len(calls) == 1
+    assert calls[0].values == values
+    assert calls[0].delta == delta
+    assert calls[0].n_nodes == n_nodes
 
 
 def test_convert_legacy_batch_to_lean_and_idempotency() -> None:
@@ -244,6 +324,109 @@ def test_lean_resolver_resolution_and_predict_tool() -> None:
 
     res_multi = resolver.try_resolve_candidates([schema1, schema2], utterance="weather in Tokyo")
     assert res_multi.tool_name in ("get_weather", "get_time")
+
+
+# ---------------------------------------------------------------------------
+# R0.4 / J5 — the resolver reports multiple calls
+# ---------------------------------------------------------------------------
+
+
+def _j5_schemas() -> tuple:
+    weather = ToolDefinition(
+        name="get_weather",
+        description="Get weather for a city",
+        parameters=[ParameterSchema(name="city", description="City", param_type="string", required=True)],
+    )
+    hotel = ToolDefinition(
+        name="book_hotel",
+        description="Book a hotel in a city",
+        parameters=[ParameterSchema(name="city", description="City", param_type="string", required=True)],
+    )
+    return weather, hotel
+
+
+def test_single_call_result_exposes_one_call_mirroring_the_scalars() -> None:
+    """J5: the single-call path must be bit-identical apart from the new list."""
+    encoder = TinyDummyEncoder(hidden_dim=32)
+    model = LeanSpanCallModel(encoder=encoder, head_dim=16, hidden_dim=32)
+    resolver = LeanResolver(model=model, max_seq_len=512)
+    weather, _hotel = _j5_schemas()
+
+    res = resolver.try_resolve(weather, utterance="weather in Tokyo", now="2026-11-09")
+    assert len(res.calls) == 1
+    call0 = res.calls[0]
+    assert call0.call_index == 0
+    assert call0.tool_name == res.tool_name
+    assert call0.payload == res.payload
+    assert call0.status == res.status
+    assert call0.hit == res.hit
+    assert call0.confidence == res.confidence
+
+
+def test_call_schemas_decode_one_call_per_oracle_tool() -> None:
+    """J5: the oracle multi-call input yields len(call_schemas) calls."""
+    encoder = TinyDummyEncoder(hidden_dim=32)
+    model = LeanSpanCallModel(encoder=encoder, head_dim=16, hidden_dim=32)
+    resolver = LeanResolver(model=model, max_seq_len=512)
+    weather, hotel = _j5_schemas()
+
+    res = resolver.try_resolve(
+        weather,
+        utterance="weather in Tokyo and a hotel in Tokyo",
+        now="2026-11-09",
+        context_schemas=[weather, hotel],
+        call_schemas=[weather, hotel],
+    )
+    assert [c.tool_name for c in res.calls] == ["get_weather", "book_hotel"]
+    assert [c.call_index for c in res.calls] == [0, 1]
+    # The scalar fields stay pinned to calls[0] for the pre-R0.4 consumers.
+    assert res.tool_name == "get_weather"
+    assert res.payload == res.calls[0].payload
+    assert res.features["n_calls"] == 2
+
+    # Without call_schemas the extra call is NOT fabricated.
+    single = resolver.try_resolve(weather, utterance="weather in Tokyo", now="2026-11-09")
+    assert len(single.calls) == 1
+
+
+def test_try_resolve_candidates_respects_max_calls() -> None:
+    """J5: max_calls=1 must never split a confident prediction in two."""
+    encoder = TinyDummyEncoder(hidden_dim=32)
+    model = LeanSpanCallModel(encoder=encoder, head_dim=16, hidden_dim=32)
+    weather, hotel = _j5_schemas()
+
+    resolver1 = LeanResolver(model=model, max_seq_len=512, max_calls=1)
+    res1 = resolver1.try_resolve_candidates([weather, hotel], utterance="weather in Tokyo")
+    assert len(res1.calls) == 1
+    assert res1.calls[0].tool_name == res1.tool_name
+
+    # Opting in to two calls can only add, never replace, the winner.
+    resolver2 = LeanResolver(
+        model=model, max_seq_len=512, max_calls=2, call_min_prob=0.0, call_min_prob_ratio=0.0
+    )
+    res2 = resolver2.try_resolve_candidates([weather, hotel], utterance="weather in Tokyo")
+    assert len(res2.calls) == 2
+    assert res2.calls[0].tool_name == res1.calls[0].tool_name
+    assert res2.tool_name == res2.calls[0].tool_name
+    assert res2.features["n_calls"] == 2
+    assert len(res2.features["call_probs"]) == 2
+
+
+def test_lean_call_result_as_dict_is_serialisable() -> None:
+    """J5: prediction records must survive a JSON round-trip."""
+    import json
+
+    encoder = TinyDummyEncoder(hidden_dim=32)
+    model = LeanSpanCallModel(encoder=encoder, head_dim=16, hidden_dim=32)
+    resolver = LeanResolver(model=model, max_seq_len=512)
+    weather, _hotel = _j5_schemas()
+
+    res = resolver.try_resolve(weather, utterance="weather in Tokyo", now="2026-11-09")
+    record = res.calls[0].as_dict()
+    restored = json.loads(json.dumps(record))
+    assert restored["call_index"] == 0
+    assert restored["tool_name"] == res.tool_name
+    assert restored["payload"] == (res.payload or {})
 
 
 def test_lean_trainer_load_rows_filters_empty_abstain(tmp_path) -> None:
@@ -536,6 +719,30 @@ class _StubResolver:
         )
 
 
+class _RenderTStubResolver(_StubResolver):
+    """Stub that ALSO reports the resolver features R9/R2 need surfaced.
+
+    A stub without ``features`` must leave the metrics at ``n/a`` (unknown), NOT
+    at a fabricated T=1 -- that distinction is what the assertions below check.
+    """
+
+    def __init__(self, scripted: dict, render_T: int = 1,
+                 recent_budget_effective: int = 2048) -> None:
+        super().__init__(scripted)
+        self.render_T = render_T
+        self.recent_budget_effective = recent_budget_effective
+
+    def try_resolve(self, tool, utterance, recent_context=None, now=None, **kwargs):
+        res = super().try_resolve(tool, utterance, recent_context, now)
+        res.features = {
+            "render_T": self.render_T,
+            "recent_budget_effective": self.recent_budget_effective,
+            "recent_budget_tokens": 4096,
+            "recent_budget_clamped": True,
+        }
+        return res
+
+
 def test_eval_param_extraction_scores_groundable_params_only(tmp_path) -> None:
     """Eval must not punish the fast path for refusing a generation-only param.
 
@@ -609,6 +816,55 @@ def test_eval_param_extraction_scores_groundable_params_only(tmp_path) -> None:
         "total_available": 1,
         "truncated": False,
     }
+
+
+def test_eval_part1_reports_render_T_telemetry(tmp_path) -> None:
+    """R9: Eval Part 1 must report the prompt layout it actually rendered.
+
+    The whole point of the check is that a T=1 oracle-tool eval is *visible*
+    rather than inferred, so the metric has to be exact -- and it has to be
+    ``n/a`` (not a fabricated 1) when the resolver cannot say.
+    """
+    record = _weather_record(
+        {"city": "Tokyo"},
+        {"city": [{"param_name": "city", "target_type": "utterance_span",
+                   "canonical_value": "Tokyo"}]},
+        sample_id="r-t",
+    )
+    split = _write_split(tmp_path, [record, dict(record, sample_id="r-t2")])
+
+    metrics = eval_param_extraction_lean(
+        split,
+        resolver=_RenderTStubResolver({"city": "Tokyo"}, render_T=1),
+        data_dir=str(tmp_path),
+        limit=10,
+        max_param_gap_report=5,
+    )
+    assert metrics["render_T_rows"] == 2
+    assert metrics["mean_render_T"] == 1.0
+    assert metrics["render_T_hist"] == {"1": 2}
+    # 100% T=1 is the exact layout mismatch the metric exists to expose.
+    assert metrics["render_T_t1_share"] == 1.0
+    # R2: the clamped budget is reported, not silently applied.
+    assert metrics["recent_budget_effective"] == {"2048": 2}
+
+
+def test_eval_part1_render_T_is_na_when_the_resolver_cannot_report(tmp_path) -> None:
+    """An old stub has no ``features``: report unknown, never a fabricated T=1."""
+    record = _weather_record({"city": "Tokyo"}, {})
+    split = _write_split(tmp_path, [record])
+
+    metrics = eval_param_extraction_lean(
+        split,
+        resolver=_StubResolver({"city": "Tokyo"}),
+        data_dir=str(tmp_path),
+        limit=10,
+        max_param_gap_report=5,
+    )
+    assert metrics["render_T_rows"] == 0
+    assert metrics["mean_render_T"] != metrics["mean_render_T"]  # NaN
+    assert metrics["render_T_hist"] == {}
+    assert metrics["recent_budget_effective"] == {}
 
 
 def _write_split(tmp_path, records, name="eval_split"):
@@ -820,6 +1076,91 @@ def _schema(name: str, params: int = 1) -> ToolDefinition:
     )
 
 
+def test_tool_pool_never_truncates_native_tools() -> None:
+    """R0.1: ``pack_tools`` is a FLOOR. Five native tools must all survive.
+
+    The old implementation stopped at ``pack_tools`` candidates, so a row that
+    genuinely offered five tools trained H1 on an arbitrary three of them while
+    the eval prompt rendered all five. H1 was then scored on tools it had never
+    been allowed to choose between.
+    """
+    gt = _schema("pick_one", params=1)
+    natives = [_schema("get_weather"), _schema("get_time"), _schema("send_email"),
+               _schema("search_web"), _schema("book_table")]
+    pool = ToolPool([gt, *natives, _schema("distractor_a")], seed=17)
+    sample = UnifiedSample(
+        sample_id="native-5",
+        source_dataset="test",
+        utterance="do the thing",
+        tools=[gt, *natives],  # SIX tools offered, pack_tools asks for 3
+        ground_truth_calls=[GroundTruthCall(tool_name="pick_one", arguments={"p0": "x"})],
+        current_time_iso="2026-11-09",
+        stratum=Stratum.F,
+    )
+    cands, gt_idx = pool.candidates_for(sample, gt, pack_tools=3)
+    names = {c.name for c in cands}
+    for t in [gt, *natives]:
+        assert t.name in names, (
+            f"native tool {t.name!r} was truncated; pack_tools must never cap"
+        )
+    assert len(cands) == 6, f"expected all 6 offered tools, got {len(cands)}: {sorted(names)}"
+    assert cands[gt_idx].name == "pick_one", "GT must survive and be indexable"
+
+
+def test_tool_pool_max_tools_ceiling_keeps_the_gt_tool() -> None:
+    """The hard ceiling must cut distractors, never the answer itself.
+
+    Truncation happens while the GT tool is still at index 0, so a pathological
+    schema dump cannot remove the supervised class. The caller is responsible
+    for counting what was cut (``tool_truncated_rows``).
+    """
+    gt = _schema("pick_one", params=1)
+    natives = [_schema(f"native_{i}") for i in range(10)]
+    pool = ToolPool([gt, *natives], seed=23)
+    sample = UnifiedSample(
+        sample_id="ceiling",
+        source_dataset="test",
+        utterance="do the thing",
+        tools=[gt, *natives],
+        ground_truth_calls=[GroundTruthCall(tool_name="pick_one", arguments={"p0": "x"})],
+        current_time_iso="2026-11-09",
+        stratum=Stratum.F,
+    )
+    cands, gt_idx = pool.candidates_for(sample, gt, pack_tools=20, max_tools=4)
+    assert len(cands) == 4, f"ceiling not applied: {len(cands)} candidates"
+    assert 0 <= gt_idx < len(cands), f"GT index {gt_idx} outside {len(cands)} candidates"
+    assert cands[gt_idx].name == "pick_one", "the ceiling dropped the supervised tool"
+
+
+def test_tensorize_counts_truncation_loudly() -> None:
+    """A truncated row must be counted, not silently rendered short."""
+    tok = FakeTokenizer()
+    mb = CandidateMaskBuilder(max_seq_len=2048, max_span_width=16)
+    gt = _schema("pick_one", params=1)
+    natives = [_schema(f"native_{i}") for i in range(8)]
+    pool = ToolPool([gt, *natives], seed=31)
+    sample = UnifiedSample(
+        sample_id="truncate-me",
+        source_dataset="test",
+        utterance="do the thing",
+        tools=[gt, *natives],
+        ground_truth_calls=[GroundTruthCall(tool_name="pick_one", arguments={"p0": "x"})],
+        current_time_iso="2026-11-09",
+        stratum=Stratum.F,
+    )
+    stats: dict = {}
+    row = tensorize_sample_lean(
+        sample, tok, mb, max_seq_len=2048, tool_pool=pool, pack_tools=20,
+        max_tools=4, stats=stats, jitter=False,
+    )
+    assert row is not None
+    assert stats.get("tool_truncated_rows", 0) == 1, (
+        "truncation happened but was not reported; a row silently rendered "
+        f"fewer tools than the user saw. stats={stats}"
+    )
+    assert int(row["_n_tool_candidates"]) <= 4
+
+
 def test_tool_pool_packs_gt_plus_distractors() -> None:
     """The GT tool must always be present, at a shuffled index, with T == budget."""
     gt = _schema("get_weather", params=2)
@@ -884,6 +1225,10 @@ def test_tensorize_emits_multi_candidate_tool_targets() -> None:
 
     Uses a 1024-token budget: packing 3 tool schemas + the time window exceeds
     512 tokens, and over-length rows are (correctly) dropped by the tensorizer.
+
+    ``jitter=False`` because R1c randomizes the floor per row; this test asserts
+    the exact packed count, while ``test_jitter_pack_tools_*`` covers the
+    randomization itself.
     """
     tok = FakeTokenizer()
     mb = CandidateMaskBuilder(max_seq_len=1024, max_span_width=16)
@@ -900,7 +1245,7 @@ def test_tensorize_emits_multi_candidate_tool_targets() -> None:
     )
     row = tensorize_sample_lean(
         sample, tok, mb, max_seq_len=1024, pack_multi_tools=True,
-        tool_pool=pool, pack_tools=3,
+        tool_pool=pool, pack_tools=3, jitter=False,
     )
     assert row is not None
     n_cands = int(row["_n_tool_candidates"])
@@ -1052,7 +1397,7 @@ def test_tensorize_drops_row_when_gt_tool_anchor_cannot_snap(monkeypatch) -> Non
     )
     row = tensorize_sample_lean(
         sample, tok, mb, max_seq_len=1024, pack_multi_tools=True,
-        tool_pool=pool, pack_tools=3,
+        tool_pool=pool, pack_tools=3, jitter=False,
     )
     assert row is None, (
         "a row whose GT tool anchor cannot snap must be dropped; keeping it "
@@ -1093,7 +1438,7 @@ def test_tensorize_encodes_unsnapped_distractor_as_pad_index(monkeypatch) -> Non
     stats: dict = {}
     row = tensorize_sample_lean(
         sample, tok, mb, max_seq_len=1024, pack_multi_tools=True,
-        tool_pool=pool, pack_tools=3, stats=stats,
+        tool_pool=pool, pack_tools=3, stats=stats, jitter=False,
     )
     if row is None:
         # The dead slot happened to be the GT: dropping is the correct policy.
@@ -1107,6 +1452,278 @@ def test_tensorize_encodes_unsnapped_distractor_as_pad_index(monkeypatch) -> Non
     assert int(row["_n_tool_candidates"]) == sum(1 for p in tp if p >= 0)
     assert tp[int(row["tool_targets"])] >= 0
     assert stats.get("tool_snap_misses", 0) >= 1
+
+
+def test_tensorize_max_pos_populates_multiple_positive_slots() -> None:
+    """R7: a repeated entity mention must yield MULTIPLE positive slots.
+
+    ``compute_lean_pointer_loss`` implements the marginal log-likelihood
+    ``logsumexp(all) - logsumexp(positives)``, which only differs from plain
+    single-positive CE when more than one positive slot is populated. The
+    tensorizer used to match targets by canonical value and ``break`` on the
+    first equal candidate, so a row could never carry two positives even with
+    ``max_pos=3`` -- the multi-positive path was dead code in every run.
+
+    "move Tokyo to Tokyo" has the same value at two distinct offsets, so both
+    candidates must be supervised.
+    """
+    tok = FakeTokenizer()
+    mb = CandidateMaskBuilder(max_seq_len=1024, max_span_width=16)
+    gt = _schema("move_item", params=1)  # optional string param -> free spans
+    utterance = "move Tokyo to Tokyo"
+    sample = UnifiedSample(
+        sample_id="multipos",
+        source_dataset="test",
+        utterance=utterance,
+        tools=[gt],
+        ground_truth_calls=[
+            GroundTruthCall(tool_name="move_item", arguments={"p0": "Tokyo"})
+        ],
+        current_time_iso="2026-11-09",
+        stratum=Stratum.F,
+    )
+    row = tensorize_sample_lean(
+        sample, tok, mb, max_seq_len=1024, max_pos=3, pack_multi_tools=True,
+    )
+    assert row is not None, "utterance fits in 1024 tokens; row must not be dropped"
+
+    pos_row = row["pos_indices"][0].tolist()
+    assert len(pos_row) == 3, f"max_pos=3 must expose 3 slots, got {len(pos_row)}"
+    live_pos = [p for p in pos_row if p >= 0]
+    assert len(live_pos) >= 2, (
+        f"only {len(live_pos)} positive slot(s) for a twice-repeated entity; "
+        "the value-match break is still collapsing every mention into one slot"
+    )
+    assert len(set(live_pos)) == len(live_pos), f"duplicate positive slots: {pos_row}"
+
+    # The two positives must be genuinely different token spans, not one span
+    # counted twice -- otherwise the loss is unchanged and the test is vacuous.
+    starts = row["cand_starts"][0].tolist()
+    ends = row["cand_ends"][0].tolist()
+    spans = [(starts[p], ends[p]) for p in live_pos]
+    assert len(set(spans)) == len(spans), f"positives share one span: {spans}"
+
+    # The multi-positive marginal likelihood must be finite with a real gradient.
+    # Shapes are (B, K, C) logits against (B, K, P) positives -- K=1 here.
+    logits = torch.randn(1, 1, len(starts), requires_grad=True)
+    ptr = torch.tensor([[pos_row]], dtype=torch.long)
+    loss = compute_lean_pointer_loss(logits, ptr)
+    assert torch.isfinite(loss).all(), f"non-finite multi-positive loss: {loss}"
+    assert float(loss.detach().sum()) > 0.0, "loss should be positive for random logits"
+    loss.sum().backward()
+    assert logits.grad is not None and torch.isfinite(logits.grad).all()
+    assert float(logits.grad.abs().sum()) > 0.0, "multi-positive loss has no gradient"
+
+
+def test_compute_lean_pointer_loss_weights_every_positive() -> None:
+    """R7: a second positive must change the loss, and the result is a lower bound.
+
+    Adding a valid alternative can only make the marginal likelihood better, so
+    ``loss(2 positives) <= loss(1 positive)`` must hold pointwise for the same
+    logits. This is the property that makes multi-positive supervision correct
+    rather than merely different.
+    """
+    logits = torch.tensor([[[1.0, 2.0, 0.5, -1.0]]])  # (B=1, K=1, C=4)
+    one = torch.tensor([[[1, -1, -1]]], dtype=torch.long)
+    two = torch.tensor([[[1, 2, -1]]], dtype=torch.long)
+    loss_one = float(compute_lean_pointer_loss(logits, one).sum())
+    loss_two = float(compute_lean_pointer_loss(logits, two).sum())
+    assert loss_two <= loss_one + 1e-6, (
+        f"adding a positive raised the loss ({loss_two} > {loss_one}); the "
+        "marginal likelihood is being computed against the wrong set"
+    )
+    # With BOTH positives at the top-2 logits, the loss must be strictly smaller.
+    assert loss_two < loss_one, "second positive had no effect on the loss"
+
+    # A row with no positives contributes exactly zero (never NaN).
+    none = torch.tensor([[[-1, -1, -1]]], dtype=torch.long)
+    assert float(compute_lean_pointer_loss(logits, none).sum()) == 0.0
+
+
+def test_tensorize_capped_candidates_have_no_duplicate_spans() -> None:
+    """The candidate cap must emit each ``(tok_start, tok_end)`` span exactly once.
+
+    Regression for a cap block that appended every kept index to BOTH an
+    ordered ``pool`` list and the ``keep_set`` membership set. Two consequences
+    followed:
+
+    1. the early-stop test ``len(pool) + len(keep_set) >= max_cands`` counted
+       each index twice, so it fired at roughly half the real budget; and
+    2. the final ``sorted(list(keep_set) + pool[...])`` emitted the same span
+       twice, so a ``max_cands=512`` row held ~256 distinct candidates padded
+       with ~256 repeats.
+
+    The model then ran a softmax over duplicated columns, and the row kept
+    about half the distinct candidate coverage the inference resolver sees --
+    a silent train/serve gap pointing the wrong way. ``keep_set`` is now the
+    single authoritative membership set.
+    """
+    tok = FakeTokenizer()
+    mb = CandidateMaskBuilder(max_seq_len=1024, max_span_width=16)
+    # ``_schema`` builds optional string params -> a free-string candidate set
+    # (windowed utterance spans) plus the deterministic <|null|> slot.
+    gt = _schema("search_docs", params=1)
+
+    # A long, word-dense utterance yields far more raw candidates than the cap,
+    # which is what forces the capping branch to run at all.
+    words = [f"w{i}x" for i in range(60)]
+    utterance = " ".join(words)
+
+    sample = UnifiedSample(
+        sample_id="cap-dedup",
+        source_dataset="test",
+        utterance=utterance,
+        tools=[gt],
+        ground_truth_calls=[
+            GroundTruthCall(tool_name="search_docs", arguments={"p0": words[20]})
+        ],
+        current_time_iso="2026-11-09",
+        stratum=Stratum.F,
+    )
+    cap = 48
+    row = tensorize_sample_lean(
+        sample, tok, mb, max_seq_len=1024, max_cands=cap, pack_multi_tools=True,
+    )
+    assert row is not None, "utterance fits in 1024 tokens; row must not be dropped"
+
+    starts = row["cand_starts"][0].tolist()
+    ends = row["cand_ends"][0].tolist()
+    spans = list(zip(starts, ends))
+    # Trailing (-1, -1) entries are padding, not candidates.
+    live = [s for s in spans if s != (PAD_INDEX, PAD_INDEX)]
+
+    assert len(live) == cap, (
+        f"the cap must fill exactly {cap} columns for an over-long candidate "
+        f"set, got {len(live)} (raw utterance yields far more)"
+    )
+    assert len(live) == len(set(live)), (
+        f"capped candidate list repeats spans: {len(live)} columns but only "
+        f"{len(set(live))} distinct (tok_start, tok_end) pairs"
+    )
+
+    # Capping must never evict the supervised span, and every positive column
+    # index must still resolve to a real (non-padding) candidate.
+    pos = [p for p in row["pos_indices"][0].tolist() if p >= 0]
+    assert pos, "capping dropped the positive span -- supervision would be empty"
+    for p in pos:
+        assert 0 <= p < len(live), f"positive index {p} out of range for {len(live)} candidates"
+
+
+def test_jitter_pack_tools_is_deterministic_in_seed_and_sample_id() -> None:
+    """R1c: the per-row floor must be reproducible across processes and reruns.
+
+    Tensorization runs inside a fork pool, so the same ``(seed, sample_id)`` must
+    yield the same anchor count every time; otherwise the same row would train
+    against a different T on every epoch for no reason.
+    """
+    draws = [jitter_pack_tools(5, "sample-abc", seed=42) for _ in range(20)]
+    assert len(set(draws)) == 1, f"non-deterministic floor: {set(draws)}"
+    assert jitter_pack_tools(5, "sample-abc", seed=42) == jitter_pack_tools(
+        5, "sample-abc", seed=42
+    )
+    # A different seed must be allowed to (and normally will) differ.
+    other = {jitter_pack_tools(8, "sample-abc", seed=s) for s in range(1, 30)}
+    assert len(other) > 1, "seed has no effect: the floor is not really randomized"
+
+
+def test_jitter_pack_tools_range_covers_one_through_the_ceiling() -> None:
+    """R1c: the draw is inclusive of BOTH ``min_tools`` and ``pack_tools``.
+
+    T=1 must be reachable, otherwise the oracle-tool eval prompt (exactly one
+    rendered tool) stays out of distribution and H1 collapses at serve time.
+    No draw may exceed the configured ceiling either.
+    """
+    hi = 5
+    values = {jitter_pack_tools(hi, f"s{i}", seed=7) for i in range(400)}
+    assert min(values) == 1, f"T=1 unreachable; draws started at {min(values)}"
+    assert max(values) == hi, f"ceiling {hi} unreachable; draws topped at {max(values)}"
+    assert values <= set(range(1, hi + 1)), f"draw outside [1, {hi}]: {values}"
+
+
+def test_jitter_pack_tools_honours_explicit_min_tools() -> None:
+    """``jitter_min_tools`` raises the lower bound without touching the ceiling."""
+    values = {jitter_pack_tools(6, f"s{i}", seed=3, min_tools=4) for i in range(300)}
+    assert values <= set(range(4, 7)), f"draw outside [4, 6]: {values}"
+    assert 4 in values and 6 in values
+
+
+def test_jitter_pack_tools_degenerates_when_floor_meets_min() -> None:
+    """A degenerate range (hi <= lo) must return the ceiling, not raise or draw lo-1."""
+    assert jitter_pack_tools(1, "s", seed=1, min_tools=1) == 1
+    assert jitter_pack_tools(3, "s", seed=1, min_tools=3) == 3
+    # min_tools above the ceiling: the ceiling wins, nothing above is invented.
+    assert jitter_pack_tools(3, "s", seed=1, min_tools=9) == 3
+
+
+def test_tensorize_jitter_reaches_t1_and_reports_the_draw() -> None:
+    """R1c end-to-end: over many rows the tensorizer must render T=1 sometimes.
+
+    Without jitter, every training row renders exactly ``pack_tools`` anchors and
+    the single-tool eval prompt is a shape H1 never saw. The ``jittered_rows``
+    and ``render_T_hist`` counters make the realized distribution auditable.
+    """
+    tok = FakeTokenizer()
+    mb = CandidateMaskBuilder(max_seq_len=2048, max_span_width=16)
+    gt = _schema("get_weather", params=1)
+    pool = ToolPool([gt, *[_schema(f"tool_{i}") for i in range(7)]], seed=13)
+    stats: dict = {}
+    seen_T: set = set()
+    for i in range(40):
+        sample = UnifiedSample(
+            sample_id=f"jit-{i}",
+            source_dataset="test",
+            utterance="weather in Tokyo",
+            tools=[gt],
+            ground_truth_calls=[
+                GroundTruthCall(tool_name="get_weather", arguments={"p0": "Tokyo"})
+            ],
+            current_time_iso="2026-11-09",
+            stratum=Stratum.F,
+        )
+        row = tensorize_sample_lean(
+            sample, tok, mb, max_seq_len=2048, tool_pool=pool, pack_tools=4,
+            stats=stats,
+        )
+        if row is not None:
+            seen_T.add(int(row["_n_tool_candidates"]))
+
+    assert stats.get("jittered_rows", 0) == 40, "jitter never ran"
+    assert 1 in seen_T, (
+        f"no row rendered T=1 over 40 jittered draws; realized T set was {sorted(seen_T)}"
+    )
+    assert max(seen_T) <= 4, f"jitter exceeded the ceiling: {sorted(seen_T)}"
+    hist = stats.get("render_T_hist") or {}
+    assert sum(int(v) for v in hist.values()) >= 1, "render_T_hist not populated"
+
+
+def test_tensorize_without_jitter_renders_exactly_the_floor() -> None:
+    """``jitter=False`` is the escape hatch that keeps counts reproducible."""
+    tok = FakeTokenizer()
+    mb = CandidateMaskBuilder(max_seq_len=2048, max_span_width=16)
+    gt = _schema("get_weather", params=1)
+    pool = ToolPool([gt, *[_schema(f"tool_{i}") for i in range(7)]], seed=13)
+    stats: dict = {}
+    counts = set()
+    for i in range(10):
+        sample = UnifiedSample(
+            sample_id=f"nojit-{i}",
+            source_dataset="test",
+            utterance="weather in Tokyo",
+            tools=[gt],
+            ground_truth_calls=[
+                GroundTruthCall(tool_name="get_weather", arguments={"p0": "Tokyo"})
+            ],
+            current_time_iso="2026-11-09",
+            stratum=Stratum.F,
+        )
+        row = tensorize_sample_lean(
+            sample, tok, mb, max_seq_len=2048, tool_pool=pool, pack_tools=4,
+            stats=stats, jitter=False,
+        )
+        if row is not None:
+            counts.add(int(row["_n_tool_candidates"]))
+    assert counts == {4}, f"jitter=False still varied T: {sorted(counts)}"
+    assert stats.get("jittered_rows", 0) == 0
 
 
 def test_tool_pool_degrades_honestly_when_smaller_than_pack_tools() -> None:
@@ -1175,4 +1792,979 @@ def test_trainer_mean_n_candidates_ignores_fully_dead_rows() -> None:
     ev = trainer.evaluate([batch])
     assert ev["mean_n_candidates"] == 3.0
     assert ev["n_tool"] == 1.0
+
+
+def test_lean_batch_collate_rank2_missing() -> None:
+    """Finding 5: LeanBatchCollate must build rank-2 pad for missing rank-2 key."""
+    from spancall.lean.tensorize import LeanBatchCollate
+
+    collate = LeanBatchCollate()
+    row1 = {
+        "input_ids": torch.tensor([1, 2, 3]),
+        "cand_starts": torch.tensor([[0, 1], [2, 3]]),  # shape (2, 2)
+        "cand_ends": torch.tensor([[1, 2], [3, 4]]),
+    }
+    row2 = {
+        "input_ids": torch.tensor([4, 5]),
+        "cand_starts": None,
+        "cand_ends": None,
+    }
+    batch = collate([row1, row2])
+    assert batch["cand_starts"].shape == (2, 2, 2)
+    assert (batch["cand_starts"][1] == -1).all()
+
+
+def test_trainer_tensorize_rows_1d_preservation() -> None:
+    """Finding 6: trainer.tensorize_rows must not destroy 1-D supervision tensors."""
+    encoder = TinyDummyEncoder(hidden_dim=32)
+    model = LeanSpanCallModel(encoder=encoder, head_dim=16, hidden_dim=32)
+    trainer = LeanTrainer(model=model, lr_encoder=1e-3, lr_head=1e-3, device="cpu", use_amp=False)
+
+    row = {
+        "input_ids": [1, 2, 3],
+        "cand_starts": [0, 1, 2],  # 1-D with K=1
+        "pos_indices": [0],
+    }
+    tensorized = trainer.tensorize_rows([row])[0]
+    assert tensorized["cand_starts"].shape == (1, 3)
+    assert tensorized["pos_indices"].shape == (1, 1)
+
+    empty_row = {
+        "input_ids": [1, 2],
+        "cand_starts": [],  # Empty 1-D
+        "pos_indices": [],
+    }
+    empty_tensorized = trainer.tensorize_rows([empty_row])[0]
+    assert empty_tensorized["cand_starts"].shape == (0, 0)
+    assert empty_tensorized["pos_indices"].shape == (0, 0)
+
+
+def test_lean_resolver_no_param_anchors_abstain() -> None:
+    """Finding 7: resolver must abstain with no_param_anchors when anchors are missing."""
+    encoder = TinyDummyEncoder(hidden_dim=32)
+    model = LeanSpanCallModel(encoder=encoder, head_dim=16, hidden_dim=32)
+    resolver = LeanResolver(model=model, max_seq_len=512)
+
+    schema = ToolDefinition(
+        name="test_tool",
+        description="Tool with param",
+        parameters=[
+            ParameterSchema(name="param1", description="A parameter", param_type="string", required=True),
+        ],
+    )
+    # Mock _score_parameters returning empty anchors
+    orig_score = resolver._score_parameters
+    try:
+        resolver._score_parameters = lambda *args, **kwargs: ([], {})
+        res = resolver.try_resolve(schema, utterance="test utterance")
+        assert res.status == "abstain"
+        assert res.abstain_reason == "no_param_anchors"
+        assert res.error_reason == "no_param_anchors"
+        assert "param1" in res.missing_required
+    finally:
+        resolver._score_parameters = orig_score
+
+
+def _two_schemas_sharing_param() -> tuple:
+    """Two tools that BOTH declare a parameter named ``query``."""
+    a = ToolDefinition(
+        name="search_docs",
+        description="Search documents",
+        parameters=[ParameterSchema(name="query", description="q", param_type="string", required=True)],
+    )
+    b = ToolDefinition(
+        name="search_email",
+        description="Search email",
+        parameters=[ParameterSchema(name="query", description="q", param_type="string", required=True)],
+    )
+    return a, b
+
+
+def test_resolver_renders_all_context_schemas_but_scores_one() -> None:
+    """R0.2 + R1b: the prompt must show every tool; only the GT tool is decoded.
+
+    Under the oracle-tool setting eval rendered exactly one ``<|tool|>`` block
+    while training rendered ``pack_tools`` of them, so H1/H3 met an anchor
+    layout at serve time they had never seen. ``context_schemas`` renders the
+    real candidate set and reports the count it actually used.
+    """
+    encoder = TinyDummyEncoder(hidden_dim=32)
+    model = LeanSpanCallModel(encoder=encoder, head_dim=16, hidden_dim=32)
+    resolver = LeanResolver(model=model, max_seq_len=512)
+    assert resolver.supports_context_schemas is True, (
+        "the capability flag must exist so eval can gate on it instead of "
+        "swallowing a TypeError"
+    )
+
+    a, b = _two_schemas_sharing_param()
+    res = resolver.try_resolve(
+        a, utterance="find the doc about Paris", context_schemas=[a, b],
+    )
+    # Scored tool is unchanged: context_schemas only affects the PROMPT.
+    assert res.tool_name == "search_docs"
+    assert set(res.parameters) == {"query"}, (
+        f"decoded {sorted(res.parameters)}; a distractor's params must not be "
+        "scored into this call's payload"
+    )
+    assert res.features.get("render_T") == 2, (
+        f"render_T={res.features.get('render_T')} but 2 tools were rendered; "
+        "the T mismatch would stay invisible"
+    )
+
+
+def test_resolver_always_renders_the_scored_tool() -> None:
+    """A ``context_schemas`` list that omits the scored tool must not be trusted."""
+    encoder = TinyDummyEncoder(hidden_dim=32)
+    model = LeanSpanCallModel(encoder=encoder, head_dim=16, hidden_dim=32)
+    resolver = LeanResolver(model=model, max_seq_len=512)
+    a, b = _two_schemas_sharing_param()
+    res = resolver.try_resolve(a, utterance="find doc", context_schemas=[b])
+    assert res.tool_name == "search_docs"
+    # search_docs got spliced back in, so two blocks are rendered.
+    assert res.features.get("render_T") == 2
+
+
+def test_resolver_reports_effective_recent_budget() -> None:
+    """R2: the halved budget must be REPORTED, not applied silently.
+
+    ``eff_budget = min(context_budget_tokens, max(64, max_seq_len // 2))`` used
+    to halve the configured budget with no trace in the features, so a run that
+    dropped recent rows looked identical to one that simply had few rows.
+    """
+    encoder = TinyDummyEncoder(hidden_dim=32)
+    model = LeanSpanCallModel(encoder=encoder, head_dim=16, hidden_dim=32)
+    resolver = LeanResolver(model=model, max_seq_len=512, context_budget_tokens=4096)
+    a, _ = _two_schemas_sharing_param()
+    res = resolver.try_resolve(a, utterance="find doc", recent_context=[])
+    f = res.features
+    assert f["recent_budget_tokens"] == 4096, f"configured budget lost: {f}"
+    assert f["recent_budget_effective"] == 256, (
+        f"effective budget should be max(64, 512//2)=256, got {f}"
+    )
+    assert f["recent_budget_clamped"] is True, "the clamp must be flagged"
+
+
+def test_candidate_masks_key_shared_param_names_by_tool() -> None:
+    """R3: ``tool_a::query`` and ``tool_b::query`` must be distinct entries.
+
+    Keying masks by bare ``param_name`` made the second schema silently
+    overwrite the first, so a distractor tool that happened to share a parameter
+    name replaced the supervised tool's candidate set.
+    """
+    encoder = TinyDummyEncoder(hidden_dim=32)
+    model = LeanSpanCallModel(encoder=encoder, head_dim=16, hidden_dim=32)
+    resolver = LeanResolver(model=model, max_seq_len=512)
+    a, b = _two_schemas_sharing_param()
+
+    from datetime import date as _date
+
+    from span_template.template import build_input_multi
+    from spancall.data.align import tooldef_to_template_tool
+
+    output = build_input_multi(
+        [tooldef_to_template_tool(a), tooldef_to_template_tool(b)],
+        "find the doc about Paris",
+        now=_date(2026, 11, 9),
+    )
+    masks, _ctx = resolver._candidate_masks(output, output.text, [a, b])
+    assert "search_docs::query" in masks, f"missing qualified key; got {sorted(masks)}"
+    assert "search_email::query" in masks, f"missing qualified key; got {sorted(masks)}"
+    # Both must have produced a usable candidate set, not one plus a clobbered one.
+    for k in ("search_docs::query", "search_email::query"):
+        assert masks[k]["candidates"], f"{k} produced no candidates"
+
+
+def test_resolver_latency_is_additive_across_stages() -> None:
+    """R5: ``latency_ms`` must include the render/encode/H1 work done by the caller.
+
+    ``_resolve`` starts its own clock, so its ``latency_ms`` only covered
+    head/decode/post. ``try_resolve_candidates`` adds its own frame and reports
+    any stage gap explicitly instead of letting it vanish.
+    """
+    encoder = TinyDummyEncoder(hidden_dim=32)
+    model = LeanSpanCallModel(encoder=encoder, head_dim=16, hidden_dim=32)
+    resolver = LeanResolver(model=model, max_seq_len=512)
+    a, b = _two_schemas_sharing_param()
+    res = resolver.try_resolve_candidates([a, b], utterance="find the doc about Paris")
+
+    assert res.latency_ms is not None and res.latency_ms > 0.0, "no latency recorded"
+    stage_sum = res.features["stage_sum_ms"]
+    unattributed = res.features["unattributed_ms"]
+    assert stage_sum >= 0.0
+    assert unattributed >= 0.0, "sum of stages exceeded total; the math is inverted"
+    assert stage_sum <= res.latency_ms + 1e-6, (
+        f"stage sum {stage_sum} > total {res.latency_ms}; total is not additive"
+    )
+
+
+def test_tensorize_sanitizes_recent_rows_like_inference() -> None:
+    """R8: a ``"user city"`` key must survive as ``"user_city"``, not be dropped.
+
+    Training stringified rows verbatim while serving ran ``sanitize_key``, so a
+    key with a space rendered at train time and was renamed (or dropped) at
+    serve time -- a silent prompt mismatch.
+    """
+    tok = FakeTokenizer()
+    mb = CandidateMaskBuilder(max_seq_len=2048, max_span_width=16)
+    gt = _schema("get_weather", params=1)
+    sample = UnifiedSample(
+        sample_id="recent-sanitize",
+        source_dataset="test",
+        utterance="weather in Tokyo",
+        tools=[gt],
+        ground_truth_calls=[GroundTruthCall(tool_name="get_weather", arguments={"p0": "Tokyo"})],
+        recent_context=[{"key": "user city", "value": "Tokyo", "source": "recent"}],
+        current_time_iso="2026-11-09",
+        stratum=Stratum.F,
+    )
+    stats: dict = {}
+    row = tensorize_sample_lean(
+        sample, tok, mb, max_seq_len=2048, stats=stats, pack_multi_tools=True,
+    )
+    assert row is not None, "a sanitizable recent row must not drop the sample"
+    assert stats.get("n_recent_rows", 0) == 1, (
+        f"the recent row was dropped instead of sanitized: {stats}"
+    )
+    # Inspect the rows that actually reached the template: the key must be
+    # sanitized, not dropped and not passed through verbatim.
+    from spancall.lean.tensorize import _recent_rows
+
+    rows = _recent_rows(sample, tools=sample.tools, tokenizer=tok)
+    assert len(rows) == 1, f"expected 1 surviving recent row, got {rows}"
+    assert rows[0].key == "user_city", (
+        f"key rendered as {rows[0].key!r}; training must sanitize like serving"
+    )
+    assert rows[0].value == "Tokyo"
+
+
+def test_tensorizer_telemetry_counts_every_T() -> None:
+    """R9: ``render_T`` must be recorded on every row, including T=1.
+
+    Counting only T>1 would hide the exact train/serve mismatch the metric
+    exists to expose.
+    """
+    tok = FakeTokenizer()
+    mb = CandidateMaskBuilder(max_seq_len=2048, max_span_width=16)
+    gt = _schema("get_weather", params=1)
+    sample = UnifiedSample(
+        sample_id="telemetry",
+        source_dataset="test",
+        utterance="weather in Tokyo",
+        tools=[gt],
+        ground_truth_calls=[GroundTruthCall(tool_name="get_weather", arguments={"p0": "Tokyo"})],
+        current_time_iso="2026-11-09",
+        stratum=Stratum.F,
+    )
+    stats: dict = {}
+    row = tensorize_sample_lean(
+        sample, tok, mb, max_seq_len=2048, stats=stats, pack_multi_tools=True,
+    )
+    assert row is not None
+    assert stats.get("render_T_rows", 0) == 1, f"T not recorded: {stats}"
+    assert stats.get("render_T_sum", 0) == int(row["_n_tool_candidates"]), (
+        "the recorded T must match the live anchors actually emitted"
+    )
+    hist = stats.get("render_T_hist") or {}
+    assert sum(int(v) for v in hist.values()) == 1, f"histogram not maintained: {hist}"
+
+
+def test_pack_multi_tools_flag_does_not_change_the_grammar() -> None:
+    """R6: ``pack_multi_tools=False`` must be a no-op now.
+
+    It used to select the SINGLE-tool template, which emits no ``<|none|>``
+    anchor and a different anchor layout than the inference path -- training on
+    a grammar serving never produced.
+    """
+    tok = FakeTokenizer()
+    mb = CandidateMaskBuilder(max_seq_len=2048, max_span_width=16)
+    gt = _schema("get_weather", params=1)
+    sample = UnifiedSample(
+        sample_id="r6-grammar",
+        source_dataset="test",
+        utterance="weather in Tokyo",
+        tools=[gt],
+        ground_truth_calls=[GroundTruthCall(tool_name="get_weather", arguments={"p0": "Tokyo"})],
+        current_time_iso="2026-11-09",
+        stratum=Stratum.F,
+    )
+    kw = dict(max_seq_len=2048, pack_tools=1, jitter=False)
+    on = tensorize_sample_lean(sample, tok, mb, pack_multi_tools=True, **kw)
+    off = tensorize_sample_lean(sample, tok, mb, pack_multi_tools=False, **kw)
+    assert on is not None and off is not None
+    assert torch.equal(on["input_ids"], off["input_ids"]), (
+        "pack_multi_tools changed the rendered grammar; the flag must be inert"
+    )
+    assert torch.equal(on["param_positions"], off["param_positions"])
+    assert torch.equal(on["tool_positions"], off["tool_positions"])
+    # The multi grammar renders a <|tool|> anchor block even for T=1, which is
+    # what the single-tool template never emitted. Both flags must produce it.
+    assert on["tool_positions"].numel() == 1, (
+        "the unified grammar must emit one <|tool|> anchor for a single tool"
+    )
+    assert torch.equal(on["tool_targets"], torch.tensor(0))
+
+
+def test_lean_resolver_candidates_multi_template_and_bundle() -> None:
+    """Finding 1: try_resolve_candidates reuses multi-tool encoding and try_resolve uses multi template."""
+    encoder = TinyDummyEncoder(hidden_dim=32)
+    model = LeanSpanCallModel(encoder=encoder, head_dim=16, hidden_dim=32)
+    resolver = LeanResolver(model=model, max_seq_len=512)
+
+    schema1 = ToolDefinition(
+        name="tool1",
+        description="Tool 1",
+        parameters=[ParameterSchema(name="city", description="City name", param_type="string", required=True)],
+    )
+    schema2 = ToolDefinition(
+        name="tool2",
+        description="Tool 2",
+        parameters=[ParameterSchema(name="item", description="Item name", param_type="string", required=True)],
+    )
+
+    # try_resolve on single tool renders with build_input_multi
+    res1 = resolver.try_resolve(schema1, utterance="test city Paris")
+    assert res1.tool_name == "tool1"
+
+    # try_resolve_candidates resolves in single pass
+    res_multi = resolver.try_resolve_candidates([schema1, schema2], utterance="test city Paris")
+    assert res_multi.tool_name in ("tool1", "tool2")
+    assert "winner_prob" in res_multi.features
+
+
+# ---------------------------------------------------------------------------
+# R0.4 / J2 — the tensorizer emits a call axis
+# ---------------------------------------------------------------------------
+
+
+def _j2_tool(name: str, *params: ParameterSchema) -> ToolDefinition:
+    return ToolDefinition(name=name, description=f"{name} tool", parameters=list(params))
+
+
+def _j2_param(name: str, required: bool = True) -> ParameterSchema:
+    return ParameterSchema(name=name, description=name, param_type="string", required=required)
+
+
+def test_single_call_row_emits_the_legacy_call_axis() -> None:
+    """J2: a one-call row must keep every old shape, with the call axis at 0."""
+    tok = FakeTokenizer()
+    mb = CandidateMaskBuilder(max_seq_len=512, max_span_width=16)
+    tool = _j2_tool("get_weather", _j2_param("city"), _j2_param("unit", required=False))
+    sample = UnifiedSample(
+        sample_id="j2-single",
+        source_dataset="test",
+        utterance="weather in Tokyo",
+        tools=[tool],
+        ground_truth_calls=[GroundTruthCall(tool_name="get_weather", arguments={"city": "Tokyo"})],
+        stratum=Stratum.F,
+    )
+    row = tensorize_sample_lean(sample, tok, mb, max_seq_len=512)
+    assert row is not None
+    # tool_targets stays scalar: F.cross_entropy(tool_logits (B,T), targets (B,)).
+    assert row["tool_targets"].dim() == 0
+    assert row["call_tool_targets"].shape == (1,)
+    assert row["call_param_index"].tolist() == [0, 0]
+    assert int(row["n_calls"]) == 1
+    assert row["pos_indices"].shape[0] == 2
+    assert "_anchor_calls" not in row
+
+
+def test_two_calls_keep_separate_param_targets_on_a_shared_anchor() -> None:
+    """J2: two calls to one tool share the anchor but not the demanded value."""
+    tok = FakeTokenizer()
+    mb = CandidateMaskBuilder(max_seq_len=512, max_span_width=16)
+    tool = _j2_tool("search", _j2_param("query"))
+    sample = UnifiedSample(
+        sample_id="j2-two",
+        source_dataset="test",
+        utterance="search Tokyo and Osaka",
+        tools=[tool],
+        ground_truth_calls=[
+            GroundTruthCall(tool_name="search", arguments={"query": "Tokyo"}),
+            GroundTruthCall(tool_name="search", arguments={"query": "Osaka"}),
+        ],
+        stratum=Stratum.F,
+    )
+    row = tensorize_sample_lean(sample, tok, mb, max_seq_len=512)
+    assert row is not None
+    assert int(row["n_calls"]) == 2
+    assert row["call_tool_targets"].shape == (2,)
+    # ONE anchor: the two calls share the same (tool, param) question vector.
+    assert row["param_positions"].shape == (1,)
+    # Both demanded values are valid, so the anchor carries positives from each.
+    # The raw count exceeds 2 because one value can surface as several candidate
+    # spans; the contract is "at least one positive per demanded value", and the
+    # conflict is tagged rather than resolved by silently keeping call 0.
+    positives = [p for p in row["pos_indices"][0].tolist() if p >= 0]
+    assert len(positives) >= 2
+    assert len(set(positives)) == len(positives)  # no duplicated columns
+    assert row["_anchor_calls"] == [[0, 1]]
+    assert row["_ambiguous_anchor"] == 1
+
+
+def test_two_calls_to_different_tools_get_one_anchor_each() -> None:
+    """J2: anchors are deduplicated by (tool, param), not by param alone."""
+    tok = FakeTokenizer()
+    mb = CandidateMaskBuilder(max_seq_len=512, max_span_width=16)
+    weather = _j2_tool("get_weather", _j2_param("city"))
+    hotel = _j2_tool("book_hotel", _j2_param("city"), _j2_param("nights", required=False))
+    sample = UnifiedSample(
+        sample_id="j2-two-tools",
+        source_dataset="test",
+        utterance="weather in Tokyo and book a hotel in Tokyo",
+        tools=[weather, hotel],
+        ground_truth_calls=[
+            GroundTruthCall(tool_name="get_weather", arguments={"city": "Tokyo"}),
+            GroundTruthCall(tool_name="book_hotel", arguments={"city": "Tokyo"}),
+        ],
+        stratum=Stratum.F,
+    )
+    row = tensorize_sample_lean(sample, tok, mb, max_seq_len=512, pack_tools=2)
+    assert row is not None
+    assert int(row["n_calls"]) == 2
+    # city@get_weather, city@book_hotel, nights@book_hotel
+    assert row["param_positions"].shape == (3,)
+    assert sorted(row["call_tool_targets"].tolist()) == sorted(
+        {row["tool_targets"].item(), row["call_tool_targets"][1].item()}
+    )
+    # No anchor is shared, so nothing is ambiguous.
+    assert "_ambiguous_anchor" not in row
+
+
+def test_call_axis_pads_with_pad_index_across_a_batch() -> None:
+    """J2: LeanBatchCollate must pad call_tool_targets with -1, not 0."""
+    tok = FakeTokenizer()
+    mb = CandidateMaskBuilder(max_seq_len=512, max_span_width=16)
+    tool = _j2_tool("search", _j2_param("query"))
+    one = UnifiedSample(
+        sample_id="j2-b1",
+        source_dataset="test",
+        utterance="search Tokyo",
+        tools=[tool],
+        ground_truth_calls=[GroundTruthCall(tool_name="search", arguments={"query": "Tokyo"})],
+        stratum=Stratum.F,
+    )
+    two = UnifiedSample(
+        sample_id="j2-b2",
+        source_dataset="test",
+        utterance="search Tokyo and Osaka",
+        tools=[tool],
+        ground_truth_calls=[
+            GroundTruthCall(tool_name="search", arguments={"query": "Tokyo"}),
+            GroundTruthCall(tool_name="search", arguments={"query": "Osaka"}),
+        ],
+        stratum=Stratum.F,
+    )
+    rows = [
+        tensorize_sample_lean(one, tok, mb, max_seq_len=512),
+        tensorize_sample_lean(two, tok, mb, max_seq_len=512),
+    ]
+    assert all(r is not None for r in rows)
+    batch = LeanBatchCollate()([r for r in rows if r is not None])
+    assert batch["call_tool_targets"].shape == (2, 2)
+    assert batch["n_calls"].tolist() == [1, 2]
+    # Row 0 has one call; the second slot is PAD_INDEX, never a fake "tool 0".
+    assert batch["call_tool_targets"][0, 1].item() == PAD_INDEX
+    # tool_targets keeps its scalar shape through the collator.
+    assert batch["tool_targets"].shape == (2,)
+
+
+# ---------------------------------------------------------------------------
+# R0.4 / J3 — set-valued H1 loss
+# ---------------------------------------------------------------------------
+
+
+def test_compute_lean_tool_loss_p1_matches_cross_entropy() -> None:
+    """J3: the (B,) path must be bit-identical to plain cross entropy."""
+    torch.manual_seed(0)
+    logits = torch.randn(4, 3)
+    targets = torch.tensor([0, -1, 2, -1])
+
+    got = compute_lean_tool_loss(logits, targets)
+    want = torch.nn.functional.cross_entropy(logits, targets, ignore_index=PAD_INDEX)
+    assert got is not None
+    # torch.equal, not torch.allclose: the (B,) branch delegates verbatim, so a
+    # bit-identical result is the contract, not merely "close enough".
+    assert torch.equal(got, want)
+
+
+def test_compute_lean_tool_loss_accepts_a_set_of_tools() -> None:
+    """J3: any member of the GT set earns credit, so more GT tools => lower loss."""
+    torch.manual_seed(1)
+    logits = torch.randn(2, 4, requires_grad=True)
+    # Row 0: two correct tools (0, 2). Row 1: padded out entirely.
+    targets = torch.tensor([[0, 2], [PAD_INDEX, PAD_INDEX]])
+
+    loss_set = compute_lean_tool_loss(logits, targets)
+    assert loss_set is not None
+    assert torch.isfinite(loss_set)
+
+    # The same row with only tool 0 as correct is a strict subset of the set, so
+    # the marginal NLL must be >= the set-valued NLL: adding a correct answer
+    # can never make the row look worse.
+    subset = torch.tensor([[0, PAD_INDEX], [PAD_INDEX, PAD_INDEX]])
+    loss_subset = compute_lean_tool_loss(logits, subset)
+    assert loss_subset is not None
+    assert float(loss_subset.detach()) >= float(loss_set.detach())
+
+    # Row 1 carries no supervision, so it must not be averaged into the mean:
+    # a single-row batch of row 0 alone reports exactly the same loss.
+    only_row0 = compute_lean_tool_loss(logits[:1], targets[:1])
+    assert only_row0 is not None
+    assert torch.allclose(only_row0, loss_set)
+
+    # The set-valued objective is differentiable, and the unsupervised row must
+    # contribute zero gradient (otherwise padded rows would drag tool 0 up).
+    assert loss_set.requires_grad
+    loss_set.backward()
+    assert logits.grad is not None
+    assert float(logits.grad[1].abs().sum()) == 0.0
+    # Both GT tools of row 0 carry gradient: neither is treated as a negative.
+    assert float(logits.grad[0, 0]) != 0.0
+    assert float(logits.grad[0, 2]) != 0.0
+
+
+def test_compute_lean_tool_loss_returns_none_without_supervision() -> None:
+    """J3: no supervision must skip the term, not report a perfect zero."""
+    logits = torch.randn(2, 3)
+    assert compute_lean_tool_loss(
+        logits, torch.tensor([[PAD_INDEX, PAD_INDEX], [PAD_INDEX, PAD_INDEX]])
+    ) is None
+    assert compute_lean_tool_loss(logits, torch.tensor([PAD_INDEX, PAD_INDEX])) is None
+    assert compute_lean_tool_loss(logits, torch.empty((2, 0), dtype=torch.long)) is None
+
+
+def test_lean_loss_container_prefers_call_tool_targets() -> None:
+    """J3: the call axis wins over the legacy scalar when both are supplied."""
+    torch.manual_seed(2)
+    logits = torch.randn(2, 4)
+    call_targets = torch.tensor([[0, 1], [2, PAD_INDEX]])
+    # A deliberately WRONG scalar target: if it were used the loss would differ.
+    scalar_targets = torch.tensor([3, 3])
+
+    container = LeanLossContainer(lambda_pointer=0.0, lambda_tool=1.0)
+    out = container(
+        {"tool_logits": logits},
+        {"call_tool_targets": call_targets, "tool_targets": scalar_targets},
+    )
+    expected = compute_lean_tool_loss(logits, call_targets)
+    assert expected is not None
+    assert torch.allclose(out["tool"], expected.detach())
+    assert torch.allclose(out["loss"], expected.detach())
+
+    # Without the call axis the container must fall back to the scalar path.
+    out_legacy = container({"tool_logits": logits}, {"tool_targets": scalar_targets})
+    legacy = compute_lean_tool_loss(logits, scalar_targets)
+    assert legacy is not None
+    assert torch.allclose(out_legacy["tool"], legacy.detach())
+
+
+def test_train_step_forwards_the_call_axis_to_the_loss() -> None:
+    """J3: a tensorized multi-call batch must train through the set-valued loss."""
+    tok = FakeTokenizer()
+    mb = CandidateMaskBuilder(max_seq_len=512, max_span_width=16)
+    tool = _j2_tool("search", _j2_param("query"))
+    sample = UnifiedSample(
+        sample_id="j3-two-calls",
+        source_dataset="test",
+        utterance="search Tokyo and Osaka",
+        tools=[tool],
+        ground_truth_calls=[
+            GroundTruthCall(tool_name="search", arguments={"query": "Tokyo"}),
+            GroundTruthCall(tool_name="search", arguments={"query": "Osaka"}),
+        ],
+        stratum=Stratum.F,
+    )
+    row = tensorize_sample_lean(sample, tok, mb, max_seq_len=512)
+    assert row is not None
+    batch = LeanBatchCollate()([row])
+    assert batch["call_tool_targets"].shape == (1, 2)
+
+    encoder = TinyDummyEncoder(hidden_dim=32)
+    model = LeanSpanCallModel(encoder=encoder, head_dim=16, hidden_dim=32)
+    trainer = LeanTrainer(model=model, lr_encoder=1e-3, lr_head=1e-3, device="cpu", use_amp=False)
+    metrics = trainer.train_step(batch)
+    assert "tool_loss" in metrics
+    assert not torch.isnan(torch.tensor(metrics["tool_loss"]))
+    # ``tool_acc`` still reads the scalar primary-call target, so it must survive.
+    assert "tool_acc" in metrics
+
+
+# --------------------------------------------------------------------------- #
+# R0.4 / J6 — multi-call eval metrics
+# --------------------------------------------------------------------------- #
+
+def _j6_two_call_record(extra_second_tool: bool = False) -> dict:
+    """One sample with TWO GT calls to different tools, sharing a param name."""
+    tools = [
+        {
+            "name": "get_weather",
+            "description": "Weather",
+            "parameters": [
+                {"name": "city", "description": "City", "param_type": "string", "required": True},
+            ],
+        },
+        {
+            "name": "book_hotel",
+            "description": "Hotel",
+            "parameters": [
+                {"name": "city", "description": "City", "param_type": "string", "required": True},
+            ],
+        },
+    ]
+    if extra_second_tool:
+        tools.append({
+            "name": "get_time",
+            "description": "Clock",
+            "parameters": [
+                {"name": "city", "description": "City", "param_type": "string", "required": True},
+            ],
+        })
+    return {
+        "sample_id": "j6-two-calls",
+        "source_dataset": "test",
+        "utterance": "weather in Tokyo and a hotel in Osaka",
+        "tools": tools,
+        "ground_truth_calls": [
+            {"tool_name": "get_weather", "arguments": {"city": "Tokyo"}},
+            {"tool_name": "book_hotel", "arguments": {"city": "Osaka"}},
+        ],
+        "current_time_iso": "2026-11-09",
+        "stratum": "F",
+        "target_spans": {
+            # Call-aware keys: the SAME param name must not collide across calls.
+            "0::city": [{"param_name": "city", "target_type": "utterance_span",
+                         "canonical_value": "Tokyo"}],
+            "1::city": [{"param_name": "city", "target_type": "utterance_span",
+                         "canonical_value": "Osaka"}],
+        },
+    }
+
+
+class _J6MultiCallResolver:
+    """Resolver stub returning one call per requested tool (oracle behaviour)."""
+
+    supports_context_schemas = True
+
+    def __init__(self, values_by_tool: dict, extra_calls: int = 0) -> None:
+        self.values_by_tool = values_by_tool
+        self.extra_calls = extra_calls
+        self.tools_seen: list = []
+
+    def try_resolve(self, tool, utterance, recent_context=None, now=None, **kwargs):
+        name = getattr(tool, "name", "")
+        self.tools_seen.append(name)
+        value = self.values_by_tool.get(name)
+        params = (
+            {"city": _StubResolution(value=value, confidence=0.9, source_type="utterance")}
+            if value is not None else {}
+        )
+        res = _StubResolveResult(
+            parameters=params,
+            payload_partial=({k: v.value for k, v in params.items()}),
+            hit=bool(params),
+            tool_name=name,
+        )
+        calls = [_StubResolveResult(
+            tool_name=name,
+            payload=({k: v.value for k, v in params.items()}),
+            hit=bool(params),
+        )]
+        # Simulate the decoder emitting extra calls (a hallucinated over-call).
+        for i in range(self.extra_calls):
+            calls.append(_StubResolveResult(tool_name=f"extra_{i}", payload={}, hit=False))
+        res.calls = calls
+        return res
+
+
+def test_eval_part1_scores_every_gt_call(tmp_path) -> None:
+    """J6: a 2-call sample must be scored on BOTH calls, not just ``[0]``.
+
+    Before the fix only ``ground_truth_calls[0]`` was resolved and scored, so the
+    13.9% multi-call rows silently reported at most half of their params, and the
+    second call's parameters never entered recall/precision at all.
+    """
+    split = _write_split(tmp_path, [_j6_two_call_record()])
+    resolver = _J6MultiCallResolver({"get_weather": "Tokyo", "book_hotel": "Osaka"})
+
+    metrics = eval_param_extraction_lean(
+        split, resolver=resolver, data_dir=str(tmp_path), limit=10, max_param_gap_report=5
+    )
+
+    # Both GT tools were resolved -> both calls were actually evaluated.
+    assert resolver.tools_seen == ["get_weather", "book_hotel"]
+    # Both calls' params are extractable and both retrieved correctly.
+    assert metrics["param_counts"]["total_gt_params"] == 2
+    assert metrics["param_counts"]["groundable_gt_params"] == 2
+    assert metrics["param_counts"]["extractable_tp"] == 2
+    assert metrics["extraction_recall"] == 1.0
+    assert metrics["extraction_precision"] == 1.0
+    # Set-level exactness: both GT calls match, predicted count agrees.
+    assert metrics["call_exact_set_match"] == 1.0
+    assert metrics["call_count_acc"] == 1.0
+
+
+def test_eval_part1_reports_n_calls_histograms(tmp_path) -> None:
+    """J6: the call-count distribution of GT and prediction must be reported."""
+    split = _write_split(tmp_path, [
+        _j6_two_call_record(),
+        _weather_record(
+            {"city": "Tokyo"},
+            {"city": [{"param_name": "city", "target_type": "utterance_span",
+                       "canonical_value": "Tokyo"}]},
+            sample_id="single",
+        ),
+    ])
+    resolver = _J6MultiCallResolver({"get_weather": "Tokyo", "book_hotel": "Osaka"})
+
+    metrics = eval_param_extraction_lean(
+        split, resolver=resolver, data_dir=str(tmp_path), limit=10, max_param_gap_report=5
+    )
+
+    assert metrics["n_calls_hist"] == {"1": 1, "2": 1}
+    assert metrics["n_multi_call_samples"] == 1
+    # The single-call row predicts 1 call; the 2-call row predicts 2.
+    assert metrics["pred_n_calls_hist"] == {"1": 1, "2": 1}
+    assert metrics["call_count_acc"] == 1.0
+
+
+def test_eval_part1_call_exact_set_match_rejects_an_extra_call(tmp_path) -> None:
+    """J6: a hallucinated extra call must break the SET match but not call-0."""
+    split = _write_split(tmp_path, [_j6_two_call_record()])
+    resolver = _J6MultiCallResolver(
+        {"get_weather": "Tokyo", "book_hotel": "Osaka"}, extra_calls=1
+    )
+
+    metrics = eval_param_extraction_lean(
+        split, resolver=resolver, data_dir=str(tmp_path), limit=10, max_param_gap_report=5
+    )
+
+    # Every param is still right, so the call-0 headline is unaffected...
+    assert metrics["extraction_recall"] == 1.0
+    assert metrics["exact_payload_match_F"] == 1.0
+    # ...but the model emitted a third call, so the set-level match fails.
+    assert metrics["call_exact_set_match"] == 0.0
+    assert metrics["call_count_acc"] == 0.0
+    assert metrics["pred_n_calls_hist"] == {"3": 1}
+
+
+def test_eval_part1_multi_call_per_param_rows_are_call_tagged(tmp_path) -> None:
+    """J6: two calls sharing a param name must not be summed into one row."""
+    split = _write_split(tmp_path, [_j6_two_call_record()])
+    resolver = _J6MultiCallResolver({"get_weather": "Tokyo", "book_hotel": "WRONG"})
+
+    metrics = eval_param_extraction_lean(
+        split, resolver=resolver, data_dir=str(tmp_path), limit=10, max_param_gap_report=20
+    )
+
+    # `city` on call 0 is right, on call 1 is wrong: 1 tp + 1 fp, never 2 tp.
+    assert metrics["param_counts"]["extractable_tp"] == 1
+    assert metrics["param_counts"]["extractable_fp"] == 1
+    assert metrics["call_exact_set_match"] == 0.0
+    # The count is still correct (2 GT calls, 2 predicted).
+    assert metrics["call_count_acc"] == 1.0
+
+
+def _j6_same_tool_two_call_record() -> dict:
+    """One sample with TWO GT calls to the SAME tool (``get_weather`` twice).
+
+    The call set is a MULTISET: ``[get_weather(Tokyo), get_weather(Osaka)]`` is
+    two calls, not one. Part 1 used to dedupe predicted calls by tool name, so a
+    perfectly predicted same-tool pair collapsed to a single call and scored
+    ``call_count_acc=0`` / ``call_exact_set_match=0``.
+    """
+    return {
+        "sample_id": "j6-same-tool-twice",
+        "source_dataset": "test",
+        "utterance": "weather in Tokyo and also in Osaka",
+        "tools": [
+            {
+                "name": "get_weather",
+                "description": "Weather",
+                "parameters": [
+                    {"name": "city", "description": "City", "param_type": "string",
+                     "required": True},
+                ],
+            },
+        ],
+        "ground_truth_calls": [
+            {"tool_name": "get_weather", "arguments": {"city": "Tokyo"}},
+            {"tool_name": "get_weather", "arguments": {"city": "Osaka"}},
+        ],
+        "current_time_iso": "2026-11-09",
+        "stratum": "F",
+        "target_spans": {
+            "0::city": [{"param_name": "city", "target_type": "utterance_span",
+                         "canonical_value": "Tokyo"}],
+            "1::city": [{"param_name": "city", "target_type": "utterance_span",
+                         "canonical_value": "Osaka"}],
+        },
+    }
+
+
+class _J6SameToolResolver:
+    """Resolver stub returning ONE call per resolution, in scripted order.
+
+    Both GT calls request ``get_weather``, so the value cannot be keyed by tool
+    name without collapsing the multiset — the values are consumed in call order.
+    """
+
+    supports_context_schemas = True
+
+    def __init__(self, values: list) -> None:
+        self.values = list(values)
+        self.n_resolved = 0
+
+    def try_resolve(self, tool, utterance, recent_context=None, now=None, **kwargs):
+        idx = min(self.n_resolved, len(self.values) - 1)
+        self.n_resolved += 1
+        value = self.values[idx]
+        name = getattr(tool, "name", "")
+        params = {"city": _StubResolution(value=value, confidence=0.9,
+                                          source_type="utterance")}
+        payload = {"city": value}
+        res = _StubResolveResult(
+            parameters=params,
+            payload_partial=dict(payload),
+            hit=True,
+            tool_name=name,
+        )
+        # One decoded call per resolution — the resolver's ``calls`` mirror.
+        res.calls = [_StubResolveResult(tool_name=name, payload=dict(payload), hit=True)]
+        return res
+
+
+def test_eval_part1_counts_two_calls_to_the_same_tool(tmp_path) -> None:
+    """J6/I1: same-tool repeated calls must count as TWO calls, not one.
+
+    Regression for the tool-name dedupe in ``eval_param_extraction_lean``: a
+    correct ``[get_weather(Tokyo), get_weather(Osaka)]`` prediction used to be
+    collapsed to 1 call, so ``call_count_acc`` and ``call_exact_set_match`` read
+    0.0 while every parameter was right.
+    """
+    split = _write_split(tmp_path, [_j6_same_tool_two_call_record()])
+    resolver = _J6SameToolResolver(["Tokyo", "Osaka"])
+
+    metrics = eval_param_extraction_lean(
+        split, resolver=resolver, data_dir=str(tmp_path), limit=10, max_param_gap_report=5
+    )
+
+    # Both GT calls were resolved against the same tool.
+    assert resolver.n_resolved == 2
+    # Both calls' params are right.
+    assert metrics["param_counts"]["extractable_tp"] == 2
+    assert metrics["extraction_recall"] == 1.0
+    # The multiset counts as two: the headline must not collapse it to one.
+    assert metrics["n_calls_hist"] == {"2": 1}
+    assert metrics["pred_n_calls_hist"] == {"2": 1}
+    assert metrics["call_count_acc"] == 1.0
+    assert metrics["call_exact_set_match"] == 1.0
+
+
+class _J6SameToolIdenticalResolver:
+    """Returns the SAME single call twice — the hardest multiset case.
+
+    Two GT calls to ``get_weather({"city": "Tokyo"})`` are indistinguishable by
+    content, so any dedupe keyed on (tool, payload) wrongly collapses them to
+    one call. Only call multiplicity — one call per resolution — is correct.
+    """
+
+    supports_context_schemas = True
+
+    def __init__(self, value: str) -> None:
+        self.value = value
+        self.n_resolved = 0
+
+    def try_resolve(self, tool, utterance, recent_context=None, now=None, **kwargs):
+        self.n_resolved += 1
+        name = getattr(tool, "name", "")
+        params = {"city": _StubResolution(value=self.value, confidence=0.9,
+                                          source_type="utterance")}
+        payload = {"city": self.value}
+        res = _StubResolveResult(
+            parameters=params,
+            payload_partial=dict(payload),
+            hit=True,
+            tool_name=name,
+        )
+        res.calls = [_StubResolveResult(tool_name=name, payload=dict(payload), hit=True)]
+        return res
+
+
+def test_eval_part1_counts_two_identical_same_tool_calls(tmp_path) -> None:
+    """Regression: identical arguments must not defeat the multiset count.
+
+    A content-keyed dedupe (tool + payload) still collapsed this case, because
+    two identical GT calls produce two identical predictions. The count has to
+    follow call multiplicity, not content.
+    """
+    rec = _j6_same_tool_two_call_record()
+    rec["ground_truth_calls"] = [
+        {"tool_name": "get_weather", "arguments": {"city": "Tokyo"}},
+        {"tool_name": "get_weather", "arguments": {"city": "Tokyo"}},
+    ]
+    rec["target_spans"] = {
+        "0::city": [{"param_name": "city", "target_type": "utterance_span",
+                     "canonical_value": "Tokyo"}],
+        "1::city": [{"param_name": "city", "target_type": "utterance_span",
+                     "canonical_value": "Tokyo"}],
+    }
+    split = _write_split(tmp_path, [rec])
+    resolver = _J6SameToolIdenticalResolver("Tokyo")
+
+    metrics = eval_param_extraction_lean(
+        split, resolver=resolver, data_dir=str(tmp_path), limit=10, max_param_gap_report=5
+    )
+
+    assert resolver.n_resolved == 2
+    assert metrics["pred_n_calls_hist"] == {"2": 1}
+    assert metrics["call_count_acc"] == 1.0
+    assert metrics["call_exact_set_match"] == 1.0
+
+
+class _J6WholeSetResolver:
+    """Decodes the WHOLE call set on every ``try_resolve`` (call_schemas path).
+
+    Each resolution repeats the identical 2-call list, so a naive concatenation
+    would report 4 predicted calls for a 2-call sample.
+    """
+
+    supports_context_schemas = True
+
+    def __init__(self, pairs) -> None:
+        self.pairs = list(pairs)
+        self.n_resolved = 0
+
+    def try_resolve(self, tool, utterance, recent_context=None, now=None, **kwargs):
+        self.n_resolved += 1
+        name = getattr(tool, "name", "")
+        value = dict(self.pairs).get(name, "")
+        params = {"city": _StubResolution(value=value, confidence=0.9,
+                                          source_type="utterance")}
+        res = _StubResolveResult(
+            parameters=params,
+            payload_partial={"city": value},
+            hit=bool(value),
+            tool_name=name,
+        )
+        res.calls = [
+            _StubResolveResult(tool_name=t, payload={"city": v}, hit=True)
+            for t, v in self.pairs
+        ]
+        return res
+
+
+def test_eval_part1_does_not_double_count_a_repeated_whole_set(tmp_path) -> None:
+    """The whole-set decode shape must be read ONCE, not once per resolution."""
+    split = _write_split(tmp_path, [_j6_two_call_record()])
+    resolver = _J6WholeSetResolver([("get_weather", "Tokyo"), ("book_hotel", "Osaka")])
+
+    metrics = eval_param_extraction_lean(
+        split, resolver=resolver, data_dir=str(tmp_path), limit=10, max_param_gap_report=5
+    )
+
+    assert resolver.n_resolved == 2          # both GT tools were resolved
+    assert metrics["pred_n_calls_hist"] == {"2": 1}   # not 4
+    assert metrics["call_count_acc"] == 1.0
+    assert metrics["call_exact_set_match"] == 1.0
+
 

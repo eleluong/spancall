@@ -58,6 +58,23 @@ def _sortkey(value: Any) -> Tuple[str, str]:
 
 
 @dataclass
+class LeanCallDecode:
+    """One decoded call for the R0.4 multi-call path.
+
+    ``values`` holds that call's ``param -> canonical value`` assignment. Calls
+    are decoded independently, so two calls may legitimately resolve to the same
+    span (e.g. the same ``city`` for a weather tool and a hotel tool) -- that is
+    not a conflict, it is the correct answer for both.
+    """
+
+    call_index: int
+    values: Dict[str, Any]
+    delta: float
+    chosen: Dict[str, LeanValueChoice]
+    n_nodes: int = 0
+
+
+@dataclass
 class _Cand:
     value: Any
     score: float
@@ -153,6 +170,53 @@ class LeanJointDecoder:
         assignment = {name: v.value for name, v in zip(active_names, best_combo)}
         chosen = {name: v for name, v in zip(active_names, best_combo)}
         return assignment, delta, chosen, len(ranked)
+
+    def decode_calls(
+        self,
+        per_param_scores_by_call: Any,
+        entity_classes: Optional[Dict[str, str]] = None,
+        top_k: Optional[int] = None,
+    ) -> List[LeanCallDecode]:
+        """Decode every call independently (R0.4).
+
+        ``per_param_scores_by_call`` is either a mapping ``{call_index: {param:
+        [(candidate, score), ...]}}`` (the tensorizer's ``call_param_index``
+        layout, where index ``k`` of the flat anchor list owns one call) or a
+        plain sequence of such per-param dicts, in which case enumeration order
+        defines ``call_index``.
+
+        Each call runs the unchanged single-call search, so exclusivity is
+        scoped **within** a call and never across calls: two calls resolving to
+        the same span is the correct answer for e.g. "weather in Tokyo and a
+        hotel in Tokyo", and pruning it would zero out a whole call.
+
+        Returns one :class:`LeanCallDecode` per call, ordered by ``call_index``.
+        A call with no non-empty parameter set is still represented (with empty
+        ``values``) so ``len(result)`` always equals the number of calls asked
+        for -- callers rely on position to align with ``call_tool_targets``.
+        """
+        if isinstance(per_param_scores_by_call, dict):
+            items: List[Tuple[int, Any]] = sorted(
+                per_param_scores_by_call.items(), key=lambda kv: int(kv[0])
+            )
+        else:
+            items = list(enumerate(per_param_scores_by_call))
+
+        out: List[LeanCallDecode] = []
+        for ci, per_param in items:
+            values, delta, chosen, n_nodes = self.decode_detailed(
+                per_param or {}, entity_classes=entity_classes, top_k=top_k
+            )
+            out.append(
+                LeanCallDecode(
+                    call_index=int(ci),
+                    values=values,
+                    delta=float(delta),
+                    chosen=chosen,
+                    n_nodes=int(n_nodes),
+                )
+            )
+        return out
 
     @staticmethod
     def _softmax(scores: Sequence[float]) -> List[float]:

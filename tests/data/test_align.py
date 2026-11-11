@@ -411,3 +411,107 @@ def test_align_hermes_singleturn_end_to_end(tmp_path) -> None:
     (qual,) = out.target_spans["stream_quality"]
     assert qual.target_type == "enum_ctx"
     assert qual.canonical_value == "4k"
+
+
+# ---------------------------------------------------------------------------
+# R0.4 / Phase J1 — call-aware target_spans
+# ---------------------------------------------------------------------------
+
+def test_single_call_keeps_bare_target_span_keys() -> None:
+    """A one-call sample must be byte-identical to the pre-R0.4 key space.
+
+    Every downstream reader (augment, the diagnose scripts, tensorize) indexes
+    ``target_spans[param_name]`` directly, so qualifying single-call samples
+    would be a silent, repo-wide break.
+    """
+    tools = [_tool(params=[_p("city"), _p("unit", required=False)])]
+    s = _sample(
+        sid="j1-single",
+        utterance="Weather in Tokyo please.",
+        tools=tools,
+        gt=[GroundTruthCall(tool_name="tool", arguments={"city": "Tokyo"})],
+    )
+    out = ReverseAligner().align(s)
+    assert out.n_calls == 1
+    assert set(out.target_spans) == {"city", "unit"}
+    assert all("::" not in k for k in out.target_spans)
+    assert set(out.metadata["h4_reasons"]) == {"city", "unit"}
+    # The migration accessor must transparently hand back the legacy map.
+    assert out.targets_for_call(0) == out.target_spans
+
+
+def test_two_calls_sharing_a_param_name_do_not_collide() -> None:
+    """R0.4 exit criterion: ``query`` declared by two calls yields two disjoint lists."""
+    tools = [
+        _tool("search", params=[_p("query")]),
+        _tool("fetch", params=[_p("query")]),
+    ]
+    s = _sample(
+        sid="j1-multi",
+        utterance="Search for apples and then fetch apples.",
+        tools=tools,
+        gt=[
+            GroundTruthCall(tool_name="search", arguments={"query": "apples"}),
+            GroundTruthCall(tool_name="fetch", arguments={"query": "apples"}),
+        ],
+    )
+    out = ReverseAligner().align(s)
+    assert out.n_calls == 2
+    assert set(out.target_spans) == {"0::query", "1::query"}
+    call0 = out.targets_for_call(0)
+    call1 = out.targets_for_call(1)
+    assert set(call0) == {"query"} and set(call1) == {"query"}
+    # Both calls ground the same word in this utterance, but they must be
+    # SEPARATE list objects: extending one can never leak into the other.
+    assert call0["query"] is not call1["query"]
+    assert call0["query"] and call1["query"]
+    assert out.metadata["h4_reasons"]["0::query"] == "OK"
+    assert out.metadata["h4_reasons"]["1::query"] == "OK"
+
+
+def test_targets_for_call_refuses_to_fabricate_from_a_flattened_legacy_key() -> None:
+    """A legacy multi-call file's bare keys are a collision, not per-call truth.
+
+    Before R0.4, alignment overwrote same-named params across calls. Handing
+    that residue to ``call_index=1`` would invent supervision from another
+    call's arguments, so the accessor must return nothing for it.
+    """
+    s = UnifiedSample(
+        sample_id="j1-legacy",
+        source_dataset="test",
+        utterance="x",
+        tools=[],
+        ground_truth_calls=[
+            GroundTruthCall(tool_name="a", arguments={"q": "1"}),
+            GroundTruthCall(tool_name="b", arguments={"q": "2"}),
+        ],
+        target_spans={
+            # What the OLD aligner produced: one bare key, holding only the
+            # last write (or an interleaved merge) -- ambiguous by construction.
+            "q": [SpanTarget(param_name="q", target_type="utterance_span",
+                             canonical_value="2")],
+        },
+    )
+    assert s.n_calls == 2
+    assert s.targets_for_call(0) == {}
+    assert s.targets_for_call(1) == {}
+
+
+def test_targets_for_call_prefers_qualified_keys_over_the_legacy_fallback() -> None:
+    """Once qualified keys exist, the fallback must not shadow or merge them."""
+    s = UnifiedSample(
+        sample_id="j1-mixed",
+        source_dataset="test",
+        utterance="x",
+        tools=[],
+        ground_truth_calls=[GroundTruthCall(tool_name="a", arguments={"q": "real"})],
+        target_spans={
+            "0::q": [SpanTarget(param_name="q", target_type="utterance_span",
+                                canonical_value="real")],
+            "q": [SpanTarget(param_name="q", target_type="utterance_span",
+                             canonical_value="stale")],
+        },
+    )
+    got = s.targets_for_call(0)
+    assert len(got["q"]) == 1
+    assert got["q"][0].canonical_value == "real"

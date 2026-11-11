@@ -19,6 +19,62 @@ import torch.nn.functional as F
 PAD_INDEX: int = -1
 
 
+def compute_lean_tool_loss(
+    tool_logits: torch.Tensor,
+    tool_targets: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """Set-valued H1 loss: any of the row's GT tools is a correct answer.
+
+    Accepts two target shapes, and the shape decides the objective:
+
+    - ``(B,)`` -- exactly one correct tool per row (the legacy contract). This
+      path calls :func:`torch.nn.functional.cross_entropy` verbatim, so its
+      value is **identical** to the pre-R0.4 implementation, not merely
+      mathematically equivalent.
+    - ``(B, P)`` -- up to ``P`` correct tools per row (one per supervised call,
+      ``PAD_INDEX`` padded). The negative log marginal likelihood of the target
+      SET is ``logsumexp(all tool logits) - logsumexp(target logits)``: any
+      member of the set earns full credit, and the gradient still pushes the
+      non-chosen GT tools up rather than treating them as negatives.
+
+    Returns ``None`` when no row in the batch has a usable target. Callers must
+    then SKIP the tool term entirely instead of adding a zero loss: a batch with
+    no H1 supervision must not look like a batch with perfect H1 predictions.
+    """
+    if tool_logits.dim() != 2 or tool_logits.numel() == 0:
+        return None
+    C = int(tool_logits.size(-1))
+    T = tool_targets
+    if not isinstance(T, torch.Tensor) or T.numel() == 0:
+        return None
+
+    if T.dim() <= 1:
+        flat = T.reshape(-1)
+        if int(flat.size(0)) != int(tool_logits.size(0)):
+            return None
+        has = (flat >= 0) & (flat < C)
+        if not bool(has.any()):
+            return None
+        return F.cross_entropy(tool_logits, flat, ignore_index=PAD_INDEX)
+
+    if T.dim() != 2 or int(T.size(0)) != int(tool_logits.size(0)):
+        return None
+    valid = (T >= 0) & (T < C)
+    has_row = valid.any(-1)
+    if not bool(has_row.any()):
+        return None
+
+    tgt = tool_logits.gather(-1, T.clamp(min=0, max=max(C - 1, 0)))
+    tgt = tgt.masked_fill(~valid, float("-inf"))
+    # Rows with no target would make logsumexp(-inf, ...) = -inf and produce
+    # NaN in the subtraction; zeroing those slots keeps the row finite and the
+    # ``has_row`` factor below excludes it from the mean contribution.
+    num = torch.logsumexp(tgt.masked_fill(~has_row.unsqueeze(-1), 0.0), dim=-1)
+    den = torch.logsumexp(tool_logits, dim=-1)
+    per_row = den - num
+    return (per_row * has_row).sum() / has_row.sum().clamp(min=1)
+
+
 def compute_lean_pointer_loss(
     candidate_logits: torch.Tensor,
     positive_indices: torch.Tensor,
@@ -121,21 +177,24 @@ class LeanLossContainer(nn.Module):
             total_loss = total_loss + self.lambda_pointer * ptr_loss
 
         # 2. Tool loss (H1)
-        if "tool_logits" in predictions and "tool_targets" in targets:
+        #
+        # ``call_tool_targets`` (B, n_calls) is the R0.4 multi-call form and
+        # takes precedence when present; ``tool_targets`` (B,) is the legacy
+        # single-tool form and is what every pre-existing caller still passes.
+        if "tool_logits" in predictions:
             tool_logits = predictions["tool_logits"]
-            tool_targets = targets["tool_targets"]
-            # tool_targets uses PAD_INDEX (-1) as the "no supervised tool"
-            # sentinel (rows whose H1 anchors the collator padded out, or rows
-            # whose GT tool failed to render). Passing -1 straight to
-            # cross_entropy would raise IndexError, hence ignore_index. When
-            # EVERY row is ignored the reduction would be NaN, so the term is
-            # skipped entirely instead of poisoning ``total_loss``.
-            if tool_targets is not None and tool_logits.numel() > 0:
-                has_sup = (tool_targets >= 0) & (tool_targets < tool_logits.size(-1))
-                if bool(has_sup.any()):
-                    t_loss = F.cross_entropy(
-                        tool_logits, tool_targets, ignore_index=PAD_INDEX
-                    )
+            tool_targets = targets.get("call_tool_targets")
+            if tool_targets is None:
+                tool_targets = targets.get("tool_targets")
+            # PAD_INDEX (-1) is the "no supervised tool" sentinel (rows whose H1
+            # anchors the collator padded out, or rows whose GT tool failed to
+            # render). ``compute_lean_tool_loss`` masks it; when EVERY row is
+            # masked it returns None and the term is skipped rather than added
+            # as a zero -- a batch with no H1 supervision must not report a
+            # perfect tool loss.
+            if tool_targets is not None:
+                t_loss = compute_lean_tool_loss(tool_logits, tool_targets)
+                if t_loss is not None:
                     out["tool"] = t_loss.detach()
                     total_loss = total_loss + self.lambda_tool * t_loss
                 else:

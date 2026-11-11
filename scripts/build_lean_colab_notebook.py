@@ -121,11 +121,24 @@ MAX_SPAN_WIDTH = 16
 MAX_CANDS      = 512
 
 import yaml
+_cfg_yaml = {}
 try:
     _cfg_yaml = yaml.safe_load(open("configs/default.yaml")) or {}
-    MAX_POS   = int((_cfg_yaml.get("optimization") or {}).get("max_pos", 3))
-except Exception:
-    MAX_POS   = 3
+except Exception as _cfg_exc:  # noqa: BLE001 - reported, never silent
+    print(f"[!] configs/default.yaml unreadable ({type(_cfg_exc).__name__}: "
+          f"{_cfg_exc}); max_pos/max_tools/jitter fall back to code defaults.")
+MAX_POS = int(((_cfg_yaml.get("optimization") or {}).get("max_pos", 3)) or 3)
+
+# R0.1: ``pack_tools`` is a FLOOR (T = max(pack_tools, 1 + len(native tools))),
+# never a cap -- a native tool must never be silently dropped from the prompt.
+# ``MAX_TOOLS`` is the one knob allowed to reduce T, and it is an emergency
+# brake for VRAM, so it is None (off) by default.
+# R1c: ``JITTER_PACK_TOOLS`` draws T uniformly from [1, floor] per row, which is
+# what puts the oracle-tool eval layout (T=1) back in the training distribution.
+_data_cfg = _cfg_yaml.get("data") or {}
+MAX_TOOLS = _data_cfg.get("max_tools")
+MAX_TOOLS = None if MAX_TOOLS in (None, "", 0) else int(MAX_TOOLS)
+JITTER_PACK_TOOLS = bool(_data_cfg.get("jitter_pack_tools", True))
 
 # Lean Flow only needs multi-tool `t2` (train) and `dev` (held-out eval)
 SPLIT_INPUTS = {
@@ -147,6 +160,8 @@ print("=" * 72)
 print(f"EXPERIMENT_NAME   = {EXPERIMENT_NAME}  SEED = {SEED}")
 print(f"BACKBONE          = {BACKBONE}")
 print(f"MAX_SEQ_LEN       = {MAX_SEQ_LEN}  MAX_SPAN_WIDTH = {MAX_SPAN_WIDTH}  MAX_POS = {MAX_POS}")
+print(f"MAX_TOOLS         = {MAX_TOOLS}  (None = no ceiling; pack_tools is a floor, never a cap)")
+print(f"JITTER_PACK_TOOLS = {JITTER_PACK_TOOLS}  (per-row T draw from [1, floor] so T=1 is in-distribution)")
 for k, v in SPLIT_INPUTS.items():
     print(f"  {k:<9} <- {v}   (limit={SAMPLE_LIMITS.get(k)})")
 print(f"DATA_FRACTION     = {DATA_FRACTION}")
@@ -306,15 +321,38 @@ print("tokenizer ready; vocab =", len(tokenizer), "| MAX_SEQ_LEN =", MAX_SEQ_LEN
       "| PACK_TOOLS =", PACK_TOOLS)'''
 
 CODE_TENSOR_RUN = '''# ---- tensorize splits into Lean 0-indexed format (parallel fork pool) ----
+# ``typing`` is imported HERE, in the cell that uses it. Notebook cells do not
+# share scope, so the ``from typing import ...`` that appears in the resolver
+# cell further down is invisible to this one: annotating ``cand_hist: Dict[...]``
+# without this line raises NameError at runtime.
+from typing import Any, Dict, List, Optional
+import json
+import os
+import queue
+import random
+import time
 
 def _iter_raw_lines(path: str):
+    """Yield the raw JSONL TEXT of each non-empty line.
+
+    Deliberately does NOT ``json.loads`` here: parsing in the parent would make
+    the whole corpus parse single-threaded before any fork happens (the parent
+    wasted one full core on this on Colab's 2 vCPUs) and would hold every row
+    dict in RAM at once. The fork workers parse their own line instead.
+    """
     with open(path, "r") as fh:
         for line in fh:
             line = line.strip()
             if line:
-                yield json.loads(line)
+                yield line
+
+def _iter_raw_dicts(path: str):
+    """Parsed variant, for consumers that need dicts in the parent."""
+    for line in _iter_raw_lines(path):
+        yield json.loads(line)
 
 def _fraction_subset(raw_lines, frac: float, seed: int):
+    """Deterministic fraction of the raw lines (still unparsed text)."""
     raw_lines = list(raw_lines)
     if frac >= 1.0:
         return raw_lines
@@ -324,10 +362,27 @@ def _fraction_subset(raw_lines, frac: float, seed: int):
     return [d for i, d in enumerate(raw_lines) if i in keep]
 
 def _serialize(row):
+    """JSON-serializable view of a tensorized row.
+
+    CONTRACT: the worker returns ``json.dumps(_serialize(row))`` and the parent
+    writes it verbatim. ``spancall/lean/trainer.py:573 load_rows`` re-parses
+    these files, so the bytes must stay identical to the old parent-side
+    ``json.dumps(r)``. Do not add kwargs here.
+    """
     return {k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in row.items()}
 
 def _tensorize_lean_task(args):
-    """Tensorize one sample; returns (row_or_None, param_drop_reasons, errors).
+    """Tensorize one sample; returns (json_line_or_None, drop_reasons, errors).
+
+    ``args`` is ``(raw_jsonl_text, pack_multi)``, NOT a parsed dict: the child
+    does its own ``json.loads``, so the parent never pays a single-threaded
+    corpus parse and never holds the whole split in RAM. Returning an already
+    serialized line (rather than a dict) likewise moves ``json.dumps`` off the
+    parent, which was the only serial tail left after the pool finished.
+
+    The serialized form is byte-identical to ``json.dumps(_serialize(row))``
+    because ``spancall/lean/trainer.py:573`` re-reads these files; see the
+    contract note on ``_serialize`` below.
 
     The drop-reason audit travels back through the return value because the
     fork pool cannot mutate a parent dict. It is reported even for rows that
@@ -338,10 +393,11 @@ def _tensorize_lean_task(args):
     and returned so a tokenizer/schema mismatch shows up as a number instead
     of silently shrinking the training set.
     """
-    d, pack_multi = args
+    raw_line, pack_multi = args
     drops = {}
     errors = {}
     try:
+        d = json.loads(raw_line)
         s = UnifiedSample.from_dict(d)
         ts_stats = {}
         row = tensorize_sample_lean(
@@ -361,14 +417,14 @@ def _tensorize_lean_task(args):
             # calling _tensorize_many; the fallback path reads the same globals.
             tool_pool=TOOL_POOL,
             pack_tools=PACK_TOOLS_EPH,
+            # R0.1: an explicit, loud ceiling that can only REDUCE T. ``None``
+            # (the default) means "never drop a native tool"; setting it is an
+            # emergency VRAM brake, and the truncation is counted below.
+            max_tools=MAX_TOOLS,
+            # R1c: draw T per row from [1, floor] so the oracle-tool eval layout
+            # (T=1) is inside the training distribution instead of out of it.
+            jitter=JITTER_PACK_TOOLS,
         )
-        # Anchor-snap misses must be visible: a bridge_text tool line the
-        # tokenizer could not map back to tokens means that H1 candidate was
-        # emitted as PAD_INDEX (-1) and is invisible to the tool head.
-        if ts_stats.get("tool_snap_misses"):
-            drops["tool_snap_miss"] = drops.get("tool_snap_miss", 0) + int(
-                ts_stats["tool_snap_misses"]
-            )
         # L1 audit: classify Stratum-F params that ended up with NO positive.
         #   unresolved_target -> needs generation/transform; OUT OF SCOPE for the
         #                        retrieval-first fast path (correct exclusion).
@@ -378,65 +434,172 @@ def _tensorize_lean_task(args):
         #   match_missed      -> groundable target existed but the matcher failed
         #                        => a supervision bug, silently excluded from loss.
         drops = dict(ts_stats.get("param_drop_reasons", {}))
+        # Anchor-snap misses must be visible: a bridge_text tool line the
+        # tokenizer could not map back to tokens means that H1 candidate was
+        # emitted as PAD_INDEX (-1) and is invisible to the tool head.
+        # This MUST be merged AFTER the rebind above: writing it into ``drops``
+        # before ``drops = dict(ts_stats[...])`` discarded it unconditionally,
+        # so the downstream tool_snap_miss warnings could never fire.
+        if ts_stats.get("tool_snap_misses"):
+            drops["tool_snap_miss"] = drops.get("tool_snap_miss", 0) + int(
+                ts_stats["tool_snap_misses"]
+            )
+        # R9: the render-T histogram must survive the return trip. The fork pool
+        # cannot mutate a parent dict, and ``drops`` is the only counter channel
+        # that already crosses the process boundary, so encode the histogram as
+        # synthetic ``render_T=<T>`` keys and decode it in the parent.
+        for _t, _cnt in (ts_stats.get("render_T_hist") or {}).items():
+            _k = f"render_T={int(_t)}"
+            drops[_k] = drops.get(_k, 0) + int(_cnt)
+        # R0.1: a truncated row is a model-visible capability loss, not a benign
+        # data quirk -- count it on the same channel so it cannot vanish.
+        if ts_stats.get("tool_truncated_rows"):
+            drops["tool_truncated_rows"] = drops.get("tool_truncated_rows", 0) + int(
+                ts_stats["tool_truncated_rows"]
+            )
+        # R1c: how many rows actually had their floor jittered.
+        if ts_stats.get("jittered_rows"):
+            drops["jittered_rows"] = drops.get("jittered_rows", 0) + int(
+                ts_stats["jittered_rows"]
+            )
         if row is None or not has_positive_targets(row):
             return None, drops, errors
-        return _serialize(row), drops, errors
+        # Serialize inside the child: the parent then only concatenates text.
+        return json.dumps(_serialize(row)), drops, errors
     except Exception as exc:  # noqa: BLE001 - counted, not swallowed
         cls = type(exc).__name__
         errors[cls] = errors.get(cls, 0) + 1
         return None, drops, errors
 
-_CHUNK = 256
+# In-flight task cap. Bounds both the reorder buffer and parent RAM; large
+# enough that a straggler row cannot starve the pool, small enough that we do
+# not pickle 50k lines into the queue at once.
+_WINDOW = 2048
 
-def _tensorize_many(raw, pack_multi: bool, need, workers: int):
+def _drain_ordered(pool, raw, pack_multi: bool, absorb, done, rows_len, need,
+                   workers: int = 1, window: int = _WINDOW):
+    """Submit in input order, apply in input order, without head-of-line stalls.
+
+    ``ProcessPoolExecutor.map`` yields strictly in submission order, so ONE slow
+    row parks every already-finished result behind it and idles the other
+    workers (head-of-line blocking). Here results are queued as they complete
+    and applied only when every earlier index has been applied -- identical
+    output order, but no worker waits on a straggler.
+
+    The completion queue is fed by futures' done callbacks, so the parent does
+    no polling: one blocking ``get`` per row, O(1) each. (An earlier version
+    called ``wait`` on the whole in-flight set each iteration, which allocated a
+    window-sized set per row and burned real parent CPU.)
+
+    Two separate bounds keep submission small:
+
+    * ``window`` caps outstanding tasks so the reorder buffer stays bounded.
+    * the *budget* (``need - rows``) caps them by how many rows we can still
+      use. Without it a sampled split (``need=200`` of 50k lines) happily
+      submitted and pickled the whole corpus before the early stop was ever
+      consulted; a ``need=5`` run would still ship 500 tasks to the pool.
+      ``guard`` exists because rows can be DROPPED: we may need to consume
+      more tasks than ``need`` remaining to still collect ``need`` rows, and
+      the cap self-corrects after every completion, so it never deadlocks.
+
+    The budget is charged against ``submit - nxt`` -- tasks SUBMITTED but not
+    yet APPLIED -- not against in-flight tasks alone. A finished result parked
+    in the reorder buffer is still a row we may be about to collect, so counting
+    only in-flight tasks let one extra task per applied row slip past the cap
+    (``need=5`` shipped 22 tasks against a 21-task budget).
+    """
+    n = len(raw)
+    guard = max(2 * int(workers), 16)
+    finished_q = queue.SimpleQueue()   # (index, future) in COMPLETION order
+    buffer = {}                        # index -> result, ready but not applicable yet
+    nxt = 0                            # next index whose result may be applied
+    submit = 0                         # next index to submit
+    inflight = 0
+    while nxt < n and not done():
+        budget = max(0, need - rows_len())
+        cap = min(window, budget + guard)
+        while submit < n and (submit - nxt) < cap and not done():
+            fut = pool.submit(_tensorize_lean_task, (raw[submit], pack_multi))
+            # Bind the index NOW; a closure over `submit` would see its final value.
+            fut.add_done_callback(lambda f, i=submit: finished_q.put((i, f)))
+            submit += 1
+            inflight += 1
+        if inflight == 0:
+            break
+        idx, fut = finished_q.get()
+        inflight -= 1
+        buffer[idx] = fut.result()
+        while nxt in buffer and not done():
+            absorb(buffer.pop(nxt))
+            nxt += 1
+
+def _tensorize_many(raw, pack_multi: bool, need, workers: int, executor=None):
+    """Tensorize raw JSONL lines; returns (rows, drops, errors, info).
+
+    ``rows`` holds pre-serialized JSON strings in input order.
+    ``executor`` lets the caller fork ONE pool for every split; without it a
+    throwaway pool is created (and torn down) per split.
+    """
     if need is None:
         need = len(raw)
     rows = []
     drops_total = Counter()
     errors_total = Counter()
+    info = {"workers": 1, "pooled": False}
 
-    def _take(res):
-        row, drops, errors = res
+    def _absorb(res):
+        line, drops, errors = res
         for k, v in (drops or {}).items():
             drops_total[k] += v
         for k, v in (errors or {}).items():
             errors_total[k] += v
-        if row is not None:
-            rows.append(row)
+        if line is not None and len(rows) < need:
+            rows.append(line)
+
+    def _done():
         return len(rows) >= need
 
     ctx = None
-    if workers > 1:
+    if executor is None and workers > 1:
         try:
             ctx = mp.get_context("fork")
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            # Silent degradation to 1 vCPU is the failure mode that makes this
+            # cell look "just slow" on Colab. Say it out loud.
+            print(f"  [!] fork context unavailable ({type(exc).__name__}: {exc}); "
+                  f"tensorizing SINGLE-PROCESS with {workers} requested workers")
             ctx = None
-    if ctx is not None:
+    elif executor is None:
+        print(f"  [!] TENSORIZE_WORKERS={workers} -> tensorizing SINGLE-PROCESS")
+
+    if executor is not None or ctx is not None:
+        pool = executor
+        owned = pool is None
         try:
-            with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
-                done = False
-                for start in range(0, len(raw), _CHUNK):
-                    batch = raw[start:start + _CHUNK]
-                    for res in ex.map(
-                        _tensorize_lean_task,
-                        [(d, pack_multi) for d in batch],
-                    ):
-                        if _take(res):
-                            done = True
-                            break
-                    if done:
-                        break
-            return rows, drops_total, errors_total
+            if owned:
+                pool = ProcessPoolExecutor(max_workers=workers, mp_context=ctx)
+            info["workers"] = int(getattr(pool, "_max_workers", workers) or workers)
+            info["pooled"] = True
+            _drain_ordered(pool, raw, pack_multi, _absorb, _done,
+                           rows_len=lambda: len(rows), need=need,
+                           workers=info["workers"])
+            return rows, drops_total, errors_total, info
         except Exception as exc:  # noqa: BLE001 - reported, not swallowed
             print(f"  [!] process pool failed ({type(exc).__name__}: {exc}); "
                   f"falling back to single-process")
+            info["workers"] = 1
+            info["pooled"] = False
             rows = []
             drops_total = Counter()
             errors_total = Counter()
-    for d in raw:
-        if _take(_tensorize_lean_task((d, pack_multi))):
+        finally:
+            if owned and pool is not None:
+                pool.shutdown(wait=True)
+    for line in raw:
+        _absorb(_tensorize_lean_task((line, pack_multi)))
+        if _done():
             break
-    return rows, drops_total, errors_total
+    return rows, drops_total, errors_total, info
 
 groups = defaultdict(list)
 for out_name, in_name in SPLIT_INPUTS.items():
@@ -465,7 +628,7 @@ if PACK_TOOLS > 1:
               f"disabled; tool_acc will be a single-class artifact.")
         TOOL_POOL = None
     else:
-        TOOL_POOL = ToolPool.from_row_dicts(_iter_raw_lines(_pool_path), seed=SEED)
+        TOOL_POOL = ToolPool.from_row_dicts(_iter_raw_dicts(_pool_path), seed=SEED)
         print(f"[tool-pool] built once from {POOL_SOURCE}: {len(TOOL_POOL)} "
               f"distinct schemas (pack_tools={PACK_TOOLS})")
         if len(TOOL_POOL) < PACK_TOOLS:
@@ -483,108 +646,257 @@ else:
           "CE == 0, tool_acc == 1.0 for any weights).")
 PACK_TOOLS_EPH = int(PACK_TOOLS) if TOOL_POOL is not None else 1
 
-for (in_name, pack_multi), out_names in groups.items():
-    src = os.path.join(DATA_DIR, in_name)
-    if not os.path.exists(src):
+# ---- ONE pool for ALL splits ---------------------------------------------
+# Forking per split re-warmed the interpreter and re-inherited the tokenizer
+# every time; on Colab most of a short split's wall-clock was that startup.
+# One pool is forked once (inheriting TOOL_POOL/tokenizer by reference) and
+# shared by every (in_name, pack_multi) group below.
+_fork_ctx = None
+_shared_ex = None
+if TENSORIZE_WORKERS > 1:
+    try:
+        _fork_ctx = mp.get_context("fork")
+    except Exception as _exc:  # noqa: BLE001 - surfaced, never silent
+        print(f"[!] fork context unavailable ({type(_exc).__name__}: {_exc}) -> "
+              f"tensorize will run SINGLE-PROCESS on one core; expect a large "
+              f"slowdown versus Colab's {os.cpu_count()} vCPU(s).")
+if _fork_ctx is not None:
+    _shared_ex = ProcessPoolExecutor(max_workers=TENSORIZE_WORKERS, mp_context=_fork_ctx)
+    print(f"[tensorize] one fork pool for all splits: {TENSORIZE_WORKERS} worker(s) "
+          f"(cpu_count={os.cpu_count()})")
+
+per_split_timing = {}
+try:
+    for (in_name, pack_multi), out_names in groups.items():
+        src = os.path.join(DATA_DIR, in_name)
+        if not os.path.exists(src):
+            for on in out_names:
+                print(f"SKIP {on}: {src} missing")
+            continue
+        t_read = time.perf_counter()
+        raw = _fraction_subset(_iter_raw_lines(src), DATA_FRACTION, SEED)
+        t_read = time.perf_counter() - t_read
+        need = None
         for on in out_names:
-            print(f"SKIP {on}: {src} missing")
-        continue
-    raw = _fraction_subset(_iter_raw_lines(src), DATA_FRACTION, SEED)
-    need = None
-    for on in out_names:
-        lim = SAMPLE_LIMITS.get(on)
-        if lim is not None:
-            need = lim if need is None else max(need, lim)
-    rows, drops, errors = _tensorize_many(
-        raw, pack_multi, need, TENSORIZE_WORKERS,
-    )
-    missed = int(drops.get("match_missed", 0))
-    unresolved = int(drops.get("unresolved_target", 0))
-    drop_summary[in_name] = dict(drops)
-    if errors:
-        error_summary[in_name] = dict(errors)
-    for on in out_names:
-        limit = SAMPLE_LIMITS.get(on)
-        out_rows = rows if limit is None else rows[:limit]
-        out_path = os.path.join(TENSOR_DIR, f"{on}.jsonl")
-        with open(out_path, "w") as fh:
-            for r in out_rows:
-                fh.write(json.dumps(r) + "\\n")
-        # LIVE anchors only (>= 0). A row with zero live anchors carries NO H1
-        # supervision, so counting it as "1 candidate" would dilute the mean
-        # toward the vacuity threshold and hide a real problem. n_rows_h1 is
-        # the honest denominator: rows H1 can actually learn from.
-        cand_counts = [
-            int(r.get("_n_tool_candidates", 0)) for r in out_rows
-            if int(r.get("_n_tool_candidates", 0)) > 0
-        ]
-        cand_hist: Dict[int, int] = {}
-        for c in cand_counts:
-            cand_hist[c] = cand_hist.get(c, 0) + 1
-        mean_cands = (sum(cand_counts) / len(cand_counts)) if cand_counts else float("nan")
-        n_rows_h1 = len(cand_counts)
-        n_rows_no_h1 = len(out_rows) - n_rows_h1
-        stats[on] = {
-            "rows": len(out_rows),
-            "filtered_or_dropped": len(raw) - len(rows),
-            "raw_after_fraction": len(raw),
-            "fraction": DATA_FRACTION,
-            "pack_multi": pack_multi,
-            "limit": limit,
-            "pack_tools": PACK_TOOLS_EPH,
-            "tool_pool_size": len(TOOL_POOL) if TOOL_POOL is not None else 0,
-            "rows_with_h1_supervision": n_rows_h1,
-            "rows_without_h1_supervision": n_rows_no_h1,
-            # NaN (not 0.0) when H1 has nothing to score: 0.0 reads as a real
-            # measurement and silently passes any `< 1.5` check downstream.
-            "mean_n_candidates": (round(mean_cands, 3)
-                                  if mean_cands == mean_cands else None),
-            "n_candidates_hist": {str(k): v for k, v in sorted(cand_hist.items())},
-            "param_drop_match_missed": missed,
-            "param_drop_unresolved": unresolved,
-            "param_drop_other": {k: v for k, v in drops.items()
-                                 if k not in ("match_missed", "unresolved_target")},
-            "tensorize_errors": dict(errors),
+            lim = SAMPLE_LIMITS.get(on)
+            if lim is not None:
+                need = lim if need is None else max(need, lim)
+        t_pool = time.perf_counter()
+        rows, drops, errors, tinfo = _tensorize_many(
+            raw, pack_multi, need, TENSORIZE_WORKERS, executor=_shared_ex,
+        )
+        t_pool = time.perf_counter() - t_pool
+        per_split_timing[in_name] = {
+            "read_lines_s": round(t_read, 3),
+            "tensorize_s": round(t_pool, 3),
+            "workers": tinfo["workers"],
+            "pooled": tinfo["pooled"],
+            "rows_per_s": (round(len(rows) / t_pool, 1) if t_pool > 0 else None),
         }
-        print(f"wrote {on}.jsonl: {len(out_rows)} groundable rows "
-              f"({len(raw) - len(rows)} ungroundable/Stratum-A/over-length filtered)")
-        if n_rows_h1 == 0:
-            print(f"  [!VACUOUS-H1] {on}: NO row carries an H1 anchor at all "
-                  f"(pack_tools={PACK_TOOLS_EPH}, pool="
-                  f"{len(TOOL_POOL) if TOOL_POOL is not None else 0}). tool_acc is "
-                  f"undefined here, not 1.0 — check the tensorize errors above.")
-        elif mean_cands < 1.5:
-            print(f"  [!VACUOUS-H1] {on}: mean candidates/row={mean_cands:.2f} over "
-                  f"{n_rows_h1} H1 rows (hist={dict(sorted(cand_hist.items()))}) -> "
-                  f"tool_acc is an artifact and H1 gets ~zero gradient. "
-                  f"Check pack_tools/tool pool.")
-        else:
-            print(f"  [tool] {on}: mean candidates/row={mean_cands:.2f} over "
-                  f"{n_rows_h1} H1 rows (hist={dict(sorted(cand_hist.items()))}) -> "
-                  f"H1 is a real {int(round(mean_cands))}-way discrimination task.")
-        if n_rows_no_h1:
-            print(f"  [i] {on}: {n_rows_no_h1} row(s) have no live H1 anchor "
-                  f"(no candidates packed, or the GT anchor failed to snap).")
-    if missed:
-        print(f"  [!] MATCH_MISSED={missed} on {in_name}: extractable targets the matcher "
-              f"failed on -> these params get NO pointer supervision (real bug).")
-    other = {k: v for k, v in drops.items()
-             if k not in ("match_missed", "unresolved_target")}
-    for k in sorted(other):
-        label = "BUG" if k in ("unaligned_target", "null_slot_missing") else "note"
-        print(f"  [{label}] {k}={other[k]} on {in_name}")
-    if other.get("tool_snap_miss"):
-        print(f"  [!] tool_snap_miss={other['tool_snap_miss']} on {in_name}: "
-              f"<|tool|> bridge lines the tokenizer could not map to tokens. Those "
-              f"candidates are PAD_INDEX(-1), i.e. invisible to H1.")
-    if unresolved:
-        print(f"  [i] unresolved_target={unresolved} on {in_name}: needs generation/transform; "
-              f"out of scope for the retrieval-first fast path (correct exclusion).")
-    for cls_name in sorted(errors):
-        print(f"  [!!] tensorize raised {cls_name} x{errors[cls_name]} on {in_name} "
-              f"-> samples silently lost from training. Investigate.")
+        print(f"[tensorize] {in_name}: {len(rows)} rows in {t_pool:.1f}s "
+              f"({len(rows) / t_pool:.1f} rows/s, {tinfo['workers']} worker(s), "
+              f"read {t_read:.2f}s)")
+        missed = int(drops.get("match_missed", 0))
+        unresolved = int(drops.get("unresolved_target", 0))
+        drop_summary[in_name] = dict(drops)
+        if errors:
+            error_summary[in_name] = dict(errors)
+        for on in out_names:
+            limit = SAMPLE_LIMITS.get(on)
+            out_rows = rows if limit is None else rows[:limit]
+            out_path = os.path.join(TENSOR_DIR, f"{on}.jsonl")
+            t_write = time.perf_counter()
+            with open(out_path, "w") as fh:
+                # Rows arrive pre-serialized from the workers: no json.dumps
+                # on the parent's single thread.
+                fh.write("\\n".join(out_rows))
+                if out_rows:
+                    fh.write("\\n")
+            per_split_timing[in_name]["write_s"] = round(
+                time.perf_counter() - t_write, 3)
+            # Stats need dicts; parse the kept rows only (not the whole split).
+            stats_rows = [json.loads(x) for x in out_rows]
+            # LIVE anchors only (>= 0). A row with zero live anchors carries NO
+            # H1 supervision, so counting it as "1 candidate" would dilute the
+            # mean toward the vacuity threshold and hide a real problem.
+            # n_rows_h1 is the honest denominator: rows H1 can learn from.
+            cand_counts = [
+                int(r.get("_n_tool_candidates", 0)) for r in stats_rows
+                if int(r.get("_n_tool_candidates", 0)) > 0
+            ]
+            cand_hist: Dict[int, int] = {}
+            for c in cand_counts:
+                cand_hist[c] = cand_hist.get(c, 0) + 1
+            mean_cands = ((sum(cand_counts) / len(cand_counts))
+                          if cand_counts else float("nan"))
+            n_rows_h1 = len(cand_counts)
+            n_rows_no_h1 = len(stats_rows) - n_rows_h1
+            # R9: the RENDER count T, beside mean_n_candidates. These measure
+            # different things and both matter: T is how many <|tool|> blocks the
+            # prompt actually carries (the train/serve layout axis), while
+            # n_candidates is how many of those anchors survived tokenization.
+            # ``tool_positions`` is serialized as a plain list, so len() is the
+            # exact T the trainer will see for this row.
+            render_hist: Dict[int, int] = {}
+            for r in stats_rows:
+                tp = r.get("tool_positions")
+                if not tp:
+                    continue
+                render_hist[len(tp)] = render_hist.get(len(tp), 0) + 1
+            n_render_rows = sum(render_hist.values())
+            mean_render_T = ((sum(t * c for t, c in render_hist.items())
+                              / n_render_rows) if n_render_rows else float("nan"))
+            t1_share = (render_hist.get(1, 0) / n_render_rows) if n_render_rows else float("nan")
+            n_truncated = int(drops.get("tool_truncated_rows", 0))
+            n_jittered = int(drops.get("jittered_rows", 0))
+            # Phase I: capacity/layout channels. These are COUNTERS, not drop
+            # reasons — lumping them into ``param_drop_other`` would print
+            # "[note] dropped_over_length=412" as if a parameter had lost its
+            # supervision, which is a different (and worse) failure.
+            n_over_length = int(drops.get("dropped_over_length", 0))
+            n_ambiguous = int(drops.get("multi_call_ambiguous_anchors", 0))
+            n_recent_trunc = int(drops.get("recent_truncated_rows", 0))
+            n_recent_rows = int(drops.get("n_recent_rows", 0))
+            _CHANNEL = (
+                "tool_truncated_rows", "jittered_rows", "dropped_over_length",
+                "multi_call_ambiguous_anchors", "recent_truncated_rows",
+                "n_recent_rows", "tool_snap_misses", "param_snap_misses",
+            )
+            param_other = {
+                k: v for k, v in drops.items()
+                if k not in ("match_missed", "unresolved_target")
+                and k not in _CHANNEL
+                and not k.startswith("render_T=")
+            }
+            stats[on] = {
+                "rows": len(stats_rows),
+                "filtered_or_dropped": len(raw) - len(rows),
+                "raw_after_fraction": len(raw),
+                "fraction": DATA_FRACTION,
+                "pack_multi": pack_multi,
+                "limit": limit,
+                "pack_tools": PACK_TOOLS_EPH,
+                "tool_pool_size": len(TOOL_POOL) if TOOL_POOL is not None else 0,
+                "rows_with_h1_supervision": n_rows_h1,
+                "rows_without_h1_supervision": n_rows_no_h1,
+                # NaN (not 0.0) when H1 has nothing to score: 0.0 reads as a
+                # real measurement and silently passes any `< 1.5` check.
+                "mean_n_candidates": (round(mean_cands, 3)
+                                      if mean_cands == mean_cands else None),
+                "n_candidates_hist": {str(k): v for k, v in sorted(cand_hist.items())},
+                # R9: rendered T (one <|tool|> block per candidate tool).
+                "mean_render_T": (round(mean_render_T, 3)
+                                  if mean_render_T == mean_render_T else None),
+                "render_T_hist": {str(k): v for k, v in sorted(render_hist.items())},
+                "render_T_t1_share": (round(t1_share, 4)
+                                      if t1_share == t1_share else None),
+                "jitter_pack_tools": bool(JITTER_PACK_TOOLS),
+                "jittered_rows": n_jittered,
+                "max_tools": MAX_TOOLS,
+                "tool_truncated_rows": n_truncated,
+                "param_drop_match_missed": missed,
+                "param_drop_unresolved": unresolved,
+                "param_drop_other": param_other,
+                # Phase I: the numeric delta report reads these five channels
+                # directly. Every one of them is a "the model never saw this"
+                # counter, so none may hide inside param_drop_other.
+                "dropped_over_length": n_over_length,
+                "multi_call_ambiguous_anchors": n_ambiguous,
+                "n_recent_rows": n_recent_rows,
+                "recent_truncated_rows": n_recent_trunc,
+                "tool_snap_misses": int(drops.get("tool_snap_misses", 0)),
+                "param_snap_misses": int(drops.get("param_snap_misses", 0)),
+                "tensorize_errors": dict(errors),
+                "timing": per_split_timing.get(in_name, {}),
+            }
+            print(f"wrote {on}.jsonl: {len(stats_rows)} groundable rows "
+                  f"({len(raw) - len(rows)} ungroundable/Stratum-A/over-length "
+                  f"filtered)")
+            if n_rows_h1 == 0:
+                print(f"  [!VACUOUS-H1] {on}: NO row carries an H1 anchor at all "
+                      f"(pack_tools={PACK_TOOLS_EPH}, pool="
+                      f"{len(TOOL_POOL) if TOOL_POOL is not None else 0}). tool_acc "
+                      f"is undefined here, not 1.0 — check the tensorize errors above.")
+            elif mean_cands < 1.5:
+                print(f"  [!VACUOUS-H1] {on}: mean candidates/row={mean_cands:.2f} "
+                      f"over {n_rows_h1} H1 rows "
+                      f"(hist={dict(sorted(cand_hist.items()))}) -> tool_acc is an "
+                      f"artifact and H1 gets ~zero gradient. Check pack_tools/pool.")
+            else:
+                print(f"  [tool] {on}: mean candidates/row={mean_cands:.2f} over "
+                      f"{n_rows_h1} H1 rows "
+                      f"(hist={dict(sorted(cand_hist.items()))}) -> H1 is a real "
+                      f"{int(round(mean_cands))}-way discrimination task.")
+            if n_rows_no_h1:
+                print(f"  [i] {on}: {n_rows_no_h1} row(s) have no live H1 anchor "
+                      f"(no candidates packed, or the GT anchor failed to snap).")
+            # R9: T is the layout axis, reported beside candidate breadth.
+            if n_render_rows:
+                print(f"  [render] {on}: mean render_T={mean_render_T:.2f} over "
+                      f"{n_render_rows} row(s) "
+                      f"(hist={dict(sorted(render_hist.items()))}, "
+                      f"T=1 share={t1_share:.1%}, jittered_rows={n_jittered})")
+                if t1_share == 0.0 and JITTER_PACK_TOOLS:
+                    print(f"  [!] {on}: T=1 never occurred although jitter is ON — "
+                          f"every row would still be out-of-distribution for the "
+                          f"oracle-tool eval layout. Check jitter_pack_tools wiring.")
+                elif t1_share == 0.0:
+                    print(f"  [i] {on}: T=1 never occurred and jitter is OFF "
+                          f"(JITTER_PACK_TOOLS=False) -> the oracle-tool eval prompt "
+                          f"(T=1) is OUT of the training distribution (R1c).")
+            if n_truncated:
+                print(f"  [!] {on}: tool_truncated_rows={n_truncated} (max_tools="
+                      f"{MAX_TOOLS}) — native tools were DROPPED from the prompt, so "
+                      f"H1 can never pick them. Raise data.max_tools or unset it.")
+        if missed:
+            print(f"  [!] MATCH_MISSED={missed} on {in_name}: extractable targets the matcher "
+                  f"failed on -> these params get NO pointer supervision (real bug).")
+        # ``render_T=<T>`` histogram keys and the capacity channel counters are
+        # NOT drop reasons: they are already reported above, and printing them as
+        # "[note] render_T=3=412" would bury the real audit lines.
+        other = {k: v for k, v in drops.items()
+                 if k not in ("match_missed", "unresolved_target")
+                 and k not in _CHANNEL
+                 and not k.startswith("render_T=")}
+        for k in sorted(other):
+            label = "BUG" if k in ("unaligned_target", "null_slot_missing") else "note"
+            print(f"  [{label}] {k}={other[k]} on {in_name}")
+        # Phase I: capacity channels printed explicitly. Each is a row/param the
+        # model never got to learn from, which is the only reason this section
+        # exists — silence here would read as "nothing was lost".
+        if n_over_length:
+            print(f"  [!] dropped_over_length={n_over_length} on {in_name}: rows "
+                  f"longer than max_seq_len, dropped whole. If this is a large "
+                  f"share, raise data.max_seq_len — those samples are unseen.")
+        if n_ambiguous:
+            print(f"  [i] multi_call_ambiguous_anchors={n_ambiguous} on {in_name}: "
+                  f"anchors two calls share, so the pointer loss treats BOTH "
+                  f"demands as valid (R0.4 honest-failure count, not a bug).")
+        if n_recent_trunc:
+            print(f"  [i] recent_truncated_rows={n_recent_trunc} on {in_name}: rows "
+                  f"whose recent block exceeded the token budget and was trimmed.")
+        if drops.get("tool_snap_misses"):
+            print(f"  [!] tool_snap_miss={drops['tool_snap_misses']} on {in_name}: "
+                  f"<|tool|> bridge lines the tokenizer could not map to tokens. Those "
+                  f"candidates are PAD_INDEX(-1), i.e. invisible to H1.")
+        if drops.get("param_snap_misses"):
+            print(f"  [!] param_snap_miss={drops['param_snap_misses']} on {in_name}: "
+                  f"param anchors that failed to snap; those parameters lose all "
+                  f"pointer supervision for the row.")
+        if unresolved:
+            print(f"  [i] unresolved_target={unresolved} on {in_name}: needs "
+                  f"generation/transform; out of scope for the retrieval-first fast "
+                  f"path (correct exclusion).")
+        for cls_name in sorted(errors):
+            print(f"  [!!] tensorize raised {cls_name} x{errors[cls_name]} on {in_name} "
+                  f"-> samples silently lost from training. Investigate.")
+finally:
+    if _shared_ex is not None:
+        _shared_ex.shutdown(wait=True)
+        print("[tensorize] shared fork pool closed")
 
 print("\\nLean tensorize summary:", json.dumps(stats, indent=2))
+print("\\nTensorize timing (per input split):", json.dumps(per_split_timing, indent=2))
 print("\\nParam supervision audit (Stratum-F params dropped from pointer loss):",
       json.dumps(drop_summary, indent=2))
 if error_summary:
@@ -1055,6 +1367,15 @@ model = LeanSpanCallModel(
     hidden_dim=encoder.hidden_dim,
 )
 
+# R0.4: the call budget MUST come from config. A resolver left on the default
+# ``max_calls=1`` can never report more than one predicted call, so every
+# multi-call metric computed from its predictions (``pred_n_calls_hist``,
+# ``call_exact_set_match``) is pinned to the single-call share by construction
+# — a structural cap that looks like model failure in the run log.
+MAX_CALLS = int(getattr(cfg.data, "max_calls", 1))
+CALL_MIN_PROB = float(getattr(cfg.data, "call_min_prob", 0.25))
+CALL_MIN_PROB_RATIO = float(getattr(cfg.data, "call_min_prob_ratio", 0.5))
+
 resolver = LeanResolver(
     model_path=CHECKPOINT_DIR,
     encoder=encoder,
@@ -1062,7 +1383,16 @@ resolver = LeanResolver(
     tokenizer=tokenizer,
     max_seq_len=cfg.model.max_seq_len,
     max_span_width=cfg.model.max_span_width,
+    max_calls=MAX_CALLS,
+    call_min_prob=CALL_MIN_PROB,
+    call_min_prob_ratio=CALL_MIN_PROB_RATIO,
 )
+print(f"resolver call budget: max_calls={MAX_CALLS} "
+      f"call_min_prob={CALL_MIN_PROB} call_min_prob_ratio={CALL_MIN_PROB_RATIO}")
+if MAX_CALLS <= 1:
+    print("  [!] max_calls=1: multi-call predictions are structurally impossible;")
+    print("      call_exact_set_match / pred_n_calls_hist will be capped at the")
+    print("      single-call share. Set data.max_calls in the YAML to measure them.")
 if DEVICE in ("cuda", "mps"):
     model.to(DEVICE)
 model.eval()
@@ -1114,13 +1444,37 @@ print(f"split                  = {p1_metrics['split']}  "
       f"(scored {tr['evaluated']} / {tr['total_available']} available"
       f"{', TRUNCATED' if tr['truncated'] else ''})")
 print(f"extraction_recall        = {_m('extraction_recall')}")
+print(f"extraction_precision     = {_m('extraction_precision')}")
+print(f"extraction_f1            = {_m('extraction_f1')}")
 print(f"fast_path_param_coverage = {_m('fast_path_param_coverage')}")
 print(f"fast_path_call_coverage  = {_m('fast_path_call_coverage')}")
 print(f"correct refusals         = {_m('refused_unextractable')} "
       f"| real fast-path misses = {_m('missed_extractable')} "
       f"| pointer_wrong = {_m('pointer_wrong')}")
 print(f"E3 aligner drift         = {_m('e3_aligner_drift')} sample(s) "
-      f"(>0 is a DATA bug, not a model miss)")'''
+      f"(>0 is a DATA bug, not a model miss)")
+
+# Phase I / J6: the call axis and the prompt layout, both read straight off the
+# metrics dict so a multi-call or T=1 run is legible without re-deriving it.
+print(f"\\n--- Call axis & layout (J6 / R0.4) ---")
+print(f"call_exact_set_match     = {_m('call_exact_set_match')} "
+      f"({_m('call_exact_set_match_n')} / {_m('n')} row(s), all calls exact)")
+print(f"exact_payload_match_F    = {_m('exact_payload_match_F')}  <- CALL 0 ONLY; "
+      f"compare against the set number above, not in place of it")
+print(f"call_count_acc           = {_m('call_count_acc')} "
+      f"({_m('call_count_correct_n')} / {_m('n')})")
+print(f"n_calls (GT)             = {_m('n_calls_hist')}  "
+      f"multi-call rows={_m('n_multi_call_samples')}")
+print(f"n_calls (predicted)      = {_m('pred_n_calls_hist')}")
+print(f"mean_render_T            = {_m('mean_render_T')} "
+      f"hist={_m('render_T_hist')} T=1 share={_m('render_T_t1_share')}")
+_rb = p1_metrics.get("recent_budget_effective") or {}
+if _rb:
+    print(f"recent_budget_effective  = {_rb}")
+if _m("render_T_t1_share") == 1.0:
+    print("  [!] every Part-1 prompt rendered T=1: the layouts here are the "
+          "oracle-tool ones, so any multi-call claim must be read against "
+          "Part 3 as well.")'''
 
 MARKDOWN_EVAL_PART2 = """---
 ## 5b. Evaluation Part 2 — Lean Function (Tool) Prediction (H1)
@@ -1166,6 +1520,10 @@ def eval_tool_prediction_lean(split_name: str, limit: Optional[int] = 500,
     probs = []
     margins = []
     empty_scores = 0
+    # Phase I: T is the layout axis H1 actually discriminated over. A mean of
+    # 1.0 makes ``tool_acc`` a single-class softmax artifact, so it must be
+    # printed beside the accuracy, never left to be inferred.
+    cand_counts = Counter()
     wrong_as = Counter()
     per_tool = defaultdict(lambda: {"n": 0, "correct": 0, "wrong_as": Counter()})
 
@@ -1199,6 +1557,9 @@ def eval_tool_prediction_lean(split_name: str, limit: Optional[int] = 500,
         margins.append(pred.get("tool_margin", 0.0))
         if not pred.get("tool_scores"):
             empty_scores += 1
+        # Phase I: count how many candidate schemas H1 actually chose between.
+        _scores = pred.get("tool_scores") or {}
+        cand_counts[len(_scores)] += 1
 
         if native_multi:
             multi_total += 1
@@ -1223,10 +1584,16 @@ def eval_tool_prediction_lean(split_name: str, limit: Optional[int] = 500,
     mean_p = sum(probs) / max(1, len(probs))
     mean_m = sum(margins) / max(1, len(margins))
 
+    mean_cands = (sum(c * n for c, n in cand_counts.items()) / max(1, total))
     print(f"=== Lean Tool Prediction (H1) on {split_name} (N={total}) — >=2 candidates ===")
     print(f"Top-1 Tool Accuracy (Overall): {acc_all:.4f} ({(single_correct + multi_correct)}/{total})")
     print(f"  Multi-tool subset: {acc_multi:.4f} ({multi_correct}/{multi_total})")
     print(f"  Single+distractor subset: {acc_single:.4f} ({single_correct}/{single_total})")
+    print(f"  mean_n_candidates: {mean_cands:.2f} "
+          f"(hist={dict(sorted(cand_counts.items()))})")
+    if total and mean_cands < 1.5:
+        print("  [!VACUOUS-H1] mean_n_candidates < 1.5: H1 had ONE class per row, so "
+              "the accuracy above is an artifact, not tool-selection skill.")
     print(f"Mean Winner Tool Probability: {mean_p:.4f} | Mean Margin: {mean_m:.4f}")
     print(f"Rows with empty tool_scores: {empty_scores}")
     print(f"Rows where candidates were augmented beyond s.tools: {augmented}")
@@ -1286,6 +1653,15 @@ def predict_split(split_name: str, out_path: str, limit: Optional[int] = None,
                 "stratum": s.stratum.value,
                 "gt_tool": (s.ground_truth_calls[0].tool_name if s.ground_truth_calls else None),
                 "gt_args": (s.ground_truth_calls[0].arguments if s.ground_truth_calls else {}),
+                # R0.4 / J6: keep the WHOLE gt call list so the evaluator can score
+                # the predicted call SET instead of only the flattened first call.
+                "gt_calls": [{"tool_name": c.tool_name, "arguments": dict(c.arguments or {})}
+                             for c in (s.ground_truth_calls or [])],
+                "n_gt_calls": len(s.ground_truth_calls or []),
+                # R0.4: the decoded call list. ``tool_name``/``payload`` above stay
+                # the primary (call-0) view, so single-call consumers are unchanged.
+                "calls": [c.as_dict() for c in (getattr(res, "calls", None) or [])],
+                "n_pred_calls": len(getattr(res, "calls", None) or []),
                 "hit": bool(res.hit),
                 "status": getattr(res, "status", "hit" if res.hit else "partial"),
                 "payload": res.payload,
@@ -1440,15 +1816,23 @@ for label, path in [
         "system": label,
         "n_F": int(m_f.get("n", 0)),
         "exact_F": round(m_f.get("exact_payload_match", 0.0), 3),
+        # R0.4 / J6: set-level headline. ``exact_F`` above stays call-0-only, so
+        # a two-call row can be "exact" while its SET is wrong (dropped/extra call).
+        "set_exact_F": round(m_f.get("call_exact_set_match", 0.0), 3),
+        "count_acc": round(m.get("call_count_acc", 0.0), 3),
         "hit_F": round(m_f.get("hit_rate", 0.0), 3),
         "param_F1_F": round(m_f.get("param_f1", 0.0), 3),
         "false_hit_on_A": round(m.get("false_hit_rate_on_a", 0.0), 4),
         "exact_all": round(m.get("exact_payload_match", 0.0), 3),
+        "set_exact_all": round(m.get("call_exact_set_match", 0.0), 3),
         "hit_all": round(m.get("hit_rate", 0.0), 3),
+        "n_calls": m.get("n_calls_hist", {}),
     })
 
 if rows:
-    headers = ["system", "n_F", "exact_F", "hit_F", "param_F1_F", "false_hit_on_A", "exact_all", "hit_all"]
+    headers = ["system", "n_F", "exact_F", "set_exact_F", "count_acc", "hit_F",
+               "param_F1_F", "false_hit_on_A", "exact_all", "set_exact_all",
+               "hit_all", "n_calls"]
     print(" | ".join(headers))
     print("-|" * len(headers))
     for r in rows:
@@ -1459,7 +1843,7 @@ else:
 MARKDOWN_EVAL_DETAIL_INTRO = """### Detailed Eval Forensics (Error Taxonomy & Per-Tool E2E)"""
 
 CODE_EVAL_DETAIL = '''import json, os
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 def _err_buckets(m):
     return {k: m.get(k, 0) for k in [
@@ -1519,7 +1903,100 @@ else:
         if st["n"] == 0:
             continue
         print(f"{tname:<30}{st['n']:>6}{st['hit']:>6}{st['hit'] / st['n']:>7.2f}"
-              f"{st['exact']:>7}{st['exact'] / st['n']:>8.2f}")'''
+              f"{st['exact']:>7}{st['exact'] / st['n']:>8.2f}")
+
+    # R9: the render count T the resolver actually built per row, straight off the
+    # persisted ``features`` block. Without this the eval table cannot be read:
+    # a T=1 layout makes H1 a single-class softmax whose accuracy is 1.0 for ANY
+    # weights, so a high ``hit`` rate there is not evidence of tool selection.
+    print("\\n" + "=" * 72)
+    print("PROMPT LAYOUT (render_T) & RECENT BUDGET — SpanCall Lean")
+    print("=" * 72)
+    rt_hist: Counter = Counter()
+    rb_hist: Counter = Counter()
+    n_rt = 0
+    for p in preds:
+        feats = p.get("features") or {}
+        rt = feats.get("render_T")
+        if rt is not None:
+            try:
+                rt_hist[int(rt)] += 1
+                n_rt += 1
+            except (TypeError, ValueError):
+                pass
+        rb = feats.get("recent_budget_effective")
+        if rb is not None:
+            try:
+                rb_hist[int(rb)] += 1
+            except (TypeError, ValueError):
+                pass
+
+    if not n_rt:
+        print("  render_T not reported by this resolver build — layout UNKNOWN")
+        print("  (re-run the predict cell with a resolver that sets features['render_T'])")
+    else:
+        mean_T = sum(t * c for t, c in rt_hist.items()) / n_rt
+        t1_share = rt_hist.get(1, 0) / n_rt
+        print(f"  mean render_T = {mean_T:.2f} over {n_rt} row(s)")
+        print(f"  hist          = {dict(sorted(rt_hist.items()))}")
+        print(f"  T=1 share     = {t1_share:.1%}")
+        if t1_share == 1.0:
+            print("  [!] EVERY eval prompt rendered exactly ONE tool block. H1's softmax")
+            print("      is single-class there: tool_acc = 1.0 regardless of the weights,")
+            print("      so the hit rates above are NOT evidence of tool-selection skill.")
+        elif t1_share == 0.0:
+            print("  [!] T=1 never occurred in eval although training jitters T down to 1.")
+            print("      Eval is then stricter than training on the T axis (R1).")
+    if rb_hist:
+        print(f"  recent_budget_effective = {dict(sorted(rb_hist.items()))}")
+    else:
+        print("  recent_budget_effective not reported (no clamp telemetry on these rows)")
+
+    # R0.4 / J6: the call-axis view. ``exact_payload_match`` scores ONLY call 0,
+    # so on the multi-call rows it silently forgives a dropped or invented second
+    # call. These lines make that visible instead of trusting the headline.
+    print("\\n" + "=" * 72)
+    print("CALL SET (multi-call supervision, R0.4) — SpanCall Lean")
+    print("=" * 72)
+    gt_hist: Counter = Counter()
+    pred_hist: Counter = Counter()
+    n_set_rows = 0
+    n_set_exact = 0
+    for p in preds:
+        n_gt = p.get("n_gt_calls")
+        n_pred = p.get("n_pred_calls")
+        if n_gt is None:
+            n_gt = len(p.get("gt_calls") or [])
+        if n_pred is None:
+            n_pred = len(p.get("calls") or [])
+        gt_hist[int(n_gt)] += 1
+        pred_hist[int(n_pred)] += 1
+        n_set_rows += 1
+        n_set_exact += int(int(n_gt) == int(n_pred))
+    multi_share = (sum(c for k, c in gt_hist.items() if k > 1) / n_set_rows) if n_set_rows else 0.0
+    print(f"  GT n_calls histogram  = {dict(sorted(gt_hist.items()))}")
+    print(f"  pred n_calls histogram= {dict(sorted(pred_hist.items()))}")
+    print(f"  multi-call share      = {multi_share:.1%} of {n_set_rows} row(s)")
+    print(f"  call_count_acc (from these rows)  = {n_set_exact / max(1, n_set_rows):.3f}")
+    # R0.4: the resolver's call budget is a STRUCTURAL ceiling, not model quality.
+    # With max_calls=1 no row can predict a second call, so a lower SET headline
+    # is the cap talking, not a dropped call.
+    max_pred_calls = max(pred_hist) if pred_hist else 0
+    if multi_share > 0 and max_pred_calls <= 1:
+        print("  [!] STRUCTURAL CAP: every row predicted <=1 call while "
+              f"{multi_share:.1%} of rows are multi-call.")
+        print("      The resolver was built with max_calls=1, so the call axis was")
+        print("      never decoded. This number measures configuration, not the model.")
+        print("      Set data.max_calls > 1 in the YAML and rebuild the resolver.")
+    set_exact_metric = m.get("call_exact_set_match")
+    if set_exact_metric is not None:
+        print(f"  call_exact_set_match (evaluator)  = {set_exact_metric:.3f}")
+        print(f"  exact_payload_match (call-0 only) = {m.get('exact_payload_match', 0.0):.3f}")
+        if multi_share > 0 and set_exact_metric < m.get("exact_payload_match", 0.0):
+            print("  [!] the SET headline is BELOW the call-0 headline: at least one")
+            print("      multi-call row matched call 0 but lost a call in the set.")
+    else:
+        print("  call_exact_set_match not present — re-run eval_toolcall.py (R0.4)")'''
 
 MARKDOWN_TEST_INTRO = """---
 ## 7. Test — OOD / Adversarial Splits
@@ -1668,6 +2145,116 @@ cells = [
     new_code_cell(CODE_TESTS),
     new_code_cell(CODE_SUMMARY),
 ]
+
+# --------------------------------------------------------------------------
+# Build-time guard: compile every code cell and resolve names
+# --------------------------------------------------------------------------
+# nbformat.validate() only checks the *JSON envelope*. The cell bodies are
+# never compiled, so a name that is used but never imported in that cell ships
+# to Colab and raises NameError on the first run -- exactly the ``Dict[int, int]``
+# bug that shipped in the tensorize cell. Each cell is its own module scope in
+# Jupyter, so "imported in a later cell" does NOT help and must not be treated
+# as resolving.
+#
+# Scope analysis uses stdlib ``symtable`` (real lexical scoping, not a regex
+# guess) and carries the set of names bound by *earlier* cells forward, which is
+# precisely Jupyter's execution semantics.
+
+def _cell_source(cell) -> str:
+    src = cell.get("source", "")
+    return src if isinstance(src, str) else "".join(src)
+
+
+def _is_ipython_cell(src: str) -> bool:
+    """True for cells containing ``!shell`` / ``%magic`` lines (not valid Python)."""
+    for line in src.splitlines():
+        head = line.lstrip()
+        if head.startswith(("!", "%", "%%")):
+            return True
+    return False
+
+
+def _scope_walk(tbl, enclosing, available, unresolved, is_module: bool) -> None:
+    """Collect names referenced by ``tbl`` that resolve to nothing visible."""
+    local = set()
+    for sym in tbl.get_symbols():
+        if sym.is_assigned() or sym.is_imported() or sym.is_parameter() or sym.is_namespace():
+            local.add(sym.get_name())
+    visible = local | enclosing
+    for sym in tbl.get_symbols():
+        name = sym.get_name()
+        if name in visible:
+            continue
+        # ``is_free`` means "bound in an enclosing *function* scope", which
+        # ``visible`` already accounts for; if it were wrong, compile() would
+        # have raised first.
+        if sym.is_free():
+            continue
+        if not (sym.is_referenced() or sym.is_declared_global()):
+            continue
+        if name in available:
+            continue
+        unresolved.append(name)
+    for child in tbl.get_children():
+        _scope_walk(child, visible, available, unresolved, is_module=False)
+
+
+def _guard_code_cells(cells) -> int:
+    import builtins
+    import symtable
+
+    # Names injected by Jupyter/Colab or provided by the kernel at runtime.
+    available = set(dir(builtins)) | {
+        "__name__", "__file__", "__doc__", "__builtins__", "__spec__",
+        "display", "get_ipython", "In", "Out", "exit", "quit", "_", "__", "___",
+    }
+    problems = []
+    checked = skipped = 0
+    for cell in cells:
+        if cell.get("cell_type") != "code":
+            continue
+        src = _cell_source(cell)
+        if _is_ipython_cell(src):
+            skipped += 1
+            continue
+        first = src.strip().splitlines()[0] if src.strip() else ""
+        label = first[:72]
+        try:
+            compile(src, "<generated cell>", "exec")
+        except SyntaxError as exc:
+            problems.append(f"SYNTAX  [{label}]\n        {exc}")
+            continue
+        checked += 1
+        table = symtable.symtable(src, "<generated cell>", "exec")
+        # Module-level binds of THIS cell are visible to closures defined in it,
+        # so fold them in before resolving references (Python resolves globals at
+        # call time, not at def time).
+        module_bound = {
+            sym.get_name()
+            for sym in table.get_symbols()
+            if sym.is_assigned() or sym.is_imported() or sym.is_parameter() or sym.is_namespace()
+        }
+        cell_available = available | module_bound
+        unresolved: list = []
+        _scope_walk(table, frozenset(), cell_available, unresolved, is_module=True)
+        for name in sorted(set(unresolved)):
+            problems.append(f"NAME    {name!r} is used but never bound in this cell\n        [{label}]")
+        available |= module_bound
+
+    if problems:
+        print(f"\n!!! {len(problems)} notebook cell problem(s) found — refusing to write !!!\n")
+        for p in problems:
+            print("  " + p)
+        print(
+            "\nEach cell is its own Jupyter scope: a name imported in a LATER cell "
+            "does not resolve. Add the import to the cell that uses it.\n"
+        )
+        raise SystemExit(1)
+    print(f"cell guard: {checked} code cells compile, all names resolve ({skipped} IPython cell(s) skipped)")
+    return checked
+
+
+_guard_code_cells(cells)
 
 nb = new_notebook(cells=cells)
 nb.metadata["kernelspec"] = {"display_name": "Python 3", "language": "python", "name": "python3"}

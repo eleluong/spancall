@@ -287,7 +287,11 @@ class LeanTrainer:
                     candidate_masks={"starts": b["cand_starts"], "ends": b["cand_ends"]},
                 )
                 preds["span_logits"] = ptr_out["span_logits"]
-                targs["pointer_positives"] = b["pos_indices"]
+                t_pos = b["pos_indices"]
+                if "param_positions" in b and (b["param_positions"] < 0).any():
+                    t_pos = t_pos.clone()
+                    t_pos[b["param_positions"] < 0] = -1
+                targs["pointer_positives"] = t_pos
 
             if "tool_positions" in b and b["tool_positions"].numel():
                 safe_tool_pos = b["tool_positions"].clamp(min=0, max=max_tok_idx)
@@ -302,6 +306,13 @@ class LeanTrainer:
                     "tool_targets",
                     torch.full((H.size(0),), -1, dtype=torch.long, device=self.device),
                 )
+                # R0.4: the call axis is the set-valued target. It is forwarded
+                # only when the collator supplied it, so single-call batches keep
+                # the bit-identical (B,) cross-entropy path. The scalar
+                # ``tool_targets`` above is still set unconditionally because
+                # ``tool_acc`` below reads it.
+                if "call_tool_targets" in b:
+                    targs["call_tool_targets"] = b["call_tool_targets"]
 
         # Compute loss in fp32 for numerical stability
         fp32_preds = {k: (v.float() if isinstance(v, torch.Tensor) else v) for k, v in preds.items()}
@@ -372,7 +383,17 @@ class LeanTrainer:
         split_or_batches: Union[str, Sequence[Dict[str, torch.Tensor]]] = "dev",
         limit: Optional[int] = None,
     ) -> Dict[str, float]:
-        """Evaluate either on a split name (e.g. 'dev') or a sequence of batch dicts."""
+        """Evaluate either on a split name (e.g. 'dev') or a sequence of batch dicts.
+
+        Multi-call note (R0.4): the batch built here carries only ``tool_targets``
+        (the PRIMARY tool), not ``call_tool_targets``. A multi-call row is
+        therefore scored on its call-0 tool only, and ``tool_acc`` is a
+        single-call upper bound — the full call-set accuracy is measured
+        end-to-end by Part 3 (:class:`spancall.eval.toolcall.ToolCallEvaluator`),
+        not here. This is deliberate: the eval loop mirrors the inference
+        contract of one primary call per prompt, so the number stays comparable
+        with pre-R0.4 runs.
+        """
         self.model.eval()
 
         if isinstance(split_or_batches, str):
@@ -442,7 +463,11 @@ class LeanTrainer:
                             candidate_masks={"starts": b["cand_starts"], "ends": b["cand_ends"]},
                         )
                         preds["span_logits"] = ptr_out["span_logits"]
-                        targs["pointer_positives"] = b["pos_indices"]
+                        t_pos = b["pos_indices"]
+                        if "param_positions" in b and (b["param_positions"] < 0).any():
+                            t_pos = t_pos.clone()
+                            t_pos[b["param_positions"] < 0] = -1
+                        targs["pointer_positives"] = t_pos
 
                     if "tool_positions" in b and b["tool_positions"].numel():
                         safe_tool_pos = b["tool_positions"].clamp(min=0, max=max_tok_idx)
@@ -596,8 +621,9 @@ class LeanTrainer:
 
         if filter_empty_positives and rows and "pos_indices" in rows[0]:
             groundable = [r for r in rows if has_positive_targets(r)]
-            if groundable:
-                rows = groundable
+            if not groundable and rows:
+                print(f"[!] WARNING: filter_empty_positives=True but 0/{len(rows)} rows had positive targets!")
+            rows = groundable
 
         return rows
 
@@ -611,7 +637,10 @@ class LeanTrainer:
                     continue
                 t = v if isinstance(v, torch.Tensor) else torch.tensor(v)
                 if k in ("cand_starts", "cand_ends", "pos_indices") and t.dim() == 1:
-                    t = t.reshape(0, 0).long()
+                    if t.numel() == 0:
+                        t = t.reshape(0, 0).long()
+                    else:
+                        t = t.unsqueeze(0).long()
                 d[k] = t
             out.append(d)
         return out

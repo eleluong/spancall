@@ -25,6 +25,85 @@ This document tracks hypotheses, configurations, verification gates, and decisio
 
 ---
 
+## Metrics Delta — Lean Workflow Upgrade (Phases A–J)
+
+Phases A–J changed **what the model sees** (prompt layout, tool coverage, recent
+context, call axis) and **how a prediction is scored** (every GT call instead of
+call 0). Numbers produced before the upgrade are therefore **not comparable** to
+numbers produced after it. This section fixes the reporting contract: the same
+keys, read off the same artifacts, so two runs can be diffed without guessing
+which definition moved.
+
+### I.1 Where each number now lives
+
+| Quantity | Artifact | Key(s) |
+| --- | --- | --- |
+| Train prompt layout | `data_tensorized_lean/tensorize_stats.json` | `render_T_hist`, `render_T_t1_share`, `jittered_rows`, `jitter_pack_tools` |
+| Train H1 job size | same | `mean_n_candidates`, `n_candidates_hist`, `rows_without_h1_supervision` |
+| Train supervision losses | same | `dropped_over_length`, `tool_snap_misses`, `param_snap_misses`, `multi_call_ambiguous_anchors`; plus the drop-reason split — `param_drop_match_missed` / `param_drop_unresolved` / `param_drop_other` are **notebook-flattened** from the nested `param_drop_reasons` dict (the JSON artifact keeps the nested form) |
+| Train recent-context budget | same | `n_recent_rows`, `recent_truncated_rows` |
+| Part 1 param extraction | `p1_metrics` (in-notebook) | `extraction_recall/precision/f1`, `fast_path_param_coverage`, `fast_path_call_coverage`, `mean_render_T`, `render_T_hist`, `render_T_t1_share`, `recent_budget_effective` |
+| Part 1 call axis (J6) | `p1_metrics` | `call_exact_set_match`, `call_exact_set_match_F`, `call_count_acc`, `n_calls_hist`, `pred_n_calls_hist`, `n_multi_call_samples` |
+| Part 2 H1 | printed report | Top-1 tool accuracy, `mean_n_candidates` + histogram, `mean_n_candidates`-vs-1.5 vacuity warning |
+| Part 3 end-to-end | `results_lean/toolcall_metrics_{split}_lean.json` | `exact_payload_match`, `hit_rate`, `param_f1`, `metrics_by_stratum.F.*` |
+| Part 3 call axis (J6) | same file | `call_exact_set_match`, `call_count_acc`, `n_calls_hist`, `pred_n_calls_hist`, `metrics_by_stratum.F.call_exact_set_match`, `metrics_by_stratum.F.call_count_acc`, per-row `n_gt_calls` / `n_pred_calls` / `call_set_equal` / `call_count_equal` in `errors_by_sample`-adjacent rows |
+| Part 3 latency | per-row `latency_ms` in `preds_eval.jsonl` | now **additive** across stages (R5) |
+
+### I.2 What each change does to the number
+
+- **`render_T` (R1c, G).** Training now jitters `pack_tools` down to 1, so the
+  train histogram develops mass at `T=1` instead of being `T>=3` only. The
+  eval side renders the oracle tool (Part 1) or the candidate packet (Part 3).
+  Read the **T=1 share on both sides**: if train is 0% at `T=1`, the eval layout
+  is out of distribution and Part 1 numbers are optimistic; if eval is 100% at
+  `T=1`, H1 is a single-class softmax and its accuracy is vacuous. Both cases
+  are now printed as explicit warnings.
+- **Tool coverage (R0.1, B).** `pack_tools` is a **floor**, never a cap, so a
+  sample with 5 native tools renders 5 tool blocks. `mean_render_T` and
+  `mean_n_candidates` both rise; a `tool_truncated_rows > 0` means an explicit
+  `max_tools` still cut a native tool and H1 can never select it.
+- **Context (R0.2/R1b, D).** Part 1 passes `context_schemas=s.tools`, so the
+  prompt it scores is the same packet inference will see. Part 1 recall is
+  therefore **lower and honest** where it used to be measured on a `T=1`
+  oracle-only prompt.
+- **Recent budget (R8/R2, E).** Training now selects recent rows with the same
+  `select_recent_context` the resolver uses. `n_recent_rows` and
+  `recent_truncated_rows` quantify how much of the block the model actually saw;
+  Part 1 reports `recent_budget_effective` so a clamped budget is visible.
+- **Call axis (R0.4, J1–J6).** The headline changes in two ways at once:
+  - Part 1 scores **every** GT call's parameters (per-param rows tagged
+    `call_index::param`) instead of silently dropping calls 1..n.
+  - `exact_payload_match` / `exact_payload_match_F` remain **call-0 only**, by
+    design, so their historical series stays continuous. The new
+    `call_exact_set_match` requires every GT call exact **and** matching call
+    counts, so `set < call-0` is the expected signature of dropped or invented
+    calls. Report both; never replace one with the other.
+- **Tie to Phase I denominator.** `n_multi_call_samples` is the base rate that
+  decides how much any of this can move: with 0 multi-call rows the two
+  exactness numbers must be identical, and a gap there is a bug.
+
+### I.3 Expected direction (gate, not a result)
+
+These are predictions to falsify, not measurements. Record actual values in the
+rows below once a post-upgrade run exists.
+
+| Quantity | Pre-upgrade expectation | Post-upgrade expectation | Why |
+| --- | --- | --- | --- |
+| Part 1 `extraction_recall` | measured on `T=1` oracle prompt | **lower** | scored on the real multi-tool packet, all calls |
+| Part 1 `fast_path_param_coverage` | under-counted | **higher** | every call's params now counted |
+| Part 2 tool accuracy | optimistic (T=1 rows included) | **closer to reality** | `mean_n_candidates` reported beside it |
+| Part 3 `exact_payload_match` | call-0 only | unchanged definition | series stays comparable |
+| Part 3 `call_exact_set_match` | n/a (did not exist) | **<= call-0 number** | it also requires call count agreement |
+| `multi_call_ambiguous_anchors` | invisible | **non-zero allowed** | honest failure count on shared anchors |
+
+### I.4 Post-upgrade run log
+
+| Run ID | Date | Split(s) | Part 1 recall / coverage | Part 1 set-exact / count-acc | Part 2 tool acc (cands/row) | Part 3 exact / set-exact / count-acc | train T=1 share | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| _(pending)_ | | | | | | | | run the notebook end-to-end and fill from the printed report |
+
+---
+
 ## Experiment Execution Protocol
 
 1. **Config-First**: Every experiment must be runnable via `python scripts/... --config configs/experiments/<exp_id>.yaml`.

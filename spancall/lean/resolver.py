@@ -31,8 +31,8 @@ from span_template.sanitize import SanitizeError
 from span_template.template import (
     RecentRow,
     SpanTemplateOutput,
-    build_input,
     build_input_multi,
+    tokenize_legend,
     tokenize_offset_mapping,
 )
 
@@ -48,6 +48,41 @@ class LeanParameterResolution:
     source_type: str
     char_span: Optional[Tuple[int, int]] = None
     p_abstain: float = 0.0
+
+
+@dataclass
+class LeanCallResult:
+    """One decoded tool call (R0.4).
+
+    ``LeanResolveResult`` flattens the FIRST call into its own ``tool_name`` /
+    ``payload`` / ``parameters`` fields so every existing caller keeps working;
+    this type carries the per-call detail when more than one call resolves.
+    """
+
+    tool_name: Optional[str] = None
+    payload: Optional[Dict[str, Any]] = None
+    parameters: Dict[str, LeanParameterResolution] = field(default_factory=dict)
+    joint_margin: float = 0.0
+    confidence: float = 0.0
+    status: str = "abstain"  # "hit" | "partial" | "abstain"
+    hit: bool = False
+    missing_required: List[str] = field(default_factory=list)
+    call_index: int = 0
+    tool_prob: float = 0.0
+
+    def as_dict(self) -> Dict[str, Any]:
+        """Serialisable form for prediction records and eval rows."""
+        return {
+            "call_index": int(self.call_index),
+            "tool_name": self.tool_name,
+            "payload": dict(self.payload or {}),
+            "status": self.status,
+            "hit": bool(self.hit),
+            "confidence": float(self.confidence),
+            "joint_margin": float(self.joint_margin),
+            "tool_prob": float(self.tool_prob),
+            "missing_required": list(self.missing_required),
+        }
 
 
 @dataclass
@@ -69,6 +104,39 @@ class LeanResolveResult:
     latency_ms: float = 0.0
     features: Dict[str, Any] = field(default_factory=dict)
     error_reason: Optional[str] = None
+    # R0.4: one entry per decoded call. Always non-empty once a tool was chosen,
+    # with ``calls[0]`` mirrored by the scalar fields above.
+    calls: List[LeanCallResult] = field(default_factory=list)
+
+
+def _call_from_result(
+    res: LeanResolveResult, call_index: int, tool_prob: float = 1.0
+) -> LeanCallResult:
+    """Project a single-call result onto the per-call record (R0.4)."""
+    return LeanCallResult(
+        tool_name=res.tool_name,
+        payload=res.payload,
+        parameters=dict(res.parameters),
+        joint_margin=float(res.joint_margin),
+        confidence=float(res.confidence),
+        status=res.status,
+        hit=bool(res.hit),
+        missing_required=list(res.missing_required),
+        call_index=int(call_index),
+        tool_prob=float(tool_prob),
+    )
+
+
+def _with_calls(res: LeanResolveResult, tool_prob: float = 1.0) -> LeanResolveResult:
+    """Populate ``res.calls`` from ``res`` itself for the single-call paths.
+
+    ``tool_name`` is the marker for "a call was chosen": an abstain that still
+    names a tool is a prediction of that tool with an incomplete payload, and
+    eval needs it in ``calls`` to score it. An abstain that never picked a tool
+    gets an empty list, so ``len(res.calls)`` stays honest.
+    """
+    res.calls = [_call_from_result(res, 0, tool_prob=tool_prob)] if res.tool_name else []
+    return res
 
 
 def _to_recent_rows(raw: Optional[Sequence[Any]]) -> List[RecentRow]:
@@ -98,19 +166,25 @@ def _to_recent_rows(raw: Optional[Sequence[Any]]) -> List[RecentRow]:
 def _to_date(val: Any) -> date:
     """Coerce now (date | ISO string | None) to a date."""
     if val is None:
-        return date.today()
+        return date(2026, 1, 1)
     if isinstance(val, date):
         return val
     if isinstance(val, str):
         try:
             return date.fromisoformat(val[:10])
         except ValueError:
-            return date.today()
-    return date.today()
+            return date(2026, 1, 1)
+    return date(2026, 1, 1)
 
 
 class LeanResolver:
     """Streamlined one-pass inference pipeline without abstain machinery."""
+
+    # Capability flag, not a try/except: eval code that wants to pass
+    # ``context_schemas`` must check this instead of catching TypeError, because
+    # a TypeError silently swallowed would quietly restore the oracle-tool
+    # prompt (R0.2) while looking like a successful evaluation run.
+    supports_context_schemas: bool = True
 
     def __init__(
         self,
@@ -124,8 +198,12 @@ class LeanResolver:
         decoder: Optional[LeanJointDecoder] = None,
         caster: Optional[StrictTypeCaster] = None,
         validator: Optional[SchemaValidator] = None,
-        k_recent: int = 3,
-        context_budget_tokens: int = 256,
+        k_recent: int = 32,
+        context_budget_tokens: int = 4096,
+        max_cands: Optional[int] = 512,
+        max_calls: int = 1,
+        call_min_prob: float = 0.25,
+        call_min_prob_ratio: float = 0.5,
         **kwargs: Any,
     ) -> None:
         if model is None and encoder is not None:
@@ -145,6 +223,15 @@ class LeanResolver:
         self.validator = validator or SchemaValidator()
         self.k_recent = int(k_recent)
         self.context_budget_tokens = int(context_budget_tokens)
+        self.max_cands = int(max_cands) if max_cands is not None else None
+        # R0.4: how many tool calls may be emitted. ``max_calls=1`` (default)
+        # preserves the single-call contract exactly; a sample that genuinely
+        # needs two calls opts in. The count itself is a decision the model does
+        # not make -- a dedicated count head is out of scope -- so the second
+        # call is admitted only when H1 gives it non-trivial probability.
+        self.max_calls = max(int(max_calls), 1)
+        self.call_min_prob = float(call_min_prob)
+        self.call_min_prob_ratio = float(call_min_prob_ratio)
 
         if model_path is not None:
             self.load_checkpoint(model_path)
@@ -348,9 +435,56 @@ class LeanResolver:
         winner_name, winner_p = choices[0]
         winner = next((s for s in candidate_schemas if s.name == winner_name), candidate_schemas[0])
 
-        res = self._resolve(winner, utterance, selected_recent, now)
+        # R0.4: decide how many calls to emit. The winner is always call 0. A
+        # further call is admitted only if H1 gives its tool real probability --
+        # both an absolute floor and a ratio against the winner -- so a confident
+        # single call is never split in two by a rounding-level runner-up.
+        admitted: List[Tuple[str, float]] = [(winner_name, float(winner_p))]
+        for name, p in choices[1:]:
+            if len(admitted) >= self.max_calls:
+                break
+            if p < self.call_min_prob or p < float(winner_p) * self.call_min_prob_ratio:
+                break
+            admitted.append((name, float(p)))
+
+        encoded_bundle = (output, H, per_token, ctx_features)
+        calls: List[LeanCallResult] = []
+        first_res: Optional[LeanResolveResult] = None
+        for call_index, (name, p) in enumerate(admitted):
+            schema_i = next((s for s in candidate_schemas if s.name == name), None)
+            if schema_i is None:
+                continue
+            part = self._resolve(
+                schema_i, utterance, selected_recent, now, encoded_bundle=encoded_bundle
+            )
+            if first_res is None:
+                first_res = part
+            calls.append(_call_from_result(part, call_index, tool_prob=p))
+        if first_res is None:  # every admitted tool vanished -- impossible, but loud
+            first_res = self._resolve(
+                winner, utterance, selected_recent, now, encoded_bundle=encoded_bundle
+            )
+            calls = [_call_from_result(first_res, 0, tool_prob=float(winner_p))]
+        res = first_res
+
+        # R5: latency must be ADDITIVE. ``_resolve`` starts its own clock, so its
+        # ``latency_ms`` only covers head/decode/post and silently omitted the
+        # render + encode + H1 scoring done here. Reported as the sum, and the
+        # sub-stages keep their own meaning: pre/enc belong to this frame.
+        total_ms = (time.perf_counter() - t0) * 1000
+        res.latency_ms = float(res.latency_ms or 0.0) + total_ms
         res.features.update(features)
+        # Not every stage name exists in both frames; report the uncovered
+        # remainder explicitly rather than letting it vanish into the total.
+        res.features["stage_sum_ms"] = float(
+            sum(res.features.get(k, 0.0) or 0.0 for k in
+                ("pre_ms", "mask_ms", "enc_ms", "heads_ms", "decode_ms", "post_ms"))
+        )
+        res.features["unattributed_ms"] = float(max(0.0, res.latency_ms - res.features["stage_sum_ms"]))
         res.features["winner_prob"] = float(winner_p)
+        res.features["n_calls"] = len(calls)
+        res.features["call_probs"] = [round(float(p), 6) for _n, p in admitted[: len(calls)]]
+        res.calls = calls
         return res
 
     def try_resolve(
@@ -360,9 +494,40 @@ class LeanResolver:
         recent_context: Optional[List[Dict[str, Any]]] = None,
         now: Optional[Any] = None,
         raw_mode: Optional[bool] = None,
+        context_schemas: Optional[Sequence[ToolDefinition]] = None,
+        call_schemas: Optional[Sequence[ToolDefinition]] = None,
     ) -> LeanResolveResult:
-        """Resolve a single tool call."""
-        return self._resolve(schema, utterance, recent_context, now)
+        """Resolve a single tool call.
+
+        Args:
+            schema: the tool whose parameters are scored and returned.
+            context_schemas: the tools to RENDER into the prompt. Defaults to
+                ``[schema]``, which is the oracle-tool setting. Passing
+                ``sample.tools`` reproduces the training prompt exactly (every
+                native tool present, ``T = 1 + len(native)``). Without this the
+                eval prompt carried one ``<|tool|>`` block while training
+                carried ``pack_tools``, so H1/H3 saw an anchor layout at eval
+                time that they were never trained on (R0.2 / R1b).
+            call_schemas: R0.4 oracle multi-call input. When given, ONE call is
+                decoded per entry (skipping ``schema`` itself, which is call 0)
+                and appended to ``calls``. ``schema``'s own result still
+                populates ``tool_name``/``payload``, so single-call callers are
+                unaffected.
+        """
+        res = self._resolve(
+            schema, utterance, recent_context, now, context_schemas=context_schemas
+        )
+        extra = [s for s in (call_schemas or ()) if s.name != schema.name]
+        if not extra:
+            return res
+        render = list(context_schemas) if context_schemas else [schema, *extra]
+        for other in extra:
+            if not any(r.name == other.name for r in render):
+                render = [*render, other]
+            part = self._resolve(other, utterance, recent_context, now, context_schemas=render)
+            res.calls.append(_call_from_result(part, len(res.calls)))
+        res.features["n_calls"] = len(res.calls)
+        return res
 
     def _resolve(
         self,
@@ -370,7 +535,15 @@ class LeanResolver:
         utterance: str,
         recent_context: Optional[List[Dict[str, Any]]],
         now: Optional[Any],
+        encoded_bundle: Optional[Tuple[SpanTemplateOutput, torch.Tensor, Sequence[Optional[Entry]], Dict[str, Any]]] = None,
+        context_schemas: Optional[Sequence[ToolDefinition]] = None,
     ) -> LeanResolveResult:
+        # ``render_schemas`` is what actually goes into the prompt; ``schema`` is
+        # only what we score. Keeping them separate is the whole point of R0.2.
+        render_schemas: List[ToolDefinition] = list(context_schemas) if context_schemas else [schema]
+        if not any(s.name == schema.name for s in render_schemas):
+            # Never render a prompt that omits the tool we are about to score.
+            render_schemas = [schema, *render_schemas]
         t0 = time.perf_counter()
         if self.model is None or self.tokenizer is None:
             return LeanResolveResult(
@@ -380,34 +553,110 @@ class LeanResolver:
                 error_reason="no_model_or_tokenizer",
             )
 
-        eff_budget = min(self.context_budget_tokens, max(64, self.max_seq_len // 2))
-        selected_recent, ctx_features = select_recent_context(
-            recent_context or [],
-            [schema],
-            k_recent=self.k_recent,
-            context_budget_tokens=eff_budget,
-            tokenizer=self.tokenizer,
-        )
-
-        try:
-            output = build_input(
-                tooldef_to_template_tool(schema),
-                utterance,
-                recent_context=_to_recent_rows(selected_recent),
-                now=_to_date(now),
-            )
+        if encoded_bundle is not None:
+            output, H, per_token, ctx_features = encoded_bundle
+            # The bundle's tokenization is the one that produced ``per_token``,
+            # so rebuild the offsets from it rather than re-encoding: the
+            # offsets are a pure function of ``output.text`` and the tokenizer,
+            # and _RowCtx identity-checks the list it was built from.
+            # R5: the stage clocks must describe THIS call, not the caller's.
+            # Previously this branch set ``t_pre = t0`` and THEN immediately
+            # overwrote ``t_mask`` before any work, so ``pre_ms`` was 0 and
+            # ``mask_ms``/``enc_ms`` were attributed to the wrong stages. The
+            # render and the encode both happened in ``try_resolve_candidates``,
+            # so the honest report is: pre=0, enc=0, and mask = the work below.
             t_pre = time.perf_counter()
-            ids, per_token = tokenize_offset_mapping(output, self.tokenizer, max_len=self.max_seq_len)
-            text = output.text
-            cand_masks = self._candidate_masks(output, text, [schema])
+            # Recovering offsets by re-encoding would be a second full pass. The
+            # bundle already carries the token count; derive the geometry from
+            # the one encode the caller performed.
+            offset_map = self.tokenizer(
+                output.text, return_offsets_mapping=True, add_special_tokens=False
+            )["offset_mapping"]
+            cand_masks, _ctx = self._candidate_masks(
+                output, output.text, [schema], token_offsets=offset_map
+            )
             t_mask = time.perf_counter()
-            H, _cls_h = self._encode(ids)
-            t_enc = time.perf_counter()
-        except Exception as exc:
-            reason = f"sanitize: {exc}" if isinstance(exc, SanitizeError) else f"render_or_encode_error: {exc}"
+            # In the bundle path the prompt was already rendered by
+            # ``try_resolve_candidates``, so reuse ITS anchor count (R9).
+            ctx_features = dict(ctx_features)
+            ctx_features.setdefault("render_T", sum(
+                1 for e in output.entries
+                if getattr(e, "kind", None) == "bridge_text"
+                and getattr(e, "tool", None) is not None
+            ))
+            # No encode happened here — it is carried by the bundle.
+            t_enc = t_mask
+        else:
+            # ``eff_budget`` is reported, never silent: R2 was that the resolver
+            # quietly halved ``context_budget_tokens`` so inference evicted rows
+            # the configured budget said were affordable.
+            eff_budget = min(self.context_budget_tokens, max(64, self.max_seq_len // 2))
+            selected_recent, ctx_features = select_recent_context(
+                recent_context or [],
+                render_schemas,
+                k_recent=self.k_recent,
+                context_budget_tokens=eff_budget,
+                tokenizer=self.tokenizer,
+            )
+            ctx_features = dict(ctx_features)
+            ctx_features["recent_budget_tokens"] = int(self.context_budget_tokens)
+            ctx_features["recent_budget_effective"] = int(eff_budget)
+            ctx_features["recent_budget_clamped"] = bool(eff_budget < int(self.context_budget_tokens))
+
+            try:
+                # Render EVERY tool: same grammar, same anchor count as training.
+                output = build_input_multi(
+                    [tooldef_to_template_tool(s) for s in render_schemas],
+                    utterance,
+                    recent_context=_to_recent_rows(selected_recent),
+                    now=_to_date(now),
+                )
+                t_pre = time.perf_counter()
+                # ONE tokenization: the same offsets feed both the legend mapping
+                # and the candidate masks (R4). Previously this encoded the text
+                # a second time inside _candidate_masks.
+                ids, per_token, token_offsets = tokenize_legend(
+                    output, self.tokenizer, max_len=self.max_seq_len
+                )
+                text = output.text
+                cand_masks, _ctx = self._candidate_masks(
+                    output, text, [schema], token_offsets=token_offsets
+                )
+                t_mask = time.perf_counter()
+                H, _cls_h = self._encode(ids)
+                t_enc = time.perf_counter()
+                # R9: the anchor count actually rendered, so a T mismatch is
+                # visible on every eval row instead of being inferred.
+                ctx_features["render_T"] = int(sum(
+                    1 for e in output.entries
+                    if getattr(e, "kind", None) == "bridge_text"
+                    and getattr(e, "tool", None) is not None
+                ))
+            except Exception as exc:
+                reason = f"sanitize: {exc}" if isinstance(exc, SanitizeError) else f"render_or_encode_error: {exc}"
+                req = [p.name for p in schema.parameters if p.required]
+                opt = [p.name for p in schema.parameters if not p.required]
+                return LeanResolveResult(
+                    hit=False,
+                    tool_name=schema.name,
+                    status="abstain",
+                    missing_required=req,
+                    missing_optional=opt,
+                    abstain_reason=reason,
+                    error_reason=reason,
+                    latency_ms=(time.perf_counter() - t0) * 1000,
+                    features=dict(ctx_features),
+                )
+
+        # Run pointer head
+        anchors, per_param_scores = self._score_parameters(output, H, per_token, cand_masks, schema=schema)
+        t_heads = time.perf_counter()
+
+        if schema.parameters and not anchors:
+            reason = "no_param_anchors"
             req = [p.name for p in schema.parameters if p.required]
             opt = [p.name for p in schema.parameters if not p.required]
-            return LeanResolveResult(
+            return _with_calls(LeanResolveResult(
                 hit=False,
                 tool_name=schema.name,
                 status="abstain",
@@ -417,12 +666,17 @@ class LeanResolver:
                 error_reason=reason,
                 latency_ms=(time.perf_counter() - t0) * 1000,
                 features=dict(ctx_features),
-            )
+            ))
 
-        # Run pointer head
-        anchors, per_param_scores = self._score_parameters(output, H, per_token, cand_masks)
-        t_heads = time.perf_counter()
-
+        # H3 must only see the anchors of the tool being scored: a distractor's
+        # ``<|param|> date`` anchor is not this schema's ``date`` slot (R3).
+        if schema.parameters and len(render_schemas) > 1:
+            ctx_features = dict(ctx_features)
+            ctx_features["n_foreign_param_anchors"] = int(sum(
+                1 for e in output.entries
+                if getattr(e, "kind", None) == "param_anchor"
+                and getattr(e, "tool", None) not in (None, schema.name)
+            ))
         param_names = [p.name for p in schema.parameters]
         entity_classes = {p.name: p.entity_class for p in schema.parameters if p.entity_class}
         assignment, delta, chosen, n_valid = self.decoder.decode_detailed(
@@ -543,7 +797,7 @@ class LeanResolver:
             "abstain_p": 0.0,
         }
 
-        return LeanResolveResult(
+        return _with_calls(LeanResolveResult(
             hit=bool(is_hit),
             tool_name=schema.name,
             payload=payload if valid else None,
@@ -559,7 +813,7 @@ class LeanResolver:
             latency_ms=(time.perf_counter() - t0) * 1000,
             features=features,
             error_reason=fail_reason,
-        )
+        ))
 
     def _encode(self, ids: List[int]) -> Tuple[torch.Tensor, torch.Tensor]:
         if len(ids) > self.max_seq_len:
@@ -580,25 +834,69 @@ class LeanResolver:
         cls_h = H[:, 0]
         return H, cls_h
 
+    @staticmethod
+    def _mask_key(tool: Optional[str], param: str) -> str:
+        """Qualified mask key. ``param`` alone collides across schemas (R3).
+
+        Two tools may legitimately both declare ``query`` (or ``date``, ``id``).
+        Keying by the bare parameter name let the LAST schema silently overwrite
+        the first, so H3 scored schema A's anchor against schema B's candidate
+        set — a wrong-tool span could win and be cast into A's payload.
+        """
+        return f"{tool}::{param}" if tool else str(param)
+
     def _candidate_masks(
         self,
         output: SpanTemplateOutput,
         text: str,
         schemas: Sequence[ToolDefinition],
-    ) -> Dict[str, Dict[str, Any]]:
-        from spancall.model.masks import CandidateMaskBuilder
+        token_offsets: Optional[Sequence[Tuple[int, int]]] = None,
+    ) -> Tuple[Dict[str, Dict[str, Any]], Any]:
+        """Build candidate sets for every parameter of every rendered schema.
 
-        enc = self.tokenizer(text, return_offsets_mapping=True, add_special_tokens=False)
-        token_offsets: List[Tuple[int, int]] = list(enc["offset_mapping"])
+        Returns ``(masks, ctx)``. ``masks`` is keyed by ``tool::param`` so a
+        shared parameter name across tools cannot collide, and ``ctx`` is the
+        per-row :class:`_RowCtx` that every parameter reused — building it once
+        here is what removes the K-fold rebuild of the token/entry indexes (R4).
+
+        ``token_offsets`` must be the offsets from the SAME tokenization that
+        produced ``output``; when omitted we fall back to a self-consistent local
+        encode, but every in-resolver caller passes it.
+        """
+        from spancall.model.masks import CandidateMaskBuilder, _RowCtx
+
+        if token_offsets is None:
+            enc = self.tokenizer(text, return_offsets_mapping=True, add_special_tokens=False)
+            token_offsets = list(enc["offset_mapping"])
+        offsets = list(token_offsets)
+
         builder = CandidateMaskBuilder(
             max_seq_len=self.max_seq_len, max_span_width=self.max_span_width
         )
         entries = output.entries
+        max_tok = builder._effective_max_seq_len(offsets)
+        ctx = _RowCtx.for_row(entries, offsets, max_tok)
+
         masks: Dict[str, Dict[str, Any]] = {}
+        # Identical parameter signatures across tools produce identical masks, so
+        # build once and alias. Keeps the qualified keys without paying twice.
+        built: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
         for schema in schemas:
             for p in schema.parameters:
-                masks[p.name] = builder.build_param_masks(p, entries, token_offsets, text)
-        return masks
+                sig = (
+                    p.name,
+                    p.param_type,
+                    tuple(p.enum) if p.enum else None,
+                    p.entity_class,
+                )
+                m = built.get(sig)
+                if m is None:
+                    m = builder.build_param_masks(
+                        p, entries, offsets, text, ctx=ctx, max_cands=self.max_cands
+                    )
+                    built[sig] = m
+                masks[self._mask_key(schema.name, p.name)] = m
+        return masks, ctx
 
     def _score_parameters(
         self,
@@ -606,21 +904,32 @@ class LeanResolver:
         H: torch.Tensor,
         per_token: Sequence[Optional[Entry]],
         cand_masks: Dict[str, Dict[str, Any]],
+        schema: Optional[ToolDefinition] = None,
     ) -> Tuple[List[Tuple[str, int]], Dict[str, List[Tuple[Any, float]]]]:
         anchors: List[Tuple[str, int]] = []
+        # ``anchor_keys[k]`` mirrors ``anchors[k]`` with the qualified mask key so
+        # a distractor tool that shares a parameter name can never supply this
+        # schema's candidate set (R3).
+        anchor_keys: List[str] = []
         for i, e in enumerate(per_token):
             if e is not None and e.kind == "param_anchor" and e.value != "<|none|>":
+                # Anchor ownership: prefer the entry's own tool tag; when the
+                # legend is untagged, fall back to the schema we were asked for.
+                owner = e.tool if e.tool is not None else (schema.name if schema else None)
+                if schema is not None and owner is not None and owner != schema.name:
+                    continue
                 anchors.append((str(e.text or ""), i))
-        if not anchors:
-            for schema in output.tools:
-                for p in schema.params:
-                    anchors.append((p.name, 0))
+                anchor_keys.append(self._mask_key(owner, str(e.text or "")))
 
         param_names = [a[0] for a in anchors]
         device = H.device
         B, _L, _d = H.shape
         K = len(anchors)
-        per_param_scores: Dict[str, List[Tuple[Any, float]]] = {n: [] for n in param_names}
+        per_param_scores: Dict[str, List[Tuple[Any, float]]] = {
+            p.name: [] for p in (schema.parameters if schema else ())
+        }
+        for n in param_names:
+            per_param_scores.setdefault(n, [])
         if K == 0 or self.model is None or self.model.pointer_head is None:
             return anchors, per_param_scores
 
@@ -630,8 +939,8 @@ class LeanResolver:
 
         starts_rows: List[List[int]] = []
         ends_rows: List[List[int]] = []
-        for name in param_names:
-            m = cand_masks.get(name)
+        for key in anchor_keys:
+            m = cand_masks.get(key)
             starts_rows.append([a for a, _ in m["cand_index"]] if m else [])
             ends_rows.append([b for _, b in m["cand_index"]] if m else [])
         C = max((len(r) for r in starts_rows), default=0)
@@ -651,7 +960,7 @@ class LeanResolver:
             span_logits = res["span_logits"]  # (1, K, C)
 
         for k, name in enumerate(param_names):
-            m = cand_masks.get(name)
+            m = cand_masks.get(anchor_keys[k])
             if not m or not m["candidates"]:
                 continue
             cands = m["candidates"]

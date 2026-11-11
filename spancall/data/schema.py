@@ -131,9 +131,44 @@ class UnifiedSample:
     recent_context: List[Dict[str, Any]] = field(default_factory=list)
     current_time_iso: Optional[str] = None
     stratum: Stratum = Stratum.F
+    # Keys are ``f"{call_index}::{param_name}"`` for multi-call alignment, plus
+    # the legacy bare ``param_name`` for single-call samples (see
+    # ``ReverseAligner._emit``). Never assume a bare key in new code -- go
+    # through ``targets_for_call``.
     target_spans: Dict[str, List[SpanTarget]] = field(default_factory=dict)
     split: Split = Split.TRAIN
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def n_calls(self) -> int:
+        """Number of ground-truth calls this sample asks the model to emit (R0.4)."""
+        return len(self.ground_truth_calls or [])
+
+    def targets_for_call(self, call_index: int) -> Dict[str, List[SpanTarget]]:
+        """Ground-truth targets owned by ONE call, keyed by bare param name.
+
+        This is the migration accessor for R0.4: call-aware alignment stores
+        spans under ``f"{call_index}::{param}"`` so two calls declaring the same
+        parameter name no longer collide. Readers that have not migrated still
+        find data for the overwhelmingly common single-call case, because the
+        bare key is (a) written by ``ReverseAligner._emit`` for single-call
+        samples and (b) used as a fallback below.
+
+        The fallback is deliberately restricted to ``n_calls == 1``: in a legacy
+        multi-call file the bare key is a *flattened collision* of every call, so
+        handing it to ``call_index=1`` would fabricate supervision out of
+        another call's arguments. An empty dict is the honest answer there.
+        """
+        out: Dict[str, List[SpanTarget]] = {}
+        prefix = f"{int(call_index)}::"
+        for key, spans in (self.target_spans or {}).items():
+            if key.startswith(prefix):
+                out[key[len(prefix):]] = list(spans)
+        if not out and self.n_calls == 1:
+            for key, spans in (self.target_spans or {}).items():
+                if "::" not in key:
+                    out[key] = list(spans)
+        return out
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> "UnifiedSample":

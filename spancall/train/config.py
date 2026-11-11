@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Type, TypeVar, Union
+from typing import Any, Dict, List, Mapping, Optional, Type, TypeVar, Union
 
 _T = TypeVar("_T")
 
@@ -145,13 +145,15 @@ class RecentConfig:
 class DataConfig:
     """Data-pipeline knobs (docs/remediation_plan.md D5).
 
-    ``pack_tools`` is the number of candidate tools packed into one input.
-    Default ``1`` (the shipped single-tool path via ``build_input``): the
-    multi-tool packing path (``build_input_multi``, <|none|> anchor, T=4/J=3
-    slots) stays implemented and tested behind config, but is NOT invoked by
-    the default pipeline. The enablement gate (H-A6) flips ``pack_tools`` on
-    when the measured tool-ambiguity slice of stratum F exceeds ~10% (E0/E7
-    telemetry); the multi-call slice separately gates the list heads (H2/H6).
+    ``pack_tools`` is the FLOOR on the number of candidate tools rendered into
+    one input (``build_input_multi``, T anchor blocks). The Lean pipeline always
+    uses the multi-tool grammar (Phase A / R6, R10): there is no single-tool
+    ``build_input`` path left to fall back to. ``pack_tools`` is a floor, not a
+    ceiling — every native tool of the sample is always rendered (Phase B /
+    R0.1), and ``ToolPool`` only tops up to the floor with distractors.
+    ``jitter_pack_tools`` (Phase G / R1c) draws T uniformly in
+    ``[pack_tools, ceiling]`` per row so that ``T=1`` layouts — which the
+    oracle-tool eval renders — stay in-distribution during training.
     Unknown keys in the YAML ``data`` section are tolerated (forward compat).
 
     ``fraction`` (default 1.0): the fraction of each tensorized split used by
@@ -160,12 +162,26 @@ class DataConfig:
     **training and dev/calib evaluation together** — set ``data.fraction: 0.2``
     to smoke-test the whole pipeline end-to-end on 20% of the data (see
     ``configs/verify20.yaml``).
+
+    ``max_calls`` / ``call_min_prob`` / ``call_min_prob_ratio`` (Phase J5 /
+    R0.4) are forwarded to :class:`spancall.lean.resolver.LeanResolver`. They
+    control how many calls the resolver may emit: a resolver built with the
+    default ``max_calls=1`` can NEVER report more than one predicted call, so
+    any multi-call metric computed against it (``call_exact_set_match``,
+    ``pred_n_calls_hist``) is capped at the single-call share by construction,
+    not by model quality. Set these from the YAML so a run log records the
+    configuration it actually ran under.
     """
 
     pack_tools: int = 1
     fraction: float = 1.0
     train_f_ratio: float = 0.0   # H-T2: target F:(A) ratio in trainer subsample
                                  # (0 = old pure-random fraction subsample)
+    jitter_pack_tools: bool = True   # R1c: draw T in [pack_tools, ceiling]
+    max_tools: Optional[int] = None  # R0.1: hard ceiling on rendered tools
+    max_calls: int = 4               # R0.4: resolver call budget (1 = single call)
+    call_min_prob: float = 0.25      # R0.4: H1 prob floor for an extra call
+    call_min_prob_ratio: float = 0.5  # R0.4: extra-call prob / top tool prob
     recent: RecentConfig = field(default_factory=RecentConfig)
 
     @classmethod

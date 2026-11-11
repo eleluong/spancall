@@ -284,6 +284,27 @@ class ToolCallEvaluator(BaseToolCallEvaluator):
 
         m.total_samples = len(rows)
         self._accumulate(m, rows, stratum=None)
+
+        # R0.4 / J6: set-level call metrics. ``exact_payload_match`` above stays
+        # call-0-only so the historical number keeps its meaning; these are the
+        # numbers that stop a multi-call row being scored on its first call only.
+        n_rows = len(rows)
+        m.call_exact_set_match = (
+            sum(1.0 for r in rows if r.get("call_set_equal")) / n_rows
+        ) if n_rows else 0.0
+        m.call_count_acc = (
+            sum(1.0 for r in rows if r.get("call_count_equal")) / n_rows
+        ) if n_rows else 0.0
+        gt_hist: Dict[str, int] = {}
+        pred_hist: Dict[str, int] = {}
+        for r in rows:
+            g = str(int(r.get("n_gt_calls", 0)))
+            p = str(int(r.get("n_pred_calls", 0)))
+            gt_hist[g] = gt_hist.get(g, 0) + 1
+            pred_hist[p] = pred_hist.get(p, 0) + 1
+        m.n_calls_hist = dict(sorted(gt_hist.items()))
+        m.pred_n_calls_hist = dict(sorted(pred_hist.items()))
+
         m.metrics_by_stratum = {
             "F": self._stratum_metrics(rows, Stratum.F),
             "A": self._stratum_metrics(rows, Stratum.A),
@@ -310,7 +331,20 @@ class ToolCallEvaluator(BaseToolCallEvaluator):
         tool_name = pred.get("tool_name") or pred.get("tool")
         gt_payload = gt.arguments if gt else None
         gt_tool = gt.tool_name if gt else None
-        equal = payload_equal(gt_payload, payload, sample.tools[0] if sample.tools else None)
+        # The schema for ``payload_equal`` must be the GT CALL's tool, not
+        # ``sample.tools[0]``. Using the first tool's schema materialised the
+        # wrong optional defaults / enum/type coercions whenever the GT call was
+        # not the first declared tool (a silent false pass or false fail once a
+        # sample declared its tools in any order other than the call order).
+        gt_schema = None
+        if gt_tool is not None:
+            gt_schema = next(
+                (t for t in (sample.tools or []) if getattr(t, "name", None) == gt_tool),
+                None,
+            )
+        if gt_schema is None and sample.tools:
+            gt_schema = sample.tools[0]
+        equal = payload_equal(gt_payload, payload, gt_schema)
         correct = bool(equal and (gt_tool is None or tool_name == gt_tool))
 
         n_gt_params = 0
@@ -329,6 +363,15 @@ class ToolCallEvaluator(BaseToolCallEvaluator):
 
         has_partial = bool(payload_partial and len(payload_partial) > 0)
         status = pred.get("status", "hit" if hit else ("partial" if has_partial else "abstain"))
+
+        # R0.4 / J6: score the predicted CALL SET, not just the flattened first
+        # call. ``payload`` / ``tool_name`` above stay the primary (call-0) view
+        # so ``exact_payload_match`` keeps its historical meaning.
+        gt_calls = list(getattr(sample, "ground_truth_calls", None) or [])
+        pred_calls = self._predicted_call_list(pred)
+        call_set_equal, call_count_equal = self.multi_call_equal(
+            gt_calls, pred_calls, sample
+        )
 
         # gates (only meaningful when hit)
         gate_correct = bool(hit and correct)
@@ -350,12 +393,85 @@ class ToolCallEvaluator(BaseToolCallEvaluator):
             "n_pred_params": n_pred_params,
             "n_correct_params": n_correct_params,
             "has_partial": has_partial,
+            "n_gt_calls": len(gt_calls),
+            "n_pred_calls": len(pred_calls),
+            "call_set_equal": call_set_equal,
+            "call_count_equal": call_count_equal,
             "errors": [],
         }
         if hit and not correct:
             row["errors"] = _classify_error(sample.sample_id, payload, gt_payload,
                                             tool_name, gt_tool, pred.get("parameters"))
         return row
+
+    @staticmethod
+    def _predicted_call_list(pred: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """The predicted calls as ``[{tool_name, payload}, ...]`` (R0.4).
+
+        A prediction written by the Lean ``predict_split`` cell carries ``calls``;
+        a legacy single-call prediction has only the flattened ``tool_name`` /
+        ``payload``. Reading the flattened fields as exactly one call keeps old
+        prediction files scorable instead of pretending they were multi-call.
+        """
+        calls = pred.get("calls")
+        if isinstance(calls, list) and calls:
+            out = []
+            for c in calls:
+                if not isinstance(c, dict):
+                    continue
+                name = c.get("tool_name")
+                if not name:
+                    continue
+                out.append({"tool_name": name, "payload": c.get("payload") or {}})
+            if out:
+                return out
+        name = pred.get("tool_name") or pred.get("tool")
+        if not name:
+            return []
+        return [{"tool_name": name, "payload": pred.get("payload") or {}}]
+
+    @staticmethod
+    def multi_call_equal(
+        gt_calls: Sequence[GroundTruthCall],
+        pred_calls: Sequence[Dict[str, Any]],
+        sample: UnifiedSample,
+    ) -> tuple:
+        """Set-level call match + call-count agreement (R0.4 / J6).
+
+        Calls are matched as a MULTISET by tool name, then each matched pair's
+        payload is compared with :func:`payload_equal` against that tool's own
+        schema. Order does not matter: emitting the same two calls in the other
+        order is still correct, because a call set has no sequence.
+        """
+        n_gt = len(gt_calls)
+        n_pred = len(pred_calls)
+        count_equal = n_gt == n_pred
+        if not count_equal:
+            return False, False
+        if n_gt == 0:
+            return True, True
+
+        schemas = {getattr(t, "name", None): t for t in (sample.tools or [])}
+        # Group predictions by tool so a tool called twice is matched twice.
+        remaining: Dict[str, List[Dict[str, Any]]] = {}
+        for c in pred_calls:
+            remaining.setdefault(str(c.get("tool_name")), []).append(c)
+
+        for gt in gt_calls:
+            name = str(getattr(gt, "tool_name", ""))
+            bucket = remaining.get(name) or []
+            if not bucket:
+                return False, True
+            gt_payload = dict(getattr(gt, "arguments", None) or {})
+            matched_idx = None
+            for i, cand in enumerate(bucket):
+                if payload_equal(gt_payload, cand.get("payload") or {}, schemas.get(name)):
+                    matched_idx = i
+                    break
+            if matched_idx is None:
+                return False, True
+            bucket.pop(matched_idx)
+        return True, True
 
     @staticmethod
     def _first_gt(sample: UnifiedSample) -> Optional[GroundTruthCall]:
@@ -380,6 +496,8 @@ class ToolCallEvaluator(BaseToolCallEvaluator):
                 "param_precision": 0.0,
                 "param_recall": 0.0,
                 "param_f1": 0.0,
+                "call_exact_set_match": 0.0,
+                "call_count_acc": 0.0,
             }
         hits = [r for r in sel if r["hit"]]
         n_hits = len(hits)
@@ -399,6 +517,9 @@ class ToolCallEvaluator(BaseToolCallEvaluator):
             "param_precision": p_prec,
             "param_recall": p_rec,
             "param_f1": p_f1,
+            # R0.4 / J6: set-level call accuracy for the same stratum.
+            "call_exact_set_match": sum(1.0 for r in sel if r.get("call_set_equal")) / n,
+            "call_count_acc": sum(1.0 for r in sel if r.get("call_count_equal")) / n,
         }
 
     def _accumulate(self, m: ToolCallMetrics, rows: List[Dict[str, Any]],
