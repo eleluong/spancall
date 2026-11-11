@@ -38,7 +38,11 @@ from spancall.lean.tensorize import (
     jitter_pack_tools,
     tensorize_sample_lean,
 )
-from spancall.lean.trainer import LeanTrainer
+from spancall.lean.trainer import (
+    LeanTrainer,
+    apply_lora,
+    build_lean_optimizer_groups,
+)
 from spancall.model.masks import CandidateMaskBuilder
 
 
@@ -604,6 +608,78 @@ def test_tensorize_required_param_without_gt_is_not_match_missed() -> None:
     assert stats["param_drop_reasons"] == {"absent_from_gt": 1}
 
 
+def test_tensorize_fallback_rescue_is_not_recorded_as_a_drop() -> None:
+    """T5 invariant: a drop reason means "this anchor ended with NO positive".
+
+    ``drop_why`` is classified BEFORE the GT-argument fallback (it must be, so
+    that ``match_missed`` can suppress the null slot). But when that fallback
+    then RESCUES the anchor, the param *is* supervised -- recording a drop
+    anyway breaks the audit cell's cross-check
+    ``n_zero_positives == len(_param_drop_reasons)`` and, worse, inflates the
+    "supervision defects (must be 0)" tripwire with params that were never
+    defective. The rescue is still worth counting, on its own channel.
+    """
+    tok = FakeTokenizer()
+    mb = CandidateMaskBuilder(max_seq_len=512, max_span_width=16)
+    schema = _weather_schema(
+        ParameterSchema(name="city", description="City name", param_type="string", required=True),
+    )
+    sample = UnifiedSample(
+        sample_id="s-rescued",
+        source_dataset="test",
+        utterance="weather in Tokyo",
+        tools=[schema],
+        ground_truth_calls=[GroundTruthCall(tool_name="get_weather", arguments={"city": "Tokyo"})],
+        current_time_iso="2026-11-09",
+        stratum=Stratum.F,
+        # EMPTY target_spans: the matcher has nothing, so classification says
+        # `match_missed`, but the GT-argument fallback finds "Tokyo" in the
+        # candidate set and supervises it.
+        target_spans={},
+    )
+
+    stats: dict = {}
+    row = tensorize_sample_lean(sample, tok, mb, max_seq_len=512, pack_multi_tools=True, stats=stats)
+    assert row is not None
+    # The param is supervised -> no drop recorded.
+    assert (row["pos_indices"][0] >= 0).any()
+    assert stats.get("param_drop_reasons", {}) == {}
+    assert "_param_drop_reasons" not in row
+    # ... but the primary-path failure is not erased either.
+    assert stats.get("param_rescued_by_fallback", {}) == {"match_missed": 1}
+
+
+def test_tensorize_null_rescue_is_not_recorded_as_a_drop() -> None:
+    """Same invariant for the ``<|null|>`` rescue of an optional param."""
+    tok = FakeTokenizer()
+    mb = CandidateMaskBuilder(max_seq_len=512, max_span_width=16)
+    schema = _weather_schema(
+        ParameterSchema(name="city", description="City name", param_type="string", required=True),
+        ParameterSchema(name="unit", description="Unit", param_type="string", required=False),
+    )
+    sample = UnifiedSample(
+        sample_id="s-null-rescued",
+        source_dataset="test",
+        utterance="weather in Tokyo",
+        tools=[schema],
+        ground_truth_calls=[GroundTruthCall(tool_name="get_weather", arguments={"city": "Tokyo"})],
+        current_time_iso="2026-11-09",
+        stratum=Stratum.F,
+        target_spans={
+            "city": [SpanTarget(param_name="city", target_type="utterance_span", canonical_value="Tokyo")],
+            # "unit" has neither a target nor a GT arg -> absent_from_gt, then
+            # rescued into the deterministic <|null|> slot because optional.
+        },
+    )
+
+    stats: dict = {}
+    row = tensorize_sample_lean(sample, tok, mb, max_seq_len=512, pack_multi_tools=True, stats=stats)
+    assert row is not None
+    assert all((p >= 0).any() for p in row["pos_indices"])
+    assert stats.get("param_drop_reasons", {}) == {}
+    assert stats.get("param_rescued_by_fallback", {}) == {"absent_from_gt": 1}
+
+
 def test_tensorize_unresolved_only_call_has_no_supervision_bug() -> None:
     """C1 regression: an explicit-null GT param is supervised, not dropped.
 
@@ -741,6 +817,96 @@ class _RenderTStubResolver(_StubResolver):
             "recent_budget_clamped": True,
         }
         return res
+
+
+class _ParityStubResolver(_StubResolver):
+    """Stub that records the T1/T2 kwargs the eval harness actually passed.
+
+    T2 is a *fix under test*, so the harness must be able to run BOTH arms.
+    Until this test existed, ``protect_parity_spans`` was accepted by the
+    resolver but never supplied by ``eval_param_extraction_lean`` -- so the
+    experiment could not be run through the eval at all, and the switch was
+    dead code from the harness's point of view.
+    """
+
+    supports_context_schemas = True
+    supports_candidate_parity = True
+
+    def __init__(self, scripted: dict) -> None:
+        super().__init__(scripted)
+        self.seen: list = []
+
+    def try_resolve(self, tool, utterance, recent_context=None, now=None, **kwargs):
+        self.seen.append(dict(kwargs))
+        return super().try_resolve(tool, utterance, recent_context, now)
+
+
+def _parity_split(tmp_path) -> str:
+    """Write a one-row split whose `city` GT span is extractable."""
+    import json
+    record = {
+        "sample_id": "p1",
+        "source_dataset": "test",
+        "utterance": "weather in Tokyo",
+        "tools": [
+            {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": [
+                    {"name": "city", "description": "City", "param_type": "string", "required": True},
+                ],
+            }
+        ],
+        "ground_truth_calls": [
+            {"tool_name": "get_weather", "arguments": {"city": "Tokyo"}}
+        ],
+        "current_time_iso": "2026-11-09",
+        "stratum": "F",
+        "target_spans": {
+            "city": [{
+                "param_name": "city",
+                "target_type": "utterance_span",
+                "canonical_value": "Tokyo",
+                "char_start": 11,
+                "char_end": 16,
+            }],
+        },
+    }
+    with open(tmp_path / "parity_split.jsonl", "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(record) + "\n")
+    return "parity_split"
+
+
+def test_eval_part1_runs_both_parity_arms(tmp_path) -> None:
+    """T2: the eval harness must be able to run the FIX arm, not just diagnose.
+
+    ``protect_parity_spans`` is the switch that separates "measure the serve-side
+    candidate loss" from "force the GT span past truncation and see how much
+    extraction headroom remains". If the harness never forwards it, the second
+    arm is unreachable and the experiment in the plan cannot be run at all.
+    """
+    split = _parity_split(tmp_path)
+
+    diag = _ParityStubResolver({"city": "Tokyo"})
+    m_diag = eval_param_extraction_lean(
+        split, resolver=diag, data_dir=str(tmp_path), limit=10, max_param_gap_report=5,
+    )
+    assert diag.seen, "resolver was never called"
+    assert diag.seen[0].get("parity_spans"), "T1 spans must be measured by default"
+    assert not diag.seen[0].get("protect_parity_spans"), "T1 must NOT protect by default"
+    assert m_diag["parity_protection"] is False
+
+    fix = _ParityStubResolver({"city": "Tokyo"})
+    m_fix = eval_param_extraction_lean(
+        split, resolver=fix, data_dir=str(tmp_path), limit=10,
+        max_param_gap_report=5, protect_parity_spans=True,
+    )
+    assert fix.seen, "resolver was never called"
+    # Protection implies measurement: the same spans are handed over AND
+    # forced past the candidate cap.
+    assert fix.seen[0].get("parity_spans"), "protection must still report parity"
+    assert fix.seen[0].get("protect_parity_spans") is True
+    assert m_fix["parity_protection"] is True
 
 
 def test_eval_param_extraction_scores_groundable_params_only(tmp_path) -> None:
@@ -1724,6 +1890,55 @@ def test_tensorize_without_jitter_renders_exactly_the_floor() -> None:
             counts.add(int(row["_n_tool_candidates"]))
     assert counts == {4}, f"jitter=False still varied T: {sorted(counts)}"
     assert stats.get("jittered_rows", 0) == 0
+    # T12a: no jitter means no draw, so the histogram must stay absent rather
+    # than materialise as an empty-but-present key.
+    assert not stats.get("jitter_draw_hist")
+
+
+def test_tensorize_records_the_jitter_draw_histogram_on_kept_rows() -> None:
+    """T12a: ``jittered_rows`` counts DRAWS; the histogram counts SURVIVORS.
+
+    A draw that is later dropped (over-length, dead anchor) must not be counted
+    as a row the trainer saw, and a jitter collapsed onto one floor must be
+    visible as ``len(hist) == 1`` instead of looking like a healthy run.
+    """
+    tok = FakeTokenizer()
+    mb = CandidateMaskBuilder(max_seq_len=2048, max_span_width=16)
+    gt = _schema("get_weather", params=1)
+    pool = ToolPool([gt, *[_schema(f"tool_{i}") for i in range(7)]], seed=13)
+    stats: dict = {}
+    kept = 0
+    for i in range(40):
+        sample = UnifiedSample(
+            sample_id=f"jhist-{i}",
+            source_dataset="test",
+            utterance="weather in Tokyo",
+            tools=[gt],
+            ground_truth_calls=[
+                GroundTruthCall(tool_name="get_weather", arguments={"p0": "Tokyo"})
+            ],
+            current_time_iso="2026-11-09",
+            stratum=Stratum.F,
+        )
+        row = tensorize_sample_lean(
+            sample, tok, mb, max_seq_len=2048, tool_pool=pool, pack_tools=4,
+            stats=stats,
+        )
+        if row is not None:
+            kept += 1
+
+    hist = stats.get("jitter_draw_hist") or {}
+    assert hist, "jitter_draw_hist was never populated on the kept-row exit"
+    # Every surviving row contributes exactly one draw.
+    assert sum(int(v) for v in hist.values()) == kept
+    # And the histograms cannot out-count the draws (rows are only ever dropped).
+    assert kept <= int(stats.get("jittered_rows", 0))
+    # Floors are keyed by the realised value and bounded by the ceiling.
+    assert all(1 <= int(k) <= 4 for k in hist)
+    # Over 40 draws the sampler should NOT be degenerate (would mean the interval
+    # collapsed to pack_tools, indistinguishable from jitter=False in the render
+    # report). This is the exact defect T12a exists to expose.
+    assert len(hist) > 1, f"jitter degenerate: every draw landed on {list(hist)}"
 
 
 def test_tool_pool_degrades_honestly_when_smaller_than_pack_tools() -> None:
@@ -2766,5 +2981,283 @@ def test_eval_part1_does_not_double_count_a_repeated_whole_set(tmp_path) -> None
     assert metrics["pred_n_calls_hist"] == {"2": 1}   # not 4
     assert metrics["call_count_acc"] == 1.0
     assert metrics["call_exact_set_match"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# T12b: the coverage/recall universes must not be conflated
+# ---------------------------------------------------------------------------
+
+
+def _mixed_extractability_split(tmp_path, n: int = 2):
+    """Two params per row: ``city`` extractable, ``advice`` unextractable."""
+    records = []
+    for i in range(n):
+        records.append({
+            "sample_id": f"u{i}",
+            "source_dataset": "test",
+            "utterance": "weather in Tokyo",
+            "tools": [{
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": [
+                    {"name": "city", "description": "City", "param_type": "string",
+                     "required": True},
+                    {"name": "advice", "description": "Advice", "param_type": "string",
+                     "required": True},
+                ],
+            }],
+            "ground_truth_calls": [{
+                "tool_name": "get_weather",
+                "arguments": {"city": "Tokyo", "advice": "umbrella"},
+            }],
+            "current_time_iso": "2026-11-09",
+            "stratum": "F",
+            "target_spans": {
+                "city": [{"param_name": "city", "target_type": "utterance_span",
+                          "canonical_value": "Tokyo"}],
+                "advice": [{"param_name": "advice", "target_type": "unresolved"}],
+            },
+        })
+    return _write_split(tmp_path, records)
+
+
+def test_eval_coverage_and_recall_use_documented_denominators(tmp_path) -> None:
+    """``param_coverage`` / ALL gt params, ``extraction_recall`` / extractable only.
+
+    The two denominators are different on purpose. Reporting BOTH counts is what
+    makes that auditable instead of a reader having to infer it from source.
+    """
+    split = _mixed_extractability_split(tmp_path, n=2)
+    metrics = eval_param_extraction_lean(
+        split, resolver=_StubResolver({"city": "Tokyo"}), data_dir=str(tmp_path),
+        limit=10, max_param_gap_report=5,
+    )
+
+    assert metrics["fast_path_total_gt_params"] == 4        # 2 rows x 2 params
+    assert metrics["fast_path_extractable_gt_params"] == 2  # ``city`` only
+    assert metrics["fast_path_unextractable_gt_params"] == 2
+    # Partition is exhaustive, so a reader can never get a share > 1.
+    assert (metrics["fast_path_extractable_gt_params"]
+            + metrics["fast_path_unextractable_gt_params"]
+            == metrics["fast_path_total_gt_params"])
+    assert metrics["fast_path_param_coverage"] == 0.5       # 2 / 4
+    # ``advice`` is refused, which is CORRECT, and must not dent the headline.
+    assert metrics["extraction_recall"] == 1.0
+    # The all-GT rate: 2 correct retrievals out of 4 GT params.
+    assert metrics["fast_path_param_accuracy_all"] == 0.5
+
+
+def test_eval_strict_recall_never_exceeds_the_headline(tmp_path) -> None:
+    """T12b: a WRONG value must lower the strict rate, never the headline.
+
+    ``extraction_recall`` is ``tp / (tp + fn)``: a param answered incorrectly goes
+    to ``ex_fp`` and disappears from that denominator, so the headline can read
+    1.0 while half the answers are wrong. The strict rate counts wrong answers.
+    """
+    split = _mixed_extractability_split(tmp_path, n=2)
+    # Predicts a WRONG city for both rows: tp=0, wrong=2, fn=0.
+    metrics = eval_param_extraction_lean(
+        split, resolver=_StubResolver({"city": "Nowhere"}), data_dir=str(tmp_path),
+        limit=10, max_param_gap_report=5,
+    )
+
+    lenient = metrics["extraction_recall"]
+    strict = metrics["fast_path_param_accuracy_scored"]
+    assert metrics["pointer_wrong"] == 2
+    assert strict == 0.0, f"strict recall with 2 wrong answers must be 0, got {strict}"
+    if lenient == lenient:      # not NaN
+        assert strict <= lenient
+
+
+def test_eval_strict_recall_counts_wrong_answers_in_the_denominator(tmp_path) -> None:
+    """No wrong answers: strict collapses to the headline value."""
+    split = _mixed_extractability_split(tmp_path, n=1)
+    metrics = eval_param_extraction_lean(
+        split, resolver=_StubResolver({"city": "Tokyo"}), data_dir=str(tmp_path),
+        limit=10, max_param_gap_report=5,
+    )
+    assert metrics["extraction_recall"] == 1.0
+    assert metrics["fast_path_param_accuracy_scored"] == 1.0
+    # No wrong answers, so the strict universe collapses to the headline one.
+    assert metrics["fast_path_params_scored"] == 1
+
+
+# ---------------------------------------------------------------------------
+# T11: config placement must be the one the loader actually reads
+# ---------------------------------------------------------------------------
+
+
+def test_freeze_encoder_stages_loads_from_the_TRAINING_section(tmp_path) -> None:
+    """T11: the YAML knob lives under ``training``, not ``model``.
+
+    The notebook generator wrote it under ``model`` for a long time, which
+    ``TrainingConfig.from_yaml`` never reads -- so the setting was a SILENT
+    no-op and the run trained the whole encoder while claiming otherwise.
+    """
+    from spancall.train.config import TrainingConfig
+
+    yaml_path = tmp_path / "cfg.yaml"
+    yaml_path.write_text(
+        "model:\n"
+        "  freeze_encoder_stages: [T9]\n"       # wrong section: must be ignored
+        "training:\n"
+        "  freeze_encoder_stages: [T0, T1]\n"   # the real one
+    )
+    cfg = TrainingConfig.from_yaml(yaml_path)
+    assert cfg.freeze_encoder_stages == ["T0", "T1"]
+
+    # The wrong-section-only case degrades to the default (no freezing), which is
+    # exactly the silent no-op this test exists to prevent from regressing.
+    yaml_path.write_text("model:\n  freeze_encoder_stages: [T9]\n")
+    cfg = TrainingConfig.from_yaml(yaml_path)
+    assert cfg.freeze_encoder_stages == []
+
+
+# ---------------------------------------------------------------------------
+# T12c: logged losses are clamped at the metric boundary only
+# ---------------------------------------------------------------------------
+
+
+def test_log_loss_clamps_negative_but_preserves_nan() -> None:
+    """T12c: a -1e-4 bf16 artifact must log as 0.0; a real NaN stays visible."""
+    from spancall.lean.trainer import _log_loss
+
+    assert _log_loss(-1e-4) == 0.0
+    assert _log_loss(-5.0) == 0.0
+    assert _log_loss(0.0) == 0.0
+    assert _log_loss(2.5) == 2.5
+    # NaN must NOT be scrubbed to 0.0: that would report a diverged run as perfect.
+    nan = _log_loss(float("nan"))
+    assert nan != nan
+    # A non-numeric value degrades to 0.0 rather than raising mid-training.
+    assert _log_loss(None) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# T10: LoRA ablation wiring
+# ---------------------------------------------------------------------------
+
+
+def test_lora_config_defaults_are_off_and_round_trip(tmp_path) -> None:
+    """T10: LoRA must be OFF by default, and the loader must read its section.
+
+    ``training`` is the section ``TrainingConfig.from_yaml`` actually consults,
+    so a knob written anywhere else is a silent no-op.
+    """
+    from spancall.train.config import TrainingConfig
+
+    # Default: off, and the adapters' own LR is independent of the encoder's.
+    assert TrainingConfig().use_lora is False
+    assert TrainingConfig().lora_lr > TrainingConfig().optimization.learning_rate_encoder
+
+    yaml_path = tmp_path / "lora.yaml"
+    yaml_path.write_text(
+        "training:\n"
+        "  use_lora: true\n"
+        "  lora_r: 8\n"
+        "  lora_alpha: 16\n"
+        "  lora_dropout: 0.1\n"
+        "  lora_lr: 5.0e-4\n"
+        "  lora_target_modules: [q_proj, v_proj]\n"
+    )
+    cfg = TrainingConfig.from_yaml(yaml_path)
+    assert cfg.use_lora is True
+    assert cfg.lora_r == 8
+    assert cfg.lora_alpha == 16
+    assert cfg.lora_dropout == 0.1
+    assert cfg.lora_lr == 5e-4
+    assert cfg.lora_target_modules == ["q_proj", "v_proj"]
+
+
+def test_build_optimizer_groups_isolates_adapters_at_their_own_lr() -> None:
+    """T10: ``lora_*`` params must NOT inherit the layer-decayed encoder LR.
+
+    They live under ``backbone.``, so without the explicit branch they would be
+    swept into the deepest encoder group (~2e-5) and never move at the adapter
+    LR the config asks for.
+    """
+
+    class _Enc(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.hidden_dim = 8
+            self.emb = nn.Linear(4, 8)
+            # ``backbone.backbone.layers`` is one of the paths the builder walks,
+            # so this exercises the real layer-decay discovery instead of a stub.
+            self.backbone = nn.Module()
+            self.backbone.layers = nn.ModuleList([nn.Linear(8, 8) for _ in range(2)])
+
+        def forward(self, ids, mask=None, ttype=None):  # pragma: no cover - unused
+            return None
+
+    model = LeanSpanCallModel(_Enc())
+    # Simulate what peft does: an adapter parameter under the backbone namespace.
+    model.backbone.register_parameter("lora_A_probe", nn.Parameter(torch.zeros(2, 2)))
+
+    groups = build_lean_optimizer_groups(
+        model, lr_encoder=2e-5, lr_head=1e-4, lora_lr=1e-3,
+    )
+    by_lr = {round(float(g["lr"]), 10): g for g in groups}
+    assert 1e-3 in by_lr, f"no adapter group at lora_lr; lrs={sorted(by_lr)}"
+
+    adapter_groups = [g for g in groups if g["lr"] == 1e-3]
+    assert len(adapter_groups) == 1
+    names = {
+        n for n, p in model.named_parameters()
+        if any(p is q for q in adapter_groups[0]["params"])
+    }
+    assert names == {"backbone.lora_A_probe"}, names
+
+    # Without ``lora_lr`` nothing changes: the probe falls back to the encoder
+    # groups, which is the pre-T10 behaviour every existing run depends on.
+    legacy = build_lean_optimizer_groups(model, lr_encoder=2e-5, lr_head=1e-4)
+    assert all(g["lr"] != 1e-3 for g in legacy)
+
+
+def test_apply_lora_fails_loudly_when_peft_is_missing(monkeypatch) -> None:
+    """T10: a missing ``peft`` must raise, never silently full-fine-tune.
+
+    Silently training a different model than the config asked for is exactly the
+    class of defect this investigation already caught with `freeze_encoder_stages`.
+    """
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _no_peft(name, *args, **kwargs):
+        if name == "peft" or name.startswith("peft."):
+            raise ImportError("No module named 'peft'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _no_peft)
+
+    class _Enc(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.hidden_dim = 8
+            self.emb = nn.Linear(4, 8)
+
+    with pytest.raises(RuntimeError, match="requires the `peft` package"):
+        apply_lora(LeanSpanCallModel(_Enc()), r=4, alpha=8)
+
+
+def test_trainer_provenance_records_whether_lora_was_used(tmp_path) -> None:
+    """T10: provenance.json must distinguish the two ablation arms."""
+    import json
+
+    class _Enc(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.hidden_dim = 8
+            self.emb = nn.Linear(4, 8)
+
+    trainer = LeanTrainer(LeanSpanCallModel(_Enc()), config=None, device="cpu")
+    assert trainer.lora_enabled is False
+    path = trainer.save_checkpoint(str(tmp_path / "ckpt"))
+    meta = json.loads((tmp_path / "ckpt" / "provenance.json").read_text())
+
+    assert meta["use_lora"] is False
+    assert meta["lora_param_count"] == 0
+    assert path.endswith("model.pt")
 
 

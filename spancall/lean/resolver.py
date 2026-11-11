@@ -185,6 +185,11 @@ class LeanResolver:
     # a TypeError silently swallowed would quietly restore the oracle-tool
     # prompt (R0.2) while looking like a successful evaluation run.
     supports_context_schemas: bool = True
+    # T1 capability flag, same contract as ``supports_context_schemas``: eval
+    # code checks this instead of catching TypeError. A swallowed TypeError
+    # would silently drop the instrumentation and report parity as "n/a", which
+    # reads like a clean run rather than a missing measurement.
+    supports_candidate_parity: bool = True
 
     def __init__(
         self,
@@ -204,6 +209,9 @@ class LeanResolver:
         max_calls: int = 1,
         call_min_prob: float = 0.25,
         call_min_prob_ratio: float = 0.5,
+        candidate_pack_fill: str = "stratified",
+        min_confidence: Optional[float] = None,
+        min_posterior: Optional[float] = None,
         **kwargs: Any,
     ) -> None:
         if model is None and encoder is not None:
@@ -218,12 +226,45 @@ class LeanResolver:
         )
         self.max_span_width = int(max_span_width)
         self.temperature = float(temperature)
-        self.decoder = decoder or LeanJointDecoder(top_k=3, normalize_scores=False)
+        # T6: refusal on the decode axis. These are opt-in (None = never refuse)
+        # so the default resolver stays byte-identical to the pre-T6 pipeline.
+        # They are passed to the decoder through this constructor rather than
+        # being mutated afterwards so an injected decoder cannot be left with a
+        # stale threshold from a previous experiment.
+        self.min_confidence = float(min_confidence) if min_confidence is not None else None
+        self.min_posterior = float(min_posterior) if min_posterior is not None else None
+        self.decoder = decoder or LeanJointDecoder(
+            top_k=3,
+            normalize_scores=False,
+            min_confidence=self.min_confidence,
+            min_posterior=self.min_posterior,
+        )
+        if decoder is not None:
+            # An injected decoder keeps its own other knobs but must honour this
+            # resolver's refusal policy; otherwise ``min_confidence=0.4`` here
+            # would silently do nothing.
+            decoder.min_confidence = self.min_confidence
+            decoder.min_posterior = self.min_posterior
         self.caster = caster or StrictTypeCaster()
         self.validator = validator or SchemaValidator()
         self.k_recent = int(k_recent)
         self.context_budget_tokens = int(context_budget_tokens)
         self.max_cands = int(max_cands) if max_cands is not None else None
+        # Candidate-retention policy when ``max_cands`` truncates a mask.
+        #
+        # ``stratified`` (default) reproduces the trainer's retention rule: keep
+        # every structured context slot, then spread the remaining budget over
+        # the whole utterance. ``head`` is the legacy serve-time behaviour that
+        # kept only the prompt's earliest utterance spans — which is why a GT
+        # value appearing later in the utterance was never even a candidate at
+        # serve time, while it always was during training. Kept selectable so the
+        # parity experiment (same model, two pack policies) stays runnable.
+        fill = str(candidate_pack_fill or "stratified").lower()
+        if fill not in ("head", "stratified"):
+            raise ValueError(
+                f"candidate_pack_fill must be 'head' or 'stratified', got {candidate_pack_fill!r}"
+            )
+        self.candidate_pack_fill = fill
         # R0.4: how many tool calls may be emitted. ``max_calls=1`` (default)
         # preserves the single-call contract exactly; a sample that genuinely
         # needs two calls opts in. The count itself is a decision the model does
@@ -232,6 +273,11 @@ class LeanResolver:
         self.max_calls = max(int(max_calls), 1)
         self.call_min_prob = float(call_min_prob)
         self.call_min_prob_ratio = float(call_min_prob_ratio)
+        # T3: why the LAST ``_tool_scores`` call returned nothing. Eval reads this
+        # to attribute an empty ``tool_scores`` row to a specific serve-side cause
+        # (no anchors / anchor loss / class mismatch) instead of treating it as a
+        # model outcome. Initialised here so the attribute always exists.
+        self.last_tool_scores_reason: str = "uninitialized"
 
         if model_path is not None:
             self.load_checkpoint(model_path)
@@ -322,6 +368,7 @@ class LeanResolver:
                 "tool_scores": [],
                 "gated_hit": False,
                 "abstain_reason": f"sanitize: {exc}",
+                "tool_scores_reason": "sanitize_error",
             }
 
         choices = self._tool_scores(output, H, per_token)
@@ -333,7 +380,10 @@ class LeanResolver:
                 "tool_margin": 0.0,
                 "tool_scores": [],
                 "gated_hit": False,
-                "abstain_reason": "no_tool_scores",
+                # T3: the concrete cause, not just "no scores". An eval row can
+                # then say "anchor_loss:1of2" instead of blaming H1.
+                "abstain_reason": f"no_tool_scores:{self.last_tool_scores_reason}",
+                "tool_scores_reason": self.last_tool_scores_reason,
             }
 
         winner_name, winner_p = choices[0]
@@ -350,6 +400,9 @@ class LeanResolver:
             "tool_scores": choices,
             "gated_hit": True,
             "abstain_reason": None,
+            # "ok" on the normal path; "anchor_loss:kofN" / "class_mismatch:..."
+            # still yields scores but flags a degraded layout (T3).
+            "tool_scores_reason": self.last_tool_scores_reason,
         }
 
     def try_resolve_candidates(
@@ -419,6 +472,9 @@ class LeanResolver:
             "enc_ms": (time.perf_counter() - t_enc) * 1000,
             "tool_scores": dict(choices),
             "temperature": self.temperature,
+            # T3: same attribution as ``predict_tool`` so Part-2 and Part-3 can
+            # never disagree about why H1 produced no distribution.
+            "tool_scores_reason": self.last_tool_scores_reason,
         }
         if not choices:
             features["n_tool_anchors"] = 0
@@ -426,8 +482,10 @@ class LeanResolver:
             return LeanResolveResult(
                 hit=False,
                 status="abstain",
-                abstain_reason="no_tool_scores",
-                error_reason="no_tool_scores",
+                # T3: carry the cause in the reason itself; "no_tool_scores"
+                # alone was indistinguishable across four different defects.
+                abstain_reason=f"no_tool_scores:{self.last_tool_scores_reason}",
+                error_reason=f"no_tool_scores:{self.last_tool_scores_reason}",
                 latency_ms=(time.perf_counter() - t0) * 1000,
                 features=features,
             )
@@ -496,6 +554,8 @@ class LeanResolver:
         raw_mode: Optional[bool] = None,
         context_schemas: Optional[Sequence[ToolDefinition]] = None,
         call_schemas: Optional[Sequence[ToolDefinition]] = None,
+        parity_spans: Optional[Dict[str, Sequence[Tuple[str, str]]]] = None,
+        protect_parity_spans: bool = False,
     ) -> LeanResolveResult:
         """Resolve a single tool call.
 
@@ -513,9 +573,19 @@ class LeanResolver:
                 and appended to ``calls``. ``schema``'s own result still
                 populates ``tool_name``/``payload``, so single-call callers are
                 unaffected.
+            parity_spans: T1 candidate-parity hook. ``{param_name:
+                [(char_start, char_end), ...]}`` GT spans whose presence in the
+                candidate set is reported in ``features["parity_hit"]``.
+                Evaluation-only; leave ``None`` in production so the mask
+                builder takes its fastest path.
+            protect_parity_spans: T2 switch. When True the same spans are also
+                forced past a ``max_cands`` truncation, which is the parity fix
+                under test. Keep it False when *measuring* the defect — with
+                protection on, parity is perfect by construction.
         """
         res = self._resolve(
-            schema, utterance, recent_context, now, context_schemas=context_schemas
+            schema, utterance, recent_context, now, context_schemas=context_schemas,
+            parity_spans=parity_spans, protect_parity_spans=protect_parity_spans,
         )
         extra = [s for s in (call_schemas or ()) if s.name != schema.name]
         if not extra:
@@ -524,7 +594,10 @@ class LeanResolver:
         for other in extra:
             if not any(r.name == other.name for r in render):
                 render = [*render, other]
-            part = self._resolve(other, utterance, recent_context, now, context_schemas=render)
+            part = self._resolve(
+                other, utterance, recent_context, now, context_schemas=render,
+                parity_spans=parity_spans, protect_parity_spans=protect_parity_spans,
+            )
             res.calls.append(_call_from_result(part, len(res.calls)))
         res.features["n_calls"] = len(res.calls)
         return res
@@ -537,7 +610,19 @@ class LeanResolver:
         now: Optional[Any],
         encoded_bundle: Optional[Tuple[SpanTemplateOutput, torch.Tensor, Sequence[Optional[Entry]], Dict[str, Any]]] = None,
         context_schemas: Optional[Sequence[ToolDefinition]] = None,
+        parity_spans: Optional[Dict[str, Sequence[Tuple[str, str]]]] = None,
+        protect_parity_spans: bool = False,
     ) -> LeanResolveResult:
+        # T1/T2 split, deliberately two switches:
+        #   ``parity_spans`` alone      -> DIAGNOSIS. Report whether each GT span
+        #                                  is inside the candidate set the model
+        #                                  was actually given. Protection stays
+        #                                  off, so the number is the real miss.
+        #   ``protect_parity_spans``    -> FIX under test. Same spans are also
+        #                                  forced past ``max_cands`` truncation.
+        # Fusing them would make every diagnosis report a trivially perfect
+        # parity rate, which is precisely the bug that section 3.3 describes.
+        protected_spans = parity_spans if protect_parity_spans else None
         # ``render_schemas`` is what actually goes into the prompt; ``schema`` is
         # only what we score. Keeping them separate is the whole point of R0.2.
         render_schemas: List[ToolDefinition] = list(context_schemas) if context_schemas else [schema]
@@ -573,7 +658,8 @@ class LeanResolver:
                 output.text, return_offsets_mapping=True, add_special_tokens=False
             )["offset_mapping"]
             cand_masks, _ctx = self._candidate_masks(
-                output, output.text, [schema], token_offsets=offset_map
+                output, output.text, [schema], token_offsets=offset_map,
+                protected_spans=protected_spans,
             )
             t_mask = time.perf_counter()
             # In the bundle path the prompt was already rendered by
@@ -620,7 +706,8 @@ class LeanResolver:
                 )
                 text = output.text
                 cand_masks, _ctx = self._candidate_masks(
-                    output, text, [schema], token_offsets=token_offsets
+                    output, text, [schema], token_offsets=token_offsets,
+                    protected_spans=protected_spans,
                 )
                 t_mask = time.perf_counter()
                 H, _cls_h = self._encode(ids)
@@ -683,6 +770,11 @@ class LeanResolver:
             per_param_scores, entity_classes=entity_classes, top_k=3
         )
         t_post = time.perf_counter()
+        # T6: a param the decoder explicitly refused. Surfaced separately from
+        # "missing" so Part-1 can report an honest abstention instead of scoring
+        # it as a retrieval miss — those are different failures with different
+        # fixes (threshold calibration vs candidate coverage).
+        decode_refusals: Dict[str, str] = dict(getattr(self.decoder, "last_refusals", {}) or {})
 
         margins = self._param_margins(per_param_scores, param_names)
 
@@ -754,12 +846,16 @@ class LeanResolver:
                         payload_partial[p.name] = p.default
                     else:
                         missing_optional.append(p.name)
+                # Distinguish "the decoder refused to pick" from "there was no
+                # candidate to pick". Both land in the same missing branch, but
+                # only the first is a T6 abstention the caller can act on.
+                src = "refused" if p.name in decode_refusals else "missing"
                 parameters[p.name] = LeanParameterResolution(
                     name=p.name,
                     value=None,
                     confidence=0.0,
                     margin=0.0,
-                    source_type="missing",
+                    source_type=src,
                     char_span=None,
                     p_abstain=0.0,
                 )
@@ -782,6 +878,32 @@ class LeanResolver:
         conf_values = [pr.confidence for pr in parameters.values() if pr.value is not None]
         overall_conf = sum(conf_values) / len(conf_values) if conf_values else (1.0 if is_hit else 0.0)
 
+        # T1 candidate-parity telemetry. ``cands_per_param`` is the candidate
+        # set size H3 actually chose from; ``cand_pack_fill`` names the retention
+        # policy; ``parity_checked``/``parity_hit`` say whether the instrumented
+        # GT span survived truncation. A low recall with ``parity_hit`` near 1.0
+        # means the model picked the wrong candidate; a low recall with
+        # ``parity_hit`` near 0.0 means the GT span was never offerable — the
+        # train/serve defect (§3.3), which no amount of training data can fix.
+        # NOTE: measured against ``parity_spans`` (the requested set), never
+        # against ``protected_spans`` — otherwise the diagnosis would only run
+        # when the fix was also on, and would then always report 1.0.
+        parity_checked = 0
+        parity_hit = 0
+        if parity_spans:
+            for p_name, spans in parity_spans.items():
+                key = self._mask_key(schema.name, p_name)
+                m = cand_masks.get(key)
+                if m is None or not spans:
+                    continue
+                have = {
+                    (int(getattr(c, "char_start", -1)), int(getattr(c, "char_end", -1)))
+                    for c in m["candidates"]
+                }
+                for cs, ce in spans:
+                    parity_checked += 1
+                    if (int(cs), int(ce)) in have:
+                        parity_hit += 1
         features = {
             **ctx_features,
             "pre_ms": (t_pre - t0) * 1000,
@@ -795,6 +917,19 @@ class LeanResolver:
             "n_params": len(schema.parameters),
             "n_resolved": len(payload_partial),
             "abstain_p": 0.0,
+            "cand_pack_fill": self.candidate_pack_fill,
+            "cand_cap": self.max_cands if self.max_cands is not None else -1,
+            "cands_per_param": {
+                self._mask_key(schema.name, k.split("::")[-1]): int(v.get("num_candidates", 0))
+                for k, v in cand_masks.items()
+                if k.startswith(f"{schema.name}::")
+            },
+            "parity_checked": int(parity_checked),
+            "parity_hit": int(parity_hit),
+            "decode_refusals": decode_refusals,
+            "n_decode_refusals": len(decode_refusals),
+            "min_confidence": self.min_confidence,
+            "min_posterior": self.min_posterior,
         }
 
         return _with_calls(LeanResolveResult(
@@ -851,6 +986,7 @@ class LeanResolver:
         text: str,
         schemas: Sequence[ToolDefinition],
         token_offsets: Optional[Sequence[Tuple[int, int]]] = None,
+        protected_spans: Optional[Dict[str, Sequence[Tuple[str, str]]]] = None,
     ) -> Tuple[Dict[str, Dict[str, Any]], Any]:
         """Build candidate sets for every parameter of every rendered schema.
 
@@ -862,6 +998,12 @@ class LeanResolver:
         ``token_offsets`` must be the offsets from the SAME tokenization that
         produced ``output``; when omitted we fall back to a self-consistent local
         encode, but every in-resolver caller passes it.
+
+        ``protected_spans`` is the candidate-parity instrumentation hook (T1):
+        ``{mask_key: [(char_start, char_end), ...]}`` names GT spans that must
+        survive a ``max_cands`` truncation. Without it, a parity experiment can
+        only prove that recall is low, never that the *candidate set* was the
+        reason — the GT span could have been dropped before scoring.
         """
         from spancall.model.masks import CandidateMaskBuilder, _RowCtx
 
@@ -873,6 +1015,7 @@ class LeanResolver:
         builder = CandidateMaskBuilder(
             max_seq_len=self.max_seq_len, max_span_width=self.max_span_width
         )
+        builder.pack_fill = self.candidate_pack_fill
         entries = output.entries
         max_tok = builder._effective_max_seq_len(offsets)
         ctx = _RowCtx.for_row(entries, offsets, max_tok)
@@ -883,20 +1026,78 @@ class LeanResolver:
         built: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
         for schema in schemas:
             for p in schema.parameters:
+                # Accept BOTH key forms. ``try_resolve`` documents
+                # ``{param_name: spans}`` (that is what the eval harness builds
+                # from a sample's ``target_spans``), while the resolver's own
+                # internal key is ``tool::param`` (R3: a distractor schema may
+                # share a parameter name). Looking up only the qualified key
+                # made protection a silent no-op for every caller that followed
+                # the documented contract -- the T2 "fix" did nothing at all,
+                # and the experiment would have reported "fix has no effect".
+                _p_spans = ()
+                if protected_spans:
+                    _p_spans = (
+                        protected_spans.get(self._mask_key(schema.name, p.name))
+                        or protected_spans.get(p.name)
+                        or ()
+                    )
                 sig = (
                     p.name,
                     p.param_type,
                     tuple(p.enum) if p.enum else None,
                     p.entity_class,
+                    # A protected set changes the retained candidates, so masks
+                    # with different protection must not alias.
+                    tuple(_p_spans) if protected_spans else None,
                 )
                 m = built.get(sig)
                 if m is None:
+                    builder.pack_protected = self._protected_token_spans(
+                        ctx, entries, offsets, protected_spans,
+                        self._mask_key(schema.name, p.name), p.name,
+                    )
                     m = builder.build_param_masks(
                         p, entries, offsets, text, ctx=ctx, max_cands=self.max_cands
                     )
                     built[sig] = m
                 masks[self._mask_key(schema.name, p.name)] = m
+        builder.pack_protected = None
         return masks, ctx
+
+    @staticmethod
+    def _protected_token_spans(
+        ctx: Any,
+        entries: Sequence[Any],
+        offsets: Sequence[Tuple[int, int]],
+        protected_spans: Optional[Dict[str, Sequence[Tuple[str, str]]]],
+        mask_key: str,
+        param_name: Optional[str] = None,
+    ) -> Optional[set]:
+        """Map GT char spans to token pairs so ``_pack`` can protect them (T1).
+
+        Returns ``None`` when nothing is protected for this mask, which keeps
+        the fast path allocation-free for the normal (non-instrumented) case.
+        A char span that does not snap onto token boundaries protects nothing:
+        the pointer head could never have scored it anyway.
+
+        ``spans`` is resolved from the qualified ``mask_key`` first and the bare
+        ``param_name`` second: the public contract for ``try_resolve`` is
+        ``{param_name: spans}``, so accepting only ``tool::param`` silently
+        disabled protection for every documented caller (T2 was a no-op).
+        """
+        if not protected_spans:
+            return None
+        spans = protected_spans.get(mask_key) or (
+            protected_spans.get(param_name) if param_name else None
+        ) or ()
+        if not spans:
+            return None
+        out: set = set()
+        for cs, ce in spans:
+            snapped = ctx.snap_char_range(int(cs), int(ce))
+            if snapped is not None:
+                out.add((int(snapped[0]), int(snapped[1])))
+        return out or None
 
     def _score_parameters(
         self,
@@ -982,8 +1183,20 @@ class LeanResolver:
         H: torch.Tensor,
         per_token: Sequence[Optional[Entry]],
     ) -> List[Tuple[str, float]]:
-        """H1 softmax over <|tool|> anchors (bridge_text with e.tool != None), descending."""
-        if self.model is None or self.model.tool_head is None:
+        """H1 softmax over <|tool|> anchors (bridge_text with e.tool != None), descending.
+
+        T3: an empty return used to be indistinguishable from a real H1 result of
+        "no anchors", so an eval row with ``tool_scores == []`` looked like a
+        model outcome when it was actually a *serve-side* failure. The concrete
+        trigger is now recorded in ``self.last_tool_scores_reason`` and surfaced
+        by every caller, so "0 scores" can be attributed instead of guessed at.
+        """
+        self.last_tool_scores_reason = "ok"
+        if self.model is None:
+            self.last_tool_scores_reason = "no_model"
+            return []
+        if self.model.tool_head is None:
+            self.last_tool_scores_reason = "no_tool_head"
             return []
 
         positions = [
@@ -992,7 +1205,20 @@ class LeanResolver:
             if e is not None and e.kind == "bridge_text" and e.tool is not None
         ]
         if not positions:
+            # The rendered prompt carries no ``<|tool|>`` bridge anchor at all.
+            # Either the template omitted it or tokenization dropped the owning
+            # entry — both are layout defects, never a model abstention.
+            self.last_tool_scores_reason = "no_tool_anchors"
             return []
+        n_rendered = sum(
+            1 for e in output.entries
+            if getattr(e, "kind", None) == "bridge_text" and getattr(e, "tool", None) is not None
+        )
+        if len(positions) != n_rendered:
+            # Tokens were lost between parse and tokenize. Recorded, not raised:
+            # the surviving anchors still produce a usable distribution, but the
+            # mismatch must be visible in eval instead of silently shrinking T.
+            self.last_tool_scores_reason = f"anchor_loss:{len(positions)}of{n_rendered}"
 
         device = H.device
         max_tok_idx = max(H.size(1) - 1, 0)
@@ -1005,6 +1231,10 @@ class LeanResolver:
             tp = torch.softmax(tl / max(self.temperature, 1e-6), dim=-1)
 
         names = [t.name for t in output.tools]
+        if int(tp.size(-1)) != len(names):
+            # H1's class count must equal the rendered tool count; a mismatch
+            # means the head was trained/loaded against a different tool layout.
+            self.last_tool_scores_reason = f"class_mismatch:{int(tp.size(-1))}vs{len(names)}"
         choices = [
             (names[i] if i < len(names) else f"tool{i}", float(tp[0, i].detach().item()))
             for i in range(tp.size(-1))

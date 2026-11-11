@@ -449,18 +449,33 @@ class ReverseAligner(BaseAligner):
 
     # ------------------------------------------------------------- internals
     def _infer_json_mode_schemas(self, sample: UnifiedSample) -> UnifiedSample:
-        """Replace empty-param tools used by json-mode rows with inferred schemas."""
+        """Replace empty-param tools used by json-mode rows with inferred schemas.
+
+        T7: the lookup is BY GT TOOL NAME, so it only works when the loader gave
+        the tool and the GT call the same name. When they disagree (the old
+        ``schema.title`` vs hardcoded ``json_output`` defect) this loop silently
+        did nothing and every json-mode row reached training with a parameterless
+        tool. The mismatch is now recorded on the sample instead of vanishing.
+        """
         new_tools = list(sample.tools)
+        tool_names = {t.name for t in new_tools}
+        unmatched: List[str] = []
         for gt in sample.ground_truth_calls:
             idx = next(
                 (i for i, t in enumerate(new_tools) if t.name == gt.tool_name),
                 None,
             )
             if idx is None:
+                unmatched.append(gt.tool_name)
                 continue
             updated, changed = _infer_schema_from_arguments(gt, new_tools[idx])
             if changed:
                 new_tools[idx] = updated
+        if unmatched:
+            # Metadata is a plain dict on UnifiedSample, so this cannot fail; it
+            # exists purely to make the alias defect observable downstream.
+            sample.metadata["json_mode_gt_tool_missing"] = sorted(set(unmatched))
+            sample.metadata["json_mode_tool_names"] = sorted(tool_names)
         sample.tools = new_tools
         return sample
 

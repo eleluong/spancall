@@ -133,3 +133,121 @@ def test_syntax_error_blocks(guard) -> None:
 
 def test_markdown_cells_are_ignored(guard) -> None:
     assert not _blocks(guard, [{"cell_type": "markdown", "source": "not Python at all"}])
+
+
+# ---------------------------------------------------------------------------
+# T10: the LoRA ablation cell must route knobs to the TRAINING section
+# ---------------------------------------------------------------------------
+
+ABLATION_CELL_MARKER = "# ---- T10: LoRA vs full-FT ablation"
+
+
+def _ablation_cell_source() -> str:
+    """Load the T10 ablation cell out of the generated notebook, if present."""
+    import json
+
+    nb_path = Path(BUILD_SCRIPT).resolve().parents[1] / "notebooks" / "spancall_lean_train_eval_test.ipynb"
+    if not nb_path.exists():
+        pytest.skip("generated notebook missing; run scripts/build_lean_colab_notebook.py")
+    nb = json.loads(nb_path.read_text(encoding="utf-8"))
+    for c in nb.get("cells", []):
+        src = c.get("source", "")
+        src = src if isinstance(src, str) else "".join(src)
+        if src.startswith(ABLATION_CELL_MARKER):
+            return src
+    pytest.skip("T10 ablation cell not found in the generated notebook")
+
+
+def _run_ablation_cell(tmp_path, monkeypatch) -> Dict[str, Any]:
+    """Execute the ablation cell with the flag OFF and return its namespace."""
+    import json
+
+    import yaml
+
+    src = _ablation_cell_source()
+    cfg_path = tmp_path / "colab.yaml"
+    cfg_path.write_text(
+        yaml.safe_dump(
+            {
+                "experiment": {"name": "x", "seed": 42},
+                "model": {"max_seq_len": 4096},
+                "training": {"gradient_accumulation_steps": 4},
+                "optimization": {"num_epochs": 5},
+                "data": {"pack_tools": 4, "fraction": 0.2},
+            }
+        ),
+        encoding="utf-8",
+    )
+    ns: Dict[str, Any] = {
+        "RESULTS_DIR": str(tmp_path),
+        "TENSOR_DIR": str(tmp_path / "t"),
+        "DEVICE": "cpu",
+        "SEED": 42,
+        "NUM_EPOCHS": 5,
+        "TRAIN_FRACTION": 0.2,
+        "PACK_TOOLS": 4,
+        "CONFIG_PATH": str(cfg_path),
+    }
+    exec(compile(src, "<t10 ablation cell>", "exec"), ns)
+    assert ns["RUN_LORA_ABLATION"] is False, "the ablation must be opt-in"
+    return ns
+
+
+def test_lora_ablation_cell_is_default_off_and_writes_training_section(tmp_path) -> None:
+    """T10/T11 regression: LoRA knobs under ``model:`` are a silent no-op."""
+    import yaml
+
+    ns = _run_ablation_cell(tmp_path, None)
+    base = yaml.safe_load(open(ns["CONFIG_PATH"]))
+
+    lora_path = ns["_write_arm_config"](base, True, "arm_lora", str(tmp_path / "out"))
+    written = yaml.safe_load(open(lora_path))
+
+    # The knobs must land in `training`, the only section TrainingConfig reads.
+    assert written["training"]["use_lora"] is True
+    assert written["training"]["lora_r"] == ns["LORA_R"]
+    assert written["training"]["lora_alpha"] == ns["LORA_ALPHA"]
+    assert written["training"]["lora_lr"] == ns["LORA_LR"]
+    assert (written.get("model") or {}).get("use_lora") is None, (
+        "use_lora written under `model:` would be a silent no-op"
+    )
+
+    # And they must actually be READ by the real loader.
+    from spancall.train.config import TrainingConfig
+
+    cfg = TrainingConfig.from_yaml(lora_path)
+    assert cfg.use_lora is True
+    assert cfg.lora_r == ns["LORA_R"]
+    assert cfg.lora_lr == ns["LORA_LR"]
+
+    ft_path = ns["_write_arm_config"](base, False, "arm_ft", str(tmp_path / "out"))
+    assert TrainingConfig.from_yaml(ft_path).use_lora is False
+
+
+def test_lora_ablation_arms_differ_only_in_use_lora(tmp_path) -> None:
+    """The A/B is only interpretable if every other knob is identical."""
+    import yaml
+
+    ns = _run_ablation_cell(tmp_path, None)
+    base = yaml.safe_load(open(ns["CONFIG_PATH"]))
+    ft = yaml.safe_load(open(ns["_write_arm_config"](base, False, "ft", str(tmp_path))))
+    lora = yaml.safe_load(open(ns["_write_arm_config"](base, True, "lora", str(tmp_path))))
+
+    assert ft["training"]["use_lora"] is False
+    assert lora["training"]["use_lora"] is True
+    for section in ("optimization", "data", "model"):
+        assert ft.get(section) == lora.get(section), f"{section} must not differ between arms"
+    assert ft["optimization"]["num_epochs"] == ns["LORA_ABLATION_EPOCHS"]
+    assert lora["optimization"]["num_epochs"] == ns["LORA_ABLATION_EPOCHS"]
+
+
+def test_lora_ablation_summary_survives_a_missing_arm(tmp_path) -> None:
+    """An arm that crashed mid-run must report n/a, not raise or invent zeros."""
+    import math
+
+    ns = _run_ablation_cell(tmp_path, None)
+    summary = ns["_arm_summary"](str(tmp_path / "absent"), "absent")
+
+    assert summary["lora_param_count"] is None
+    for key in ("final_train_loss", "dev_span_acc", "dev_exact_call", "dev_tool_acc"):
+        assert math.isnan(summary[key]), f"{key} must be NaN ('never measured'), not 0.0"

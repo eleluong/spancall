@@ -123,16 +123,35 @@ def _gt_params(gt_args: Dict[str, Any], schema: Any) -> Dict[str, Any]:
 def _predicted_calls(res: Any) -> List[Any]:
     """The predicted call list of a resolver result (J6 / R0.4).
 
+    **The single definition of "a predicted call"**, shared with Part 3.
+
     A resolver that decoded the call axis exposes ``calls``; an old stub does
     not. In that case a result naming a tool is exactly ONE call, and a result
     naming none is zero calls — so ``call_count_acc`` stays honest instead of
     assuming the legacy path was multi-call or inventing a call that was never
     predicted.
+
+    T8: a call must NAME A TOOL to count. ``LeanResolveResult.calls`` is
+    populated for every emitted call even when the payload is empty, so counting
+    ``len(res.calls)`` (what Part 3 used to do) counted a fully-abstained decode
+    as a predicted call, while Part 1 filtered it out — the two parts reported
+    different call counts for the same resolver output. A call with no tool name
+    asserts nothing, so it is not a prediction; keep that rule in exactly one
+    place and have both parts call it.
     """
     calls = getattr(res, "calls", None)
     if calls:
         return [c for c in calls if getattr(c, "tool_name", None)]
     return [res] if getattr(res, "tool_name", None) else []
+
+
+def predicted_call_count(res: Any) -> int:
+    """Number of calls that actually name a tool (T8, Part-3 parity).
+
+    A thin wrapper over :func:`_predicted_calls` so the notebook's prediction
+    records cannot drift back to ``len(res.calls)``.
+    """
+    return len(_predicted_calls(res))
 
 
 def _call_identity(call: Any) -> Tuple[str, str]:
@@ -223,12 +242,39 @@ def _fmt(v: Any, nd: int = 4) -> str:
 # Evaluation driver
 # --------------------------------------------------------------------------- #
 
+def _parity_spans_for_call(sample: UnifiedSample, call_index: int) -> Dict[str, List[Tuple[int, int]]]:
+    """T1: GT ``(char_start, char_end)`` spans per param for ONE call.
+
+    Only extractable targets with a usable span can be parity-checked: an
+    ``unresolved`` target has no span to offer, and a context-derived target
+    (``canonical_value`` only) has no span in the utterance. Those are the
+    correct refusals the retrieval-first contract already accounts for, so
+    including them would inflate the parity failure rate for the wrong reason.
+    """
+    out: Dict[str, List[Tuple[int, int]]] = {}
+    for pname, targets in (sample.targets_for_call(call_index) or {}).items():
+        spans: List[Tuple[int, int]] = []
+        for t in targets:
+            if t.target_type in NON_EXTRACTABLE_TARGET_TYPES:
+                continue
+            cs = getattr(t, "char_start", None)
+            ce = getattr(t, "char_end", None)
+            if cs is None or ce is None:
+                continue
+            spans.append((int(cs), int(ce)))
+        if spans:
+            out[pname] = spans
+    return out
+
+
 def eval_param_extraction_lean(
     split_name: str,
     resolver: Any,
     data_dir: str,
     limit: Optional[int] = 500,
     max_param_gap_report: int = 20,
+    measure_candidate_parity: bool = True,
+    protect_parity_spans: bool = False,
 ) -> Dict[str, Any]:
     """Run retrieval-first param-extraction eval on a canonical split.
 
@@ -240,6 +286,22 @@ def eval_param_extraction_lean(
         data_dir: directory containing ``{split_name}.jsonl``.
         limit: max samples to score (reported via ``truncation``).
         max_param_gap_report: cap on per-param table rows printed.
+        measure_candidate_parity: T1 instrumentation. When True (default) every
+            extractable GT span is checked for membership in the candidate set
+            H3 was actually given, and the survival rate is reported as
+            ``candidate_parity``. This is the number that distinguishes "the
+            model picked wrong" from "the answer was never offerable" — the
+            train/serve defect this eval exists to expose. Resolvers without
+            the instrumented signature are silently skipped (the metric is
+            reported as n/a rather than fabricated).
+        protect_parity_spans: T2 fix-under-test switch, default False. When True
+            the same GT spans are additionally forced past a ``max_cands``
+            truncation, so ``candidate_parity`` should go to ~1.0 and the eval
+            headroom (``extraction_recall`` minus the parity-limited ceiling)
+            becomes measurable. This MUST stay a separate flag from
+            ``measure_candidate_parity``: protection without measurement would
+            make the diagnosis self-fulfilling. Requires a resolver exposing
+            ``supports_candidate_parity``; ignored otherwise.
 
     Returns:
         A dict of metrics (also printed as a human-readable report).
@@ -282,6 +344,13 @@ def eval_param_extraction_lean(
     refused_unextractable = 0
     missed_extractable = 0
     pointer_wrong = 0                   # pred present and != GT (nulls included)
+    # T12b: extractable GT params where a value WAS predicted but it is wrong.
+    # These land in ``ex_fp``, which also collects predictions for params that are
+    # not in the GT at all -- so ``ex_fp`` cannot serve as the "wrong answer"
+    # denominator and a dedicated counter is required. Without it the headline
+    # ``extraction_recall = tp / (tp + fn)`` silently omits this whole class,
+    # making a 50%-correct parameter report as 100%.
+    ex_wrong = 0
 
     # coverage accounting
     total_gt_params = 0                 # params present in GT args (nulls included)
@@ -317,6 +386,20 @@ def eval_param_extraction_lean(
     e3_violations = 0
     e3_examples: List[str] = []
 
+    # T1: candidate-parity accounting. ``parity_checked`` counts extractable GT
+    # spans with a usable char span; ``parity_hit`` counts those that were
+    # present in the candidate set H3 actually scored. The gap between
+    # ``parity_hit/parity_checked`` and ``extraction_recall`` is the split
+    # between "not offerable" (serve-time defect) and "offered but not chosen"
+    # (model quality) — the two causes this eval used to conflate.
+    parity_checked = 0
+    parity_hit = 0
+    parity_undetermined = 0            # resolver exposed no parity instrumentation
+    cands_per_param_hist: Counter = Counter()
+    cands_per_param_rows = 0
+    cand_cap_seen: Counter = Counter()
+    pack_fill_seen: Counter = Counter()
+
     per_param: Dict[str, Dict[str, int]] = defaultdict(
         lambda: {"gt": 0, "tp": 0, "fp": 0, "fn": 0, "extractable": 0, "unextractable": 0}
     )
@@ -348,15 +431,42 @@ def eval_param_extraction_lean(
                 # old stubs honest: they simply keep the oracle prompt and the T
                 # mismatch is reported, rather than being hidden by a swallowed
                 # exception.
+                # T1: hand the resolver this call's extractable GT spans so it
+                # can report whether they were even offerable. ``parity_spans``
+                # alone only MEASURES (protection stays off) — protection is a
+                # separate opt-in (T2) so the diagnosis is never self-fulfilling.
+                _p_spans = (
+                    _parity_spans_for_call(s, ci)
+                    if (measure_candidate_parity or protect_parity_spans)
+                    else None
+                )
+                # Capability flag, not a TypeError probe: a swallowed TypeError
+                # would silently restore the un-instrumented call and report a
+                # parity of "n/a" that looks like a clean run.
+                _supports_parity = bool(getattr(resolver, "supports_candidate_parity", False))
                 if getattr(resolver, "supports_context_schemas", False):
-                    res = resolver.try_resolve(
-                        gt_tool, s.utterance, s.recent_context, s.current_time_iso,
-                        context_schemas=s.tools,
-                    )
+                    if _supports_parity:
+                        res = resolver.try_resolve(
+                            gt_tool, s.utterance, s.recent_context, s.current_time_iso,
+                            context_schemas=s.tools, parity_spans=_p_spans,
+                            protect_parity_spans=protect_parity_spans,
+                        )
+                    else:
+                        res = resolver.try_resolve(
+                            gt_tool, s.utterance, s.recent_context, s.current_time_iso,
+                            context_schemas=s.tools,
+                        )
                 else:
                     res = resolver.try_resolve(
                         gt_tool, s.utterance, s.recent_context, s.current_time_iso
                     )
+                if _p_spans:
+                    _f = getattr(res, "features", None) or {}
+                    if "parity_checked" in _f:
+                        parity_checked += int(_f.get("parity_checked", 0))
+                        parity_hit += int(_f.get("parity_hit", 0))
+                    else:
+                        parity_undetermined += sum(len(v) for v in _p_spans.values())
                 per_call.append((ci, gt_call, gt_tool, res))
             if not per_call:
                 continue
@@ -375,6 +485,19 @@ def eval_param_extraction_lean(
             _rb = _feats.get("recent_budget_effective")
             if _rb is not None:
                 recent_budget_effective[int(_rb)] += 1
+            # T1: record the retention policy and cap the resolver actually ran
+            # under, plus the candidate-set size distribution. Without these a
+            # low parity rate cannot be attributed to a specific policy.
+            _fill = _feats.get("cand_pack_fill")
+            if _fill is not None:
+                pack_fill_seen[str(_fill)] += 1
+            _cap = _feats.get("cand_cap")
+            if _cap is not None:
+                cand_cap_seen[int(_cap)] += 1
+            _cpp = _feats.get("cands_per_param") or {}
+            for _v in _cpp.values():
+                cands_per_param_hist[int(_v)] += 1
+                cands_per_param_rows += 1
 
             # J6: predicted call count vs GT call count (R0.4 call-count accuracy).
             #
@@ -535,6 +658,7 @@ def eval_param_extraction_lean(
                         ex_tp += 1
                     else:
                         ex_fp += 1
+                        ex_wrong += 1
 
                 # --- per-param Stratum-F table ---
                 # Multi-call rows are tagged ``call_index::param`` so two calls
@@ -603,6 +727,27 @@ def eval_param_extraction_lean(
     e3_rate = _ratio(e3_violations, stratum_f_total)
     mean_conf = sum(confs) / len(confs) if confs else float("nan")
     param_coverage = _ratio(groundable_gt_params, total_gt_params)
+    # T12b (§3.1 caveat): the two headline ratios use DIFFERENT denominators —
+    #   fast_path_param_coverage = groundable / ALL gt params
+    #   extraction_recall        = ex_tp / (ex_tp + ex_fn)
+    # so ``coverage - recall`` subtracts a share from a conditional rate and is
+    # meaningless (it reads as a "generation gap" when nothing is wrong).
+    # ``param_accuracy_all`` is the honest all-GT rate: the fraction of EVERY
+    # ground-truth param the fast path retrieved correctly. It is comparable with
+    # ``param_coverage`` (same denominator) and needs no subtraction.
+    param_accuracy_all = _ratio(ex_tp, total_gt_params)
+    # T12b (second, sharper finding): ``extraction_recall`` omits wrong-VALUE
+    # predictions entirely. ``ex_fp`` mixes them with predictions for params that
+    # are not in the GT at all, so it cannot be subtracted out — hence the
+    # dedicated ``ex_wrong`` counter. A param answered INCORRECTLY is neither a
+    # true positive nor a "not present" miss, so the headline denominator
+    # (tp + fn) is missing a whole class and reads high. ``param_accuracy_scored``
+    # uses the complete universe: correct / (correct + wrong + absent).
+    params_scored_total = ex_tp + ex_wrong + ex_fn
+    # Arithmetically ``<= ex_r`` because the denominator only grows; asserted by
+    # test_eval_strict_recall_never_exceeds_the_headline so a future edit cannot
+    # silently re-inflate the headline again.
+    param_accuracy_scored = _ratio(ex_tp, params_scored_total)
     call_coverage = _ratio(calls_all_groundable, total)
     mean_render_T = ((sum(t * c for t, c in render_T_hist.items()) / render_T_rows)
                      if render_T_rows else float("nan"))
@@ -613,6 +758,14 @@ def eval_param_extraction_lean(
         "total_available": total_available,
         "truncated": bool(limit is not None and total >= limit and total_available > total),
     }
+    candidate_parity = _ratio(parity_hit, parity_checked)
+    # Offered-but-not-chosen: of the extractable GT params whose span WAS in the
+    # candidate set, how many did the pointer still miss? Reported as a rate so
+    # it is directly comparable with extraction_recall.
+    offered_miss_rate = (
+        _ratio(parity_checked - parity_hit, parity_checked)
+        if parity_checked else float("nan")
+    )
 
     metrics: Dict[str, Any] = {
         "split": split_name,
@@ -628,6 +781,20 @@ def eval_param_extraction_lean(
         "f1_all": _round(_f1(all_p, all_r)),
         # Architecture-value metrics
         "fast_path_param_coverage": _round(param_coverage),
+        # T12b: same denominator as coverage (ALL gt params), so this one MAY be
+        # compared with it. No subtraction required.
+        "fast_path_param_accuracy_all": _round(param_accuracy_all),
+        # T12b: the STRICT counterpart of extraction_recall (see derivation).
+        # Lower than ``extraction_recall`` whenever a value was predicted wrong.
+        "fast_path_param_accuracy_scored": _round(param_accuracy_scored),
+        "fast_path_params_scored": int(params_scored_total),
+        "fast_path_total_gt_params": int(total_gt_params),
+        "fast_path_extractable_gt_params": int(groundable_gt_params),
+        # The refusal side of the partition: params the fast path is not expected
+        # to solve. ``extractable + unextractable == total`` by construction.
+        "fast_path_unextractable_gt_params": int(
+            max(total_gt_params - groundable_gt_params, 0)
+        ),
         "fast_path_call_coverage": _round(call_coverage),
         # Refusal vs failure split
         "refused_unextractable": refused_unextractable,
@@ -652,6 +819,22 @@ def eval_param_extraction_lean(
             str(k): v for k, v in sorted(pred_n_calls_hist.items())
         },
         "n_multi_call_samples": n_multi_call,
+        # T1: candidate parity. The decisive split between the two failure modes:
+        #   candidate_parity low  -> the GT span was never offerable (serve defect)
+        #   candidate_parity high -> the model had it and picked wrong (quality)
+        "candidate_parity": _round(candidate_parity),
+        "candidate_parity_checked": parity_checked,
+        "candidate_parity_hit": parity_hit,
+        "candidate_parity_undetermined": parity_undetermined,
+        "candidate_miss_rate": _round(offered_miss_rate),
+        # T2: which arm of the experiment produced the numbers above. Without
+        # this a protected run and a diagnosis run are indistinguishable in the
+        # metrics dict, and the "did the fix work" comparison is unfalsifiable.
+        "parity_protection": bool(protect_parity_spans),
+        "cand_pack_fill": {str(k): v for k, v in sorted(pack_fill_seen.items())},
+        "cand_cap": {str(k): v for k, v in sorted(cand_cap_seen.items())},
+        "cands_per_param_hist": {str(k): v for k, v in sorted(cands_per_param_hist.items())},
+        "cands_per_param_rows": cands_per_param_rows,
         # Fix E3: aligner-drift tripwire (Stratum F only).
         "e3_aligner_drift": e3_violations,
         "e3_aligner_drift_rate": _round(e3_rate),
@@ -733,11 +916,46 @@ def _print_report(
           f"(multi-call samples={metrics['n_multi_call_samples']})")
     print(f"FAST-PATH COVERAGE: {_fmt(metrics['fast_path_param_coverage'])} of GT params are extractable; "
           f"{_fmt(metrics['fast_path_call_coverage'])} of calls fully extractable")
+    # T12b: coverage divides by ALL gt params; extraction_recall divides by the
+    # extractable ones. They must be COMPOSED, never subtracted (§3.1 caveat).
+    print(f"  (all-GT view) {_fmt(metrics['fast_path_param_accuracy_all'])} of ALL "
+          f"{metrics['fast_path_total_gt_params']} GT params were retrieved "
+          f"correctly ({metrics['fast_path_extractable_gt_params']} extractable, "
+          f"{metrics['fast_path_unextractable_gt_params']} not). NEVER subtract "
+          f"coverage from recall -- different denominators.")
+    # T12b: extraction_recall EXCLUDES params that were answered wrongly, so it
+    # reads high. This is the same rate over the complete scored universe.
+    _strict = metrics["fast_path_param_accuracy_scored"]
+    _lenient = metrics["extraction_recall"]
+    if _strict == _strict and _lenient == _lenient and _strict < _lenient:
+        print(f"  (strict recall) {_fmt(_strict)} over "
+              f"{metrics['fast_path_params_scored']} scored extractable params "
+              f"(correct+wrong+absent) vs headline {_fmt(_lenient)} — the headline "
+              f"omits params answered WRONGLY; `pointer_wrong` counts them.")
     print(f"Refusal split: refused_unextractable={metrics['refused_unextractable']} "
           f"(correct refusals) | missed_extractable={metrics['missed_extractable']} (real fast-path failures) | "
           f"pointer_wrong={metrics['pointer_wrong']} (pred present, != GT)")
+    # T1: the parity split. Printed BEFORE the drift tripwire because it is the
+    # metric that decides whether the fix belongs in serving (candidate set) or
+    # in training (model quality).
+    _pc = metrics["candidate_parity_checked"]
+    if _pc:
+        _arm = ("PROTECTED (T2 fix under test)" if metrics.get("parity_protection")
+                else "DIAGNOSIS (protection off)")
+        print(f"CANDIDATE PARITY [{_arm}]: {_fmt(metrics['candidate_parity'])} of extractable "
+              f"GT spans were IN the offered candidate set "
+              f"({metrics['candidate_parity_hit']} / {_pc}) "
+              f"| not offered = {_fmt(metrics['candidate_miss_rate'])}")
+        print(f"  -> pack_fill={metrics['cand_pack_fill']} cap={metrics['cand_cap']} "
+              f"cands/param hist={metrics['cands_per_param_hist']} "
+              f"over {metrics['cands_per_param_rows']} param(s)")
+        print("  -> parity low  = serve-time defect (GT span never offerable): fix candidate packing")
+        print("  -> parity high = model picked the wrong candidate: fix training/signal")
+    else:
+        print(f"CANDIDATE PARITY: n/a (no instrumented GT spans; "
+              f"undetermined={metrics['candidate_parity_undetermined']})")
     print(f"E3 ALIGNER DRIFT (Stratum F): {metrics['e3_aligner_drift']} violating sample(s) "
-          f"(rate={_fmt(metrics['e3_aligner_drift_rate'])}) — a non-zero value is a DATA bug, not a model miss")
+            f"(rate={_fmt(metrics['e3_aligner_drift_rate'])}) — a non-zero value is a DATA bug, not a model miss")
     for ex in metrics["e3_examples"]:
         print(f"    drift: {ex}")
 

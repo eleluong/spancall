@@ -447,6 +447,9 @@ def tensorize_sample_lean(
             min_tools=jitter_min_tools,
         )
         if stats is not None:
+            # Counted at the point of the DRAW, so this includes rows that are
+            # later dropped (over-length, dead anchor). ``jitter_draw_hist`` is
+            # recorded at the kept-row return instead — see the T12a note there.
             stats["jittered_rows"] = int(stats.get("jittered_rows", 0)) + 1
     if tool_pool is not None:
         tool_candidates, gt_idx = tool_pool.candidates_for(
@@ -790,6 +793,51 @@ def tensorize_sample_lean(
                                 matched_cis.append(ci)
                             found = True
 
+            # L1/T5: classify WHY a Stratum-F param ended up with no positive,
+            # BEFORE any fallback runs.
+            #
+            # Ordering matters and used to be wrong: the ``<|null|>`` fallback
+            # below fills ``matched_cis`` whenever the param is optional or
+            # nullable, which made the classifier's ``if not matched_cis`` guard
+            # false, so a genuine matcher failure on an extractable target was
+            # silently converted into "the answer is null" and never counted. The
+            # model was then trained to predict null for a param whose value was
+            # sitting in the utterance, and the ``match_missed`` tripwire could
+            # never fire for exactly the params most likely to hit it.
+            #
+            # Only ONE of these reasons is expected under the retrieval-first
+            # contract ('unresolved_target'); everything else is a data-pipeline
+            # or alignment defect that must not hide behind the legitimate
+            # exclusion. See docs/param_extraction_eval_coverage.md §4.
+            drop_why: Optional[str] = None
+            if not matched_cis:
+                has_unresolved = any(t.target_type == "unresolved" for t in targets)
+                has_null_target = any(t.target_type == "null_ctx" for t in targets)
+                all_unaligned = bool(targets) and all(
+                    getattr(t, "canonical_value", None) is None
+                    and getattr(t, "char_start", None) is None
+                    for t in targets
+                )
+                gt_is_null = any_null
+                if has_unresolved:
+                    # Expected: needs generation -> fast path must refuse.
+                    drop_why = "unresolved_target"
+                elif all_unaligned and not has_null_target:
+                    # Target row exists but carries neither a canonical value
+                    # nor a span -> the aligner produced an unusable target.
+                    drop_why = "unaligned_target"
+                elif (has_null_target or gt_is_null) and null_ci is None:
+                    # We know the answer is "null" but the mask builder emitted
+                    # no <|null|> candidate for this param -> cannot supervise.
+                    drop_why = "null_slot_missing"
+                elif not targets and not gt_present:
+                    # No target and no GT arg: the param simply is not part of
+                    # this call's supervision set (e.g. optional, omitted).
+                    drop_why = "absent_from_gt"
+                else:
+                    # Extractable target existed but the matcher failed: BUG.
+                    drop_why = "match_missed"
+
             # Direct argument fallback if target_spans missed.
             #
             # C1: distinguish "GT arg is explicitly null" from "GT arg absent".
@@ -806,7 +854,12 @@ def tensorize_sample_lean(
                             if c.canon_value == gt_val or c_val == g_val:
                                 if ci not in matched_cis:
                                     matched_cis.append(ci)
-                if not matched_cis and (
+                # T5: never manufacture a null positive for a ``match_missed``
+                # param. The GT value was extractable and the matcher lost it;
+                # supervising null would teach the model that a wrong answer is
+                # the right one. Leaving the anchor unsupervised keeps the defect
+                # visible in ``param_drop_reasons`` instead of burying it.
+                if not matched_cis and drop_why != "match_missed" and (
                     any_null
                     or not param.required
                     or "null" in (param.param_type or "").lower()
@@ -816,42 +869,34 @@ def tensorize_sample_lean(
                     if null_ci is not None and null_ci not in matched_cis:
                         matched_cis.append(null_ci)
 
-            # L1: classify WHY a Stratum-F param ended up with no positive.
-            # Only ONE of these is expected under the retrieval-first contract
-            # ('unresolved_target'); everything else is a data-pipeline or
-            # alignment defect that must not hide behind the legitimate
-            # exclusion. See docs/param_extraction_eval_coverage.md §4.
-            if not matched_cis:
-                has_unresolved = any(t.target_type == "unresolved" for t in targets)
-                has_null_target = any(t.target_type == "null_ctx" for t in targets)
-                all_unaligned = bool(targets) and all(
-                    getattr(t, "canonical_value", None) is None
-                    and getattr(t, "char_start", None) is None
-                    for t in targets
-                )
-                gt_is_null = any_null
-                if has_unresolved:
-                    # Expected: needs generation -> fast path must refuse.
-                    why = "unresolved_target"
-                elif all_unaligned and not has_null_target:
-                    # Target row exists but carries neither a canonical value
-                    # nor a span -> the aligner produced an unusable target.
-                    why = "unaligned_target"
-                elif (has_null_target or gt_is_null) and null_ci is None:
-                    # We know the answer is "null" but the mask builder emitted
-                    # no <|null|> candidate for this param -> cannot supervise.
-                    why = "null_slot_missing"
-                elif not targets and not gt_present:
-                    # No target and no GT arg: the param simply is not part of
-                    # this call's supervision set (e.g. optional, omitted).
-                    why = "absent_from_gt"
-                else:
-                    # Extractable target existed but the matcher failed: BUG.
-                    why = "match_missed"
-                drop_reasons.append(why)
+            # Record the reason ONLY if the param is still empty after the
+            # fallbacks above. ``drop_why`` is computed before them on purpose
+            # (it must be able to suppress the null fallback), but a fallback
+            # that RESCUED the anchor means the param is supervised, so nothing
+            # was dropped. Recording it anyway double-counts: the audit cell
+            # cross-checks ``params with zero positives`` against the recorded
+            # reasons, and a spurious ``match_missed`` would inflate the
+            # "supervision defects (must be 0)" tripwire with params that were
+            # never defects. The invariant this branch enforces is:
+            #     len(_param_drop_reasons) == #params with no positive slot.
+            if drop_why is not None and not matched_cis:
+                drop_reasons.append(drop_why)
                 if stats is not None:
                     stats.setdefault("param_drop_reasons", {})
-                    stats["param_drop_reasons"][why] = stats["param_drop_reasons"].get(why, 0) + 1
+                    stats["param_drop_reasons"][drop_why] = (
+                        stats["param_drop_reasons"].get(drop_why, 0) + 1
+                    )
+            elif drop_why is not None:
+                # Rescued by a fallback. This is NOT a drop, but it is still
+                # evidence that the primary path (target_spans / matcher)
+                # failed, so it must not be silently erased either: a large
+                # ``match_missed`` rescue count means the aligner/matcher is
+                # carrying a defect that the GT-argument fallback is papering
+                # over. Counted on its own channel so it never triggers the
+                # "supervision defects must be 0" tripwire.
+                if stats is not None:
+                    rescued = stats.setdefault("param_rescued_by_fallback", {})
+                    rescued[drop_why] = rescued.get(drop_why, 0) + 1
 
         # Cap candidates if necessary.
         #
@@ -972,6 +1017,18 @@ def tensorize_sample_lean(
         # Counts LIVE anchors: dead (unsnapped) slots are -1 and must not inflate
         # the number of choices H1 actually has.
         row["_n_tool_candidates"] = int(sum(1 for p in tool_positions if p >= 0))
+
+    # T12a: the histogram of the per-row jitter DRAW, keyed on the realised floor
+    # the row was actually built with. Recorded HERE, on the single kept-row exit,
+    # so rows dropped downstream (over-length, unmappable GT anchor) cannot skew
+    # it — ``jittered_rows`` counts draws, this counts surviving rows. Together
+    # they say whether the jitter actually reached the trainer's data.
+    if stats is not None and jitter and tool_pool is not None:
+        hist = stats.get("jitter_draw_hist")
+        if not isinstance(hist, dict):
+            hist = {}
+            stats["jitter_draw_hist"] = hist
+        hist[row_pack_tools] = int(hist.get(row_pack_tools, 0)) + 1
 
     return row
 

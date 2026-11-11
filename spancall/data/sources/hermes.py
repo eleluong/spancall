@@ -183,6 +183,40 @@ def _parse_tools_json(raw: Optional[str]) -> List[ToolDefinition]:
     return tools
 
 
+# Fallback name for the synthetic tool a json-mode row is supervised against.
+JSON_MODE_TOOL_NAME = "json_output"
+
+
+def _slugify_tool_name(raw: Optional[str]) -> str:
+    """Coerce a schema ``title`` into a single token-safe tool name.
+
+    The render/parse contract limits a tool name to one whitespace-free token
+    (``<|tool|>\\s+([^\\s(]+)`` in ``span_template/parser.py``), so a title like
+    ``"Flight Booking"`` cannot be used verbatim: the parser would record
+    ``Flight`` while the GT recorded something else, and every H1 row would read
+    as a miss for a reason that has nothing to do with the model.
+    """
+    if not raw:
+        return JSON_MODE_TOOL_NAME
+    cleaned = "".join(ch if (ch.isalnum() or ch in "_-.") else "_" for ch in str(raw).strip())
+    cleaned = cleaned.strip("_")
+    return cleaned or JSON_MODE_TOOL_NAME
+
+
+def _json_mode_tool_name(parsed_schema: Optional[Dict[str, Any]]) -> str:
+    """The ONE name used for both the json-mode tool AND its synthetic GT call.
+
+    T7: these used to disagree. ``load`` built the tool from
+    ``parsed_schema["title"]`` while ``_build_sample`` hardcoded the GT to
+    ``json_output``, so the GT tool was never among ``sample.tools``: Part-2 then
+    "augmented" every row with a distractor and reported all 500 GT names as
+    ``json_output`` — an alias defect, not model behaviour.
+    """
+    if not isinstance(parsed_schema, dict):
+        return JSON_MODE_TOOL_NAME
+    return _slugify_tool_name(parsed_schema.get("title"))
+
+
 def _tool_from_json_schema(
     name: str, description: str, params: Dict[str, Any]
 ) -> ToolDefinition:
@@ -338,6 +372,7 @@ class HermesLoader(BaseDatasetLoader):
         tools: List[ToolDefinition],
         gt_calls: List[GroundTruthCall],
         metadata_extra: Optional[Dict[str, Any]] = None,
+        json_tool_name: Optional[str] = None,
     ) -> Optional[UnifiedSample]:
         """Assemble a UnifiedSample from parsed pieces; None if not processable."""
         self.stats["rows_yielded"] += 1
@@ -358,7 +393,14 @@ class HermesLoader(BaseDatasetLoader):
         if not gt_calls:
             for a_text in assistant_texts:
                 for parsed in _iter_tool_call_payloads(a_text):
-                    name = parsed.get("name") or parsed.get("function") or "json_output"
+                    # T7: fall back to the same json-mode name the tool list
+                    # uses, never a hardcoded literal that may not exist there.
+                    name = (
+                        parsed.get("name")
+                        or parsed.get("function")
+                        or json_tool_name
+                        or JSON_MODE_TOOL_NAME
+                    )
                     args = parsed.get("arguments")
                     if isinstance(args, str):
                         args = _safe_json_loads(args) or {}
@@ -378,15 +420,20 @@ class HermesLoader(BaseDatasetLoader):
             # also ships ARRAY-typed outputs (e.g. flight/booking lists) which
             # we wrap under "items" to fit the GroundTruthCall.arguments dict
             # contract rather than dropping the row.
+            #
+            # T7: the GT tool name must be the SAME name the tool list carries.
+            # Hardcoding "json_output" here while ``load`` named the tool from
+            # ``schema.title`` made the GT unreachable by construction.
+            gt_name = json_tool_name or JSON_MODE_TOOL_NAME
             obj = None
             for a_text in reversed(assistant_texts):
                 obj = _safe_json_loads(a_text)
                 if isinstance(obj, (dict, list)):
                     break
             if isinstance(obj, dict):
-                gt_calls = [GroundTruthCall(tool_name="json_output", arguments=obj)]
+                gt_calls = [GroundTruthCall(tool_name=gt_name, arguments=obj)]
             elif isinstance(obj, list):
-                gt_calls = [GroundTruthCall(tool_name="json_output", arguments={"items": obj})]
+                gt_calls = [GroundTruthCall(tool_name=gt_name, arguments={"items": obj})]
             else:
                 self.stats["dropped_no_gt"] += 1
                 return None
@@ -423,7 +470,10 @@ class HermesLoader(BaseDatasetLoader):
             sample_id=sample_id,
             source_dataset="hermes-function-calling-v1",
             utterance=utterance,
-            tools=tools or [ToolDefinition(name="json_output", description="Structured JSON output")],
+            tools=tools or [ToolDefinition(
+                name=json_tool_name or JSON_MODE_TOOL_NAME,
+                description="Structured JSON output",
+            )],
             ground_truth_calls=gt_calls,
             recent_context=recent_context,
             stratum=Stratum.F,
@@ -446,6 +496,8 @@ class HermesLoader(BaseDatasetLoader):
             tools: List[ToolDefinition] = []
             gt_calls: List[GroundTruthCall] = []
             metadata_extra: Optional[Dict[str, Any]] = None
+            # T7: one name decides BOTH the json-mode tool and its synthetic GT.
+            json_tool_name: Optional[str] = None
 
             if self.config_name in _JSON_MODE_CONFIGS:
                 # json-mode: no OpenAI tools; use the `schema` field if present,
@@ -459,13 +511,16 @@ class HermesLoader(BaseDatasetLoader):
                 if schema_raw:
                     parsed_schema = _safe_json_loads(schema_raw)
                     if isinstance(parsed_schema, dict):
+                        json_tool_name = _json_mode_tool_name(parsed_schema)
                         tools = [
                             _tool_from_json_schema(
-                                parsed_schema.get("title") or "json_output",
+                                json_tool_name,
                                 "Structured JSON output",
                                 parsed_schema,
                             )
                         ]
+                if json_tool_name is None:
+                    json_tool_name = JSON_MODE_TOOL_NAME
                 metadata_extra = {"agentic": self.config_name == "json_mode_agentic"}
             else:
                 # function-calling configs: prefer the `tools` column.
@@ -503,6 +558,7 @@ class HermesLoader(BaseDatasetLoader):
                 tools,
                 gt_calls,
                 metadata_extra=metadata_extra,
+                json_tool_name=json_tool_name,
             )
             if sample is not None:
                 yield sample

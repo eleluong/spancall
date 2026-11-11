@@ -58,14 +58,87 @@ from spancall.lean.tensorize import (
 from spancall.train.trainer import CosineWarmupSchedule
 
 
+def _log_loss(value: Any) -> float:
+    """Clamp a loss scalar at 0 for LOGGING only (T12c).
+
+    A bf16/fp16 reduction can emit a tiny negative scalar even though the true
+    value is non-negative (the CE terms are clamped internally). Those rows then
+    land in ``train_log.jsonl`` and get quoted as if a loss could be negative.
+    Clamping at the metric boundary keeps the log honest without touching the
+    gradient path: ``scaled_loss``/``backward()`` still see the raw tensor.
+
+    Deliberately NOT applied inside :class:`LeanLossContainer` — that would
+    change what the optimizer sees, which is a numerics decision nobody asked
+    for here.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if v != v:  # NaN: keep it visible rather than silently reporting "fine"
+        return v
+    return max(0.0, v)
+
+
+def apply_lora(
+    model: nn.Module,
+    r: int = 16,
+    alpha: int = 32,
+    dropout: float = 0.05,
+    target_modules: Optional[Sequence[str]] = None,
+) -> int:
+    """Wrap the backbone in LoRA adapters in place; return adapter param count (T10).
+
+    Deliberately raises when ``peft`` is unavailable instead of falling back to
+    full fine-tuning: silently training a different model than the config asked
+    for is exactly the `freeze_encoder_stages`-under-`model` defect this
+    investigation already caught once.
+    """
+    try:
+        from peft import LoraConfig, get_peft_model
+    except ImportError as exc:  # pragma: no cover - depends on the environment
+        raise RuntimeError(
+            "training.use_lora=True requires the `peft` package. Install it with "
+            "`pip install peft`, or set training.use_lora=False to full fine-tune."
+        ) from exc
+
+    targets = list(target_modules or ["q_proj", "k_proj", "v_proj", "o_proj"])
+    backbone = getattr(model, "backbone", None)
+    if backbone is None:
+        raise ValueError("apply_lora: model has no `backbone` to adapt")
+
+    lora_cfg = LoraConfig(
+        r=int(r),
+        lora_alpha=int(alpha),
+        lora_dropout=float(dropout),
+        target_modules=targets,
+        bias="none",
+    )
+    # ``get_peft_model`` mutates in place and returns the SAME module object, so
+    # the caller's reference stays valid and the optimizer groups below see the
+    # adapter parameters under their new names.
+    model.backbone = get_peft_model(backbone, lora_cfg)
+    return sum(
+        p.numel() for n, p in model.named_parameters() if "lora_" in n and p.requires_grad
+    )
+
+
 def build_lean_optimizer_groups(
     model: nn.Module,
     lr_encoder: float = 2e-5,
     lr_head: float = 1e-4,
     weight_decay: float = 0.01,
     layer_decay: float = 0.85,
+    lora_lr: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
-    """Create optimizer parameter groups with layer-wise decay for the backbone."""
+    """Create optimizer parameter groups with layer-wise decay for the backbone.
+
+    When ``lora_lr`` is given, adapter parameters get their own group at that LR.
+    They must NOT be folded into the layer-decayed encoder groups: ``lora_*``
+    names sit under ``backbone.`` and would otherwise inherit the deepest-layer
+    encoder LR (~2e-5), which is two orders of magnitude below what adapters
+    need to move at all.
+    """
     enc_param_names: set = set()
     layer_index: Dict[str, int] = {}
     n_layers: int = 1
@@ -102,6 +175,14 @@ def build_lean_optimizer_groups(
             continue
         no_decay = param.dim() <= 1 or any(nd in name.lower() for nd in ("bias", "layernorm"))
         decay = 0.0 if no_decay else weight_decay
+
+        if lora_lr is not None and "lora_" in name:
+            # T10: adapters share one group at the adapter LR.
+            g = groups.setdefault(
+                "lora", {"params": [], "lr": float(lora_lr), "weight_decay": decay}
+            )
+            g["params"].append(param)
+            continue
 
         if is_encoder(name):
             l = layer_index.get(name, n_layers - 1)
@@ -165,6 +246,21 @@ class LeanTrainer:
         if self.device == "cuda" and not torch.cuda.is_available():
             self.device = "cpu"
 
+        # T10: LoRA ablation. Applied BEFORE ``.to(device)`` and BEFORE the
+        # optimizer groups are derived, because the adapter parameters must exist
+        # and be trainable by the time ``build_lean_optimizer_groups`` walks
+        # ``named_parameters()``.
+        self.lora_enabled = bool(getattr(config, "use_lora", False))
+        self.lora_param_count = 0
+        if self.lora_enabled:
+            self.lora_param_count = apply_lora(
+                self.model,
+                r=int(getattr(config, "lora_r", 16)),
+                alpha=int(getattr(config, "lora_alpha", 32)),
+                dropout=float(getattr(config, "lora_dropout", 0.05)),
+                target_modules=getattr(config, "lora_target_modules", None),
+            )
+
         self.model.to(self.device)
 
         if config is not None and getattr(config, "gradient_checkpointing", False):
@@ -185,6 +281,9 @@ class LeanTrainer:
             lr_head=self.lr_head,
             weight_decay=self.weight_decay,
             layer_decay=self.layer_decay,
+            lora_lr=(
+                float(getattr(config, "lora_lr", 1e-3)) if self.lora_enabled else None
+            ),
         )
         self.optimizer: torch.optim.Optimizer = AdamW(groups)
         self.scheduler: Optional[CosineWarmupSchedule] = None
@@ -333,12 +432,12 @@ class LeanTrainer:
         self.step += 1
         self.global_step += 1
 
-        out_metrics: Dict[str, float] = {"loss": float(total_loss.detach().item())}
+        out_metrics: Dict[str, float] = {"loss": _log_loss(total_loss.detach().item())}
         if "pointer" in loss_out:
-            out_metrics["pointer_loss"] = float(loss_out["pointer"].item())
+            out_metrics["pointer_loss"] = _log_loss(loss_out["pointer"].item())
             out_metrics["pointer"] = out_metrics["pointer_loss"]
         if "tool" in loss_out:
-            out_metrics["tool_loss"] = float(loss_out["tool"].item())
+            out_metrics["tool_loss"] = _log_loss(loss_out["tool"].item())
             out_metrics["tool"] = out_metrics["tool_loss"]
 
         if "span_logits" in fp32_preds and "pos_indices" in b:
@@ -484,9 +583,9 @@ class LeanTrainer:
 
                 fp32_preds = {k: (v.float() if isinstance(v, torch.Tensor) else v) for k, v in preds.items()}
                 loss_out = self.loss_container(fp32_preds, targs)
-                total_loss += float(loss_out["loss"].item())
+                total_loss += _log_loss(loss_out["loss"].item())
                 if "pointer" in loss_out:
-                    total_ptr_loss += float(loss_out["pointer"].item())
+                    total_ptr_loss += _log_loss(loss_out["pointer"].item())
 
                 # Per-row whole-call exactness: every supervised param must land
                 # on a positive candidate AND the predicted tool must be the GT
@@ -864,6 +963,11 @@ class LeanTrainer:
             "step": self.step,
             "lr_encoder": self.lr_encoder,
             "lr_head": self.lr_head,
+            # T10: provenance must say WHICH model was trained. A LoRA checkpoint
+            # is only loadable with peft present, and a reader of provenance.json
+            # otherwise cannot tell the two arms of the ablation apart.
+            "use_lora": bool(getattr(self, "lora_enabled", False)),
+            "lora_param_count": int(getattr(self, "lora_param_count", 0)),
             **(metadata or {}),
         }
         with open(out_p / "provenance.json", "w", encoding="utf-8") as f:

@@ -148,12 +148,20 @@ class DataConfig:
     ``pack_tools`` is the FLOOR on the number of candidate tools rendered into
     one input (``build_input_multi``, T anchor blocks). The Lean pipeline always
     uses the multi-tool grammar (Phase A / R6, R10): there is no single-tool
-    ``build_input`` path left to fall back to. ``pack_tools`` is a floor, not a
-    ceiling — every native tool of the sample is always rendered (Phase B /
-    R0.1), and ``ToolPool`` only tops up to the floor with distractors.
-    ``jitter_pack_tools`` (Phase G / R1c) draws T uniformly in
-    ``[pack_tools, ceiling]`` per row so that ``T=1`` layouts — which the
-    oracle-tool eval renders — stay in-distribution during training.
+    ``build_input`` path left to fall back to. Every native tool of the sample is
+    always rendered (Phase B / R0.1) and ``ToolPool`` only tops up to the floor
+    with distractors, so the realised tool count is
+    ``max(row_floor, 1 + #extra_native_tools)`` and can exceed ``pack_tools``.
+
+    ``jitter_pack_tools`` (Phase G / R1c) randomises that per-row floor. The draw
+    is uniform over ``[jitter_min_tools, pack_tools]`` **inclusive** — i.e.
+    ``pack_tools`` is the *ceiling of the draw*, not its floor, and
+    ``jitter_min_tools`` (default 1) is the lower bound. With the defaults this
+    makes ``T=1`` (which the oracle-tool eval renders) reachable for every row,
+    so that layout stays in-distribution during training. The interval is drawn
+    per row and is deterministic in ``(experiment.seed, sample_id)``; only an
+    *interval* is supported — there is no set-valued sampler.
+
     Unknown keys in the YAML ``data`` section are tolerated (forward compat).
 
     ``fraction`` (default 1.0): the fraction of each tensorized split used by
@@ -177,7 +185,9 @@ class DataConfig:
     fraction: float = 1.0
     train_f_ratio: float = 0.0   # H-T2: target F:(A) ratio in trainer subsample
                                  # (0 = old pure-random fraction subsample)
-    jitter_pack_tools: bool = True   # R1c: draw T in [pack_tools, ceiling]
+    # R1c: per-row floor drawn uniformly from [jitter_min_tools, pack_tools]
+    # inclusive; pack_tools is the CEILING of that draw (see class docstring).
+    jitter_pack_tools: bool = True
     max_tools: Optional[int] = None  # R0.1: hard ceiling on rendered tools
     max_calls: int = 4               # R0.4: resolver call budget (1 = single call)
     call_min_prob: float = 0.25      # R0.4: H1 prob floor for an extra call
@@ -235,6 +245,23 @@ class TrainingConfig:
     resolver_eval_split: str = ""          # E2E-hook: raw-mode resolver eval split ("" = disabled)
     resolver_eval_limit: int = 40          # row cap for the resolver e2e hook
     resolver_factory: Any = None           # callable(out_ckpt_dir) -> SpanCallResolver (injected)
+    # ---- LoRA ablation (T10; default OFF so nothing changes unless asked) -----
+    # Motivation (investigation §10.3): at the 0.2 data fraction only the two
+    # heads were effectively being trained and the frozen encoder could never
+    # re-align its representation to the pointer vocabulary. LoRA adapters give
+    # the backbone a small, cheap, low-rank way to move. Requires ``peft``; when
+    # it is missing, enabling this must FAIL LOUDLY rather than silently
+    # train a full model (that is the `freeze_encoder_stages` bug all over again).
+    use_lora: bool = False
+    lora_r: int = 16                       # rank of the low-rank update
+    lora_alpha: int = 32                   # LoRA scaling numerator (alpha / r)
+    lora_dropout: float = 0.05
+    # Adapters usually want a much higher LR than a full fine-tune of the same
+    # block, so this gets its OWN optimizer group rather than sharing lr_encoder.
+    lora_lr: float = 1e-3
+    lora_target_modules: List[str] = field(
+        default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"]
+    )
 
     @classmethod
     def from_yaml(cls, path: Union[str, Path]) -> "TrainingConfig":
@@ -302,6 +329,14 @@ class TrainingConfig:
                 training.get("resolver_eval_limit", cfg.resolver_eval_limit)
             ),
             resolver_factory=cfg.resolver_factory,
+            use_lora=bool(training.get("use_lora", cfg.use_lora)),
+            lora_r=int(training.get("lora_r", cfg.lora_r)),
+            lora_alpha=int(training.get("lora_alpha", cfg.lora_alpha)),
+            lora_dropout=float(training.get("lora_dropout", cfg.lora_dropout)),
+            lora_lr=float(training.get("lora_lr", cfg.lora_lr)),
+            lora_target_modules=list(
+                training.get("lora_target_modules", cfg.lora_target_modules) or []
+            ),
             seed=experiment.get("seed", cfg.seed),
             output_dir=experiment.get("output_dir", cfg.output_dir),
             experiment_name=experiment.get("name", cfg.experiment_name),

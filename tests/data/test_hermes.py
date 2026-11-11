@@ -162,12 +162,15 @@ def test_load_each_config(tmp_path, config: str) -> None:
         assert s.tools, f"config={config} parsed no tools"
         assert any(t.name == "get_camera_live_feed" for t in s.tools)
     else:
-        # json-mode: GT uses the synthetic json_output tool; the tools list
-        # holds the schema-derived tool (named by the JSON Schema title) or the
-        # synthetic json_output fallback when no schema exists.
+        # json-mode: the synthetic GT call must name the SAME tool the schema
+        # produced (T7). The fixture schema title is "PatentPortfolio"; the
+        # synthetic `json_output` name is only the no-schema fallback.
         assert s.metadata["mode"] == "json"
-        assert s.ground_truth_calls[0].tool_name == "json_output"
+        assert s.ground_truth_calls[0].tool_name == "PatentPortfolio"
         assert s.tools, f"config={config} parsed no tools"
+        # The alias invariant: a GT tool MUST exist in sample.tools, otherwise
+        # every H1 row is a guaranteed miss manufactured by the loader.
+        assert s.ground_truth_calls[0].tool_name in {t.name for t in s.tools}
 
 
 def test_singleturn_tools_and_gt() -> None:
@@ -210,7 +213,8 @@ def test_json_singleturn_synthetic_gt(tmp_path) -> None:
     loader = HermesLoader(config_name="json_mode_singleturn", local_path=path)
     (s,) = list(loader.load())
     assert s.metadata["mode"] == "json"
-    assert s.ground_truth_calls[0].tool_name == "json_output"
+    assert s.ground_truth_calls[0].tool_name == "PatentPortfolio"
+    assert s.ground_truth_calls[0].tool_name in {t.name for t in s.tools}
     assert s.ground_truth_calls[0].arguments["patentID"] == "US9876543B2"
     # The JSON Schema -> ToolDefinition mapping yields a param with the enum
     assert any(p.name == "patentStatus" and p.enum for t in s.tools for p in t.parameters)
@@ -271,10 +275,46 @@ def test_json_array_output_wrapped_as_items(tmp_path) -> None:
     path = _write_config_rows(tmp_path, "json_mode_singleturn", [row])
     loader = HermesLoader(config_name="json_mode_singleturn", local_path=path)
     (s,) = list(loader.load())
-    assert s.ground_truth_calls[0].tool_name == "json_output"
+    assert s.ground_truth_calls[0].tool_name == "PatentPortfolio"
+    assert s.ground_truth_calls[0].tool_name in {t.name for t in s.tools}
     assert isinstance(s.ground_truth_calls[0].arguments["items"], list)
     assert s.ground_truth_calls[0].arguments["items"][0]["flightNumber"] == "AA123"
     assert loader.stats["dropped_no_gt"] == 0
+
+
+def test_json_mode_alias_invariant_no_schema_falls_back(tmp_path) -> None:
+    """T7 regression: WITHOUT a schema the fallback name is still `json_output`,
+    and the GT must match whatever the tool list carries in BOTH cases."""
+    from spancall.data.sources.hermes import (
+        JSON_MODE_TOOL_NAME,
+        _json_mode_tool_name,
+        _slugify_tool_name,
+    )
+
+    # No schema -> the synthetic fallback for both tool and GT.
+    assert _json_mode_tool_name(None) == JSON_MODE_TOOL_NAME
+    # Whitespace/punctuation titles must be coerced to a single parser-safe token
+    # (`TOOL_RE` forbids whitespace), never left verbatim.
+    assert _slugify_tool_name("Flight Booking") == "Flight_Booking"
+    assert " " not in _slugify_tool_name("Flight Booking")
+    assert _slugify_tool_name("") == JSON_MODE_TOOL_NAME
+    assert _slugify_tool_name("  ") == JSON_MODE_TOOL_NAME
+
+    row = {
+        "id": "fixture-json-noschema-1",
+        "conversations": [
+            {"from": "system", "value": "Answer in JSON."},
+            {"from": "human", "value": "Give me the patent status."},
+            {"from": "gpt", "value": '{"patentID": "US1", "patentStatus": "Filed"}'},
+        ],
+        "schema": "",
+        "category": "Pharma", "subcategory": "Biotech", "task": "extract",
+    }
+    path = _write_config_rows(tmp_path, "json_mode_singleturn", [row])
+    loader = HermesLoader(config_name="json_mode_singleturn", local_path=path)
+    (s,) = list(loader.load())
+    assert s.ground_truth_calls[0].tool_name == JSON_MODE_TOOL_NAME
+    assert {t.name for t in s.tools} == {JSON_MODE_TOOL_NAME}
 
 
 def test_unknown_config_rejected() -> None:

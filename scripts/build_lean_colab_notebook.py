@@ -327,6 +327,7 @@ CODE_TENSOR_RUN = '''# ---- tensorize splits into Lean 0-indexed format (paralle
 # without this line raises NameError at runtime.
 from typing import Any, Dict, List, Optional
 import json
+import math
 import os
 import queue
 import random
@@ -434,6 +435,15 @@ def _tensorize_lean_task(args):
         #   match_missed      -> groundable target existed but the matcher failed
         #                        => a supervision bug, silently excluded from loss.
         drops = dict(ts_stats.get("param_drop_reasons", {}))
+        # A reason is only recorded when the anchor ended with NO positive. Params
+        # that the fallback RESCUED are supervised, so they must not be counted as
+        # drops -- but they are still evidence that the primary path failed, and
+        # the child's stats dict cannot cross the fork boundary. Encode them on
+        # the same synthetic-key channel as ``render_T=<T>`` below so the parent
+        # can flag a high rescue rate instead of losing it.
+        for _why, _cnt in (ts_stats.get("param_rescued_by_fallback") or {}).items():
+            _k = f"rescued:{_why}"
+            drops[_k] = drops.get(_k, 0) + int(_cnt)
         # Anchor-snap misses must be visible: a bridge_text tool line the
         # tokenizer could not map back to tokens means that H1 candidate was
         # emitted as PAD_INDEX (-1) and is invisible to the tool head.
@@ -462,6 +472,16 @@ def _tensorize_lean_task(args):
             drops["jittered_rows"] = drops.get("jittered_rows", 0) + int(
                 ts_stats["jittered_rows"]
             )
+        # T12a: the DRAW histogram, keyed on the floor each surviving row was
+        # actually built with. ``jittered_rows`` above only proves a draw
+        # HAPPENED; it cannot distinguish "drew uniformly over [min, pack]" from
+        # "drew pack_tools every single row" (which is what a mis-wired
+        # ``jitter_min_tools`` looks like, and it would leave the T=1 eval layout
+        # just as absent as jitter=False). Encode on the synthetic-key channel,
+        # same as ``render_T=<T>``, because a nested dict cannot cross the fork.
+        for _floor, _cnt in (ts_stats.get("jitter_draw_hist") or {}).items():
+            _k = f"jitter_draw={int(_floor)}"
+            drops[_k] = drops.get(_k, 0) + int(_cnt)
         if row is None or not has_positive_targets(row):
             return None, drops, errors
         # Serialize inside the child: the parent then only concatenates text.
@@ -747,6 +767,24 @@ try:
             mean_render_T = ((sum(t * c for t, c in render_hist.items())
                               / n_render_rows) if n_render_rows else float("nan"))
             t1_share = (render_hist.get(1, 0) / n_render_rows) if n_render_rows else float("nan")
+            # T9: the ANALYTIC expectation for the T=1 share, not a hardcoded
+            # complaint. ``jitter_pack_tools`` draws each row's floor uniformly
+            # from ``[1, hi]``, so exactly one of those ``hi`` buckets is T=1 and
+            # the share you should SEE is ~1/hi. The old check asserted only
+            # "T=1 happened at all", which passed for a share 7x below the
+            # expectation (446/9830 = 4.5% where 1/3 = 33% was due) — an
+            # unrepresentative draw reads exactly like a healthy one.
+            expected_t1 = ((1.0 / max(int(PACK_TOOLS_EPH), 1)) if JITTER_PACK_TOOLS else 0.0)
+            # Binomial tolerance: 4 sd around the expected share is wide enough
+            # to ignore sampling noise and tight enough to catch the observed
+            # 4.5%-vs-33% class of defect.
+            t1_sd = (math.sqrt(max(expected_t1 * (1.0 - expected_t1), 1e-12)
+                               / max(n_render_rows, 1)) if n_render_rows else float("nan"))
+            t1_off = bool(
+                n_render_rows >= 30
+                and t1_sd == t1_sd
+                and abs(t1_share - expected_t1) > 4.0 * t1_sd
+            )
             n_truncated = int(drops.get("tool_truncated_rows", 0))
             n_jittered = int(drops.get("jittered_rows", 0))
             # Phase I: capacity/layout channels. These are COUNTERS, not drop
@@ -757,16 +795,36 @@ try:
             n_ambiguous = int(drops.get("multi_call_ambiguous_anchors", 0))
             n_recent_trunc = int(drops.get("recent_truncated_rows", 0))
             n_recent_rows = int(drops.get("n_recent_rows", 0))
+            # T12a: decode the synthetic ``jitter_draw=<floor>`` channel back into
+            # a real histogram. This is the POSITIVE control for the T=1 check
+            # below: render_T_hist says what layout was produced, jitter_draw_hist
+            # says what floor was DRAWN, so a gap between them localises the bug
+            # to the draw (here) rather than to rendering (render_T there).
+            draw_hist: Dict[int, int] = {}
+            for _k, _v in drops.items():
+                if _k.startswith("jitter_draw="):
+                    try:
+                        draw_hist[int(_k[len("jitter_draw="):])] = int(_v)
+                    except (TypeError, ValueError):
+                        pass
+            n_draws = sum(draw_hist.values())
             _CHANNEL = (
                 "tool_truncated_rows", "jittered_rows", "dropped_over_length",
                 "multi_call_ambiguous_anchors", "recent_truncated_rows",
                 "n_recent_rows", "tool_snap_misses", "param_snap_misses",
             )
+            # T5: params the fallback rescued. NOT drops (they are supervised),
+            # so they must not reach ``param_drop_other``, but they must be
+            # reported: a high rescue rate means the primary matcher is failing.
+            rescued = {k[len("rescued:"):]: int(v) for k, v in drops.items()
+                       if k.startswith("rescued:")}
             param_other = {
                 k: v for k, v in drops.items()
                 if k not in ("match_missed", "unresolved_target")
                 and k not in _CHANNEL
                 and not k.startswith("render_T=")
+                and not k.startswith("rescued:")
+                and not k.startswith("jitter_draw=")
             }
             stats[on] = {
                 "rows": len(stats_rows),
@@ -790,13 +848,27 @@ try:
                 "render_T_hist": {str(k): v for k, v in sorted(render_hist.items())},
                 "render_T_t1_share": (round(t1_share, 4)
                                       if t1_share == t1_share else None),
+                # T9: what the layout SHOULD have produced, so a future reader
+                # can tell "T=1 is a 4.5% accident" from "T=1 is 1/3 by design".
+                "render_T_t1_expected_share": round(expected_t1, 4),
+                "render_T_t1_share_off": t1_off,
                 "jitter_pack_tools": bool(JITTER_PACK_TOOLS),
+                # T12a: draws that did NOT jitter are still draws. If
+                # ``jittered_rows`` is 0 while ``jitter_draw_hist`` only has the
+                # ceiling bucket, the sampler degenerated to pack_tools -- which
+                # is indistinguishable from jitter=False in the render_T report.
                 "jittered_rows": n_jittered,
+                "jitter_draw_hist": {str(k): v for k, v in sorted(draw_hist.items())},
+                "jitter_draw_rows": n_draws,
+                "jitter_draw_distinct_floors": len(draw_hist),
                 "max_tools": MAX_TOOLS,
                 "tool_truncated_rows": n_truncated,
                 "param_drop_match_missed": missed,
                 "param_drop_unresolved": unresolved,
                 "param_drop_other": param_other,
+                # T5: supervised anyway (fallback rescued them) -- reported so a
+                # failing primary matcher cannot hide behind the fallback.
+                "param_rescued_by_fallback": rescued,
                 # Phase I: the numeric delta report reads these five channels
                 # directly. Every one of them is a "the model never saw this"
                 # counter, so none may hide inside param_drop_other.
@@ -835,15 +907,51 @@ try:
                 print(f"  [render] {on}: mean render_T={mean_render_T:.2f} over "
                       f"{n_render_rows} row(s) "
                       f"(hist={dict(sorted(render_hist.items()))}, "
-                      f"T=1 share={t1_share:.1%}, jittered_rows={n_jittered})")
-                if t1_share == 0.0 and JITTER_PACK_TOOLS:
+                      f"T=1 share={t1_share:.1%} vs expected "
+                      f"{expected_t1:.1%}, jittered_rows={n_jittered})")
+                # T9: compare the OBSERVED share against the analytic one. The
+                # pre-T9 check only asked "did T=1 ever happen", so a draw 7x
+                # below expectation passed silently.
+                if JITTER_PACK_TOOLS and t1_share == 0.0:
                     print(f"  [!] {on}: T=1 never occurred although jitter is ON — "
                           f"every row would still be out-of-distribution for the "
                           f"oracle-tool eval layout. Check jitter_pack_tools wiring.")
-                elif t1_share == 0.0:
+                elif t1_off:
+                    print(f"  [!] {on}: T=1 share={t1_share:.1%} but {expected_t1:.1%} "
+                          f"was expected (pack_tools={PACK_TOOLS_EPH}, "
+                          f"jitter={JITTER_PACK_TOOLS}, sd={t1_sd:.3f}). The draw is "
+                          f"not representative of [1, {PACK_TOOLS_EPH}]: the oracle-tool "
+                          f"eval layout (T=1) is UNDER-represented in training (R1c).")
+                elif not JITTER_PACK_TOOLS and t1_share == 0.0:
                     print(f"  [i] {on}: T=1 never occurred and jitter is OFF "
                           f"(JITTER_PACK_TOOLS=False) -> the oracle-tool eval prompt "
                           f"(T=1) is OUT of the training distribution (R1c).")
+                # T12a: the DRAW side of the same question. render_T_hist above is
+                # the layout that was RENDERED; this is the floor that was DRAWN.
+                # A jitter that degenerated to the ceiling shows up here and
+                # nowhere else, because the rendered T still looks like a legal
+                # pack_tools row.
+                if n_draws:
+                    print(f"  [jitter] {on}: {n_draws} row(s) drew a floor "
+                          f"(hist={dict(sorted(draw_hist.items()))}, "
+                          f"{len(draw_hist)} distinct floor(s) of "
+                          f"{max(int(PACK_TOOLS_EPH), 1)} possible)")
+                    if JITTER_PACK_TOOLS and len(draw_hist) == 1:
+                        _only = next(iter(draw_hist))
+                        print(f"  [!] {on}: jitter is ON but every draw landed on "
+                              f"the SAME floor ({_only}). The sampler is "
+                              f"degenerate -- jitter_min_tools/pack_tools wiring "
+                              f"collapsed the interval. Training sees one layout "
+                              f"only, so the T=1 eval prompt stays OOD (R1c).")
+                    elif JITTER_PACK_TOOLS and 1 not in draw_hist:
+                        print(f"  [!] {on}: no row drew floor=1, so the minimum "
+                              f"packing (the oracle-tool eval layout) was never "
+                              f"sampled. Check data.jitter_min_tools.")
+                elif JITTER_PACK_TOOLS:
+                    print(f"  [!] {on}: jitter is ON but NO row reported a draw "
+                          f"(jitter_draw_hist empty). Either no row survived "
+                          f"tensorization or the stats channel is not wired -- "
+                          f"this is the silent-no-op signature.")
             if n_truncated:
                 print(f"  [!] {on}: tool_truncated_rows={n_truncated} (max_tools="
                       f"{MAX_TOOLS}) — native tools were DROPPED from the prompt, so "
@@ -851,13 +959,22 @@ try:
         if missed:
             print(f"  [!] MATCH_MISSED={missed} on {in_name}: extractable targets the matcher "
                   f"failed on -> these params get NO pointer supervision (real bug).")
+        n_rescued = sum(rescued.values())
+        if n_rescued:
+            print(f"  [note] rescued_by_fallback={n_rescued} on {in_name} "
+                  f"{rescued} -> the param IS supervised (not a drop), but the "
+                  f"primary target/matcher path missed it. A share near the "
+                  f"groundable-param count means the GT-argument fallback is "
+                  f"carrying the alignment, and `match_missed` should not be read "
+                  f"as zero just because the drop counter is.")
         # ``render_T=<T>`` histogram keys and the capacity channel counters are
         # NOT drop reasons: they are already reported above, and printing them as
         # "[note] render_T=3=412" would bury the real audit lines.
         other = {k: v for k, v in drops.items()
                  if k not in ("match_missed", "unresolved_target")
                  and k not in _CHANNEL
-                 and not k.startswith("render_T=")}
+                 and not k.startswith("render_T=")
+                 and not k.startswith("rescued:")}
         for k in sorted(other):
             label = "BUG" if k in ("unaligned_target", "null_slot_missing") else "note"
             print(f"  [{label}] {k}={other[k]} on {in_name}")
@@ -1099,7 +1216,11 @@ cfg["training"]["gradient_accumulation_steps"] = 4
 cfg["training"]["gradient_checkpointing"] = True
 cfg["training"]["eval_splits"] = ["dev"]
 cfg["training"]["eval_limit"] = 500
-cfg["model"]["freeze_encoder_stages"] = []
+# IMPORTANT: ``freeze_encoder_stages`` belongs to the TRAINING section, not
+# ``model`` — it is a field of ``TrainingConfig``. Writing it under ``model``
+# made the setting a silent no-op: ``TrainingConfig.from_dict`` never looked
+# there, so the notebook's knob did nothing at all.
+cfg["training"]["freeze_encoder_stages"] = []
 cfg["model"]["max_seq_len"] = MAX_SEQ_LEN
 
 # fraction is a TRAINER-side subsample; pack_tools is a TENSORIZER-side knob, so
@@ -1262,6 +1383,169 @@ if train_log:
         print("  no train events")
 else:
     print("No training log found — run the training cell first.")
+'''
+
+MARKDOWN_LORA_ABLATION = """### (Optional) T10 — LoRA vs Full-Fine-Tune Ablation
+
+Default **OFF**. Set `RUN_LORA_ABLATION = True` (and `!pip install peft` in cell 0a) to train
+both arms back-to-back with the **same seed, fraction, epochs, and data**, and print a
+comparison table:
+
+| arm | backbone | adapter params |
+|---|---|---|
+| `full_ft` | fully trainable (current behaviour) | 0 |
+| `lora` | frozen + low-rank adapters at `lora_lr` (~1e-3) | `r`, `alpha`, targets |
+
+Motivation (investigation §10.2–10.4): at the 0.2 data fraction the two heads are effectively
+the only thing being trained, so the encoder can never re-align its representation to the
+pointer vocabulary. LoRA gives the backbone a cheap low-rank path to move. Prediction: near
+identical `exact_call`, better epoch-tail `train_loss` for LoRA.
+
+LoRA knobs are **`TrainingConfig` fields and therefore live under the `training:` YAML
+section** — writing them under `model:` is silently ignored (the same class of bug as
+`freeze_encoder_stages`). Enabling LoRA without `peft` **raises**, never silently
+full-fine-tunes."""
+
+CODE_LORA_ABLATION = '''# ---- T10: LoRA vs full-FT ablation (opt-in; default OFF) ----
+import os, json, math, glob, yaml
+
+RUN_LORA_ABLATION = False          # flip to True to actually run the ablation
+LORA_ABLATION_EPOCHS = int(globals().get("NUM_EPOCHS", 5))  # identical for BOTH arms
+LORA_R = 16
+LORA_ALPHA = 32                       # alpha = 2r
+LORA_DROPOUT = 0.05
+LORA_LR = 1e-3                        # adapters get their OWN group, not lr_encoder
+LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+
+def _write_arm_config(base_cfg, use_lora, arm_name, arm_out):
+    """Materialise one arm's YAML. LoRA knobs go under ``training``, never ``model``."""
+    cfg = json.loads(json.dumps(base_cfg))          # yaml-safe deep copy
+    cfg.setdefault("experiment", {})
+    cfg["experiment"]["name"] = arm_name
+    cfg["experiment"]["output_dir"] = arm_out
+    cfg.setdefault("training", {})
+    # T11 lesson: these are TrainingConfig fields. Under `model` they are a no-op.
+    cfg["training"]["use_lora"] = bool(use_lora)
+    cfg["training"]["lora_r"] = int(LORA_R)
+    cfg["training"]["lora_alpha"] = int(LORA_ALPHA)
+    cfg["training"]["lora_dropout"] = float(LORA_DROPOUT)
+    cfg["training"]["lora_lr"] = float(LORA_LR)
+    cfg["training"]["lora_target_modules"] = list(LORA_TARGET_MODULES)
+    cfg.setdefault("optimization", {})
+    cfg["optimization"]["num_epochs"] = int(LORA_ABLATION_EPOCHS)
+    cfg.setdefault("data", {})
+    cfg["data"]["fraction"] = TRAIN_FRACTION
+    cfg["data"]["pack_tools"] = int(globals().get("PACK_TOOLS_EPH", PACK_TOOLS) or 1)
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    path = os.path.join(RESULTS_DIR, f"lora_ablation_{arm_name}.yaml")
+    with open(path, "w") as fh:
+        yaml.safe_dump(cfg, fh)
+    return path
+
+
+def _arm_summary(arm_root, exp_name):
+    """Read back one arm's tail-of-training dev metrics + adapter provenance."""
+    out = {
+        "final_train_loss": float("nan"),
+        "dev_span_acc": float("nan"),
+        "dev_exact_call": float("nan"),
+        "dev_tool_acc": float("nan"),
+        "lora_param_count": None,
+    }
+    log_p = os.path.join(arm_root, f"{exp_name}_seed{SEED}", "train_log.jsonl")
+    recs = []
+    if os.path.exists(log_p):
+        with open(log_p) as fh:
+            recs = [json.loads(l) for l in fh if l.strip()]
+    evals = [r for r in recs if r.get("event") == "epoch_eval" and r.get("split") == "dev"]
+    if evals:
+        last = evals[-1]
+        for src, dst in (("span_acc", "dev_span_acc"),
+                         ("exact_call", "dev_exact_call"),
+                         ("tool_acc", "dev_tool_acc")):
+            try:
+                out[dst] = float(last.get(src))
+            except (TypeError, ValueError):
+                out[dst] = float("nan")
+    ends = [r for r in recs if r.get("event") == "epoch_end"]
+    if ends:
+        try:
+            out["final_train_loss"] = float(ends[-1].get("mean_loss"))
+        except (TypeError, ValueError):
+            pass
+    provs = sorted(glob.glob(os.path.join(arm_root, "**", "provenance.json"), recursive=True))
+    if provs:
+        with open(provs[-1]) as fh:
+            out["lora_param_count"] = json.load(fh).get("lora_param_count")
+    return out
+
+
+arms = [("full_ft", False), ("lora", True)]
+
+if RUN_LORA_ABLATION:
+    try:
+        import peft  # noqa: F401
+    except ImportError:
+        raise RuntimeError(
+            "RUN_LORA_ABLATION=True requires the `peft` package. Run "
+            "`!pip install peft` in cell 0a, or leave the flag False. (T10: "
+            "enabling LoRA must fail loudly, never silently full-fine-tune.)"
+        )
+    from scripts.train_lean import main as train_lean_main
+
+    with open(CONFIG_PATH) as fh:
+        base_cfg = yaml.safe_load(fh)
+
+    results = {}
+    for arm_name, use_lora in arms:
+        arm_root = os.path.join(RESULTS_DIR, "lora_ablation", arm_name)
+        cfg_path = _write_arm_config(base_cfg, use_lora, f"lora_ablation_{arm_name}", arm_root)
+        print("=" * 78)
+        print(f"[T10] arm={arm_name}  use_lora={use_lora}  out={arm_root}")
+        print("=" * 78)
+        train_lean_main([
+            "--config", cfg_path,
+            "--experiment_name", f"lora_ablation_{arm_name}",
+            "--output_dir", arm_root,
+            "--data_dir", TENSOR_DIR,
+            "--stages", "T2",
+            "--device", DEVICE,
+            "--seed", str(SEED),
+        ])
+        results[arm_name] = _arm_summary(arm_root, f"lora_ablation_{arm_name}")
+
+    print("=" * 78)
+    print("T10 LORA ABLATION - dev comparison (identical seed / fraction / epochs)")
+    print("=" * 78)
+    hdr = (f"{'arm':<10}{'use_lora':>10}{'adapters':>12}{'train_loss':>12}"
+           f"{'span_acc':>10}{'exact_call':>12}{'tool_acc':>10}")
+    print(hdr)
+    print("-" * len(hdr))
+
+    def _fmt(x):
+        try:
+            v = float(x)
+        except (TypeError, ValueError):
+            return "n/a"
+        return "n/a" if not math.isfinite(v) else f"{v:.4f}"
+
+    for arm_name, use_lora in arms:
+        m = results[arm_name]
+        ap = m.get("lora_param_count")
+        print(f"{arm_name:<10}{str(use_lora):>10}{(ap if ap is not None else '-'):>12}"
+              f"{_fmt(m['final_train_loss']):>12}{_fmt(m['dev_span_acc']):>10}"
+              f"{_fmt(m['dev_exact_call']):>12}{_fmt(m['dev_tool_acc']):>10}")
+    print()
+    print("Read: the arms differ ONLY in whether the backbone got adapters. An")
+    print("unchanged `exact_call` with a lower LoRA train-loss tail is the §10.2")
+    print("prediction (bottleneck is the pointer vocabulary, not capacity). A dev")
+    print("gain WITHOUT a loss-tail gain is noise -- check the seeded floor first.")
+else:
+    print("[T10] LoRA ablation skipped (RUN_LORA_ABLATION = False).")
+    print("      Wiring + config knobs are live (training.use_lora / lora_r /")
+    print("      lora_alpha / lora_dropout / lora_lr / lora_target_modules); only")
+    print("      the GPU run is deferred. Enable the flag + `!pip install peft`.")
 '''
 
 MARKDOWN_PICK_CP = """### Pick the Best Lean Checkpoint
@@ -1474,7 +1758,38 @@ if _rb:
 if _m("render_T_t1_share") == 1.0:
     print("  [!] every Part-1 prompt rendered T=1: the layouts here are the "
           "oracle-tool ones, so any multi-call claim must be read against "
-          "Part 3 as well.")'''
+          "Part 3 as well.")
+
+# T1/T2: candidate parity is THE split between "the model picked wrong" and
+# "the right answer was never offerable". Printing it only as a raw key in
+# p1_metrics forced the reader to remember which of the two failure modes a
+# given number implies, so state it explicitly.
+print("\\n--- Candidate parity (T1 diagnosis / T2 fix) ---")
+_pc = p1_metrics.get("candidate_parity_checked") or 0
+_arm = "PROTECTED (fix under test)" if p1_metrics.get("parity_protection") else "DIAGNOSIS (protection off)"
+print(f"arm                    = {_arm}")
+if _pc:
+    _cp = p1_metrics["candidate_parity"]
+    print(f"candidate_parity       = {_m('candidate_parity')} "
+          f"({p1_metrics['candidate_parity_hit']} / {_pc} extractable GT spans offered)")
+    print(f"candidate_miss_rate    = {_m('candidate_miss_rate')} "
+          f"| not offered = {p1_metrics['candidate_parity_undetermined']} undetermined")
+    print(f"cands_per_param        = {_m('cands_per_param_hist')} "
+          f"fill={_m('cand_pack_fill')} cap={_m('cand_cap')}")
+    if not p1_metrics.get("parity_protection") and _cp == _cp and _cp < 0.99:
+        print(f"  [!] {1 - _cp:.1%} of extractable GT spans were NEVER in the served "
+              f"candidate set. That is a serve-side defect, not model quality: "
+              f"no amount of training fixes it. Re-run Part 1 with "
+              f"protect_parity_spans=True to measure the headroom the fix recovers.")
+    elif p1_metrics.get("parity_protection") and _cp == _cp and _cp < 0.99:
+        print(f"  [!] protection is ON but parity is still {_cp:.1%}: the GT span is "
+              f"missing for a reason OTHER than max_cands truncation (region/type "
+              f"filter, or a target whose char offsets do not survive tokenization).")
+    else:
+        print("  [i] parity is ~1.0: every extractable GT span was offerable, so "
+              "extraction_recall now measures model quality rather than mask coverage.")
+else:
+    print("candidate_parity       = n/a (no instrumented GT span in this split)")'''
 
 MARKDOWN_EVAL_PART2 = """---
 ## 5b. Evaluation Part 2 — Lean Function (Tool) Prediction (H1)
@@ -1520,6 +1835,11 @@ def eval_tool_prediction_lean(split_name: str, limit: Optional[int] = 500,
     probs = []
     margins = []
     empty_scores = 0
+    # T3: attribute every empty-``tool_scores`` row to a concrete serve-side
+    # cause. Without this bucket the old "75 empty rows" line was unfalsifiable:
+    # it could be no anchors, anchor loss in tokenization, or a head/layout
+    # mismatch, and those have completely different fixes.
+    empty_reasons = Counter()
     # Phase I: T is the layout axis H1 actually discriminated over. A mean of
     # 1.0 makes ``tool_acc`` a single-class softmax artifact, so it must be
     # printed beside the accuracy, never left to be inferred.
@@ -1557,6 +1877,7 @@ def eval_tool_prediction_lean(split_name: str, limit: Optional[int] = 500,
         margins.append(pred.get("tool_margin", 0.0))
         if not pred.get("tool_scores"):
             empty_scores += 1
+            empty_reasons[str(pred.get("tool_scores_reason") or "unknown")] += 1
         # Phase I: count how many candidate schemas H1 actually chose between.
         _scores = pred.get("tool_scores") or {}
         cand_counts[len(_scores)] += 1
@@ -1596,6 +1917,8 @@ def eval_tool_prediction_lean(split_name: str, limit: Optional[int] = 500,
               "the accuracy above is an artifact, not tool-selection skill.")
     print(f"Mean Winner Tool Probability: {mean_p:.4f} | Mean Margin: {mean_m:.4f}")
     print(f"Rows with empty tool_scores: {empty_scores}")
+    if empty_scores:
+        print(f"  empty tool_scores by cause: {dict(empty_reasons.most_common())}")
     print(f"Rows where candidates were augmented beyond s.tools: {augmented}")
     print(f"Most common wrong picks: {wrong_as.most_common(8)}")
 
@@ -1632,6 +1955,9 @@ def _features_detail(features) -> Dict[str, Any]:
 
 def predict_split(split_name: str, out_path: str, limit: Optional[int] = None,
                   detailed: bool = True) -> None:
+    # T8: ONE definition of "a predicted call", shared with Eval Part 1. Imported
+    # here (not copy-pasted) so the two parts cannot drift apart again.
+    from spancall.lean.eval_p1 import predicted_call_count as _n_predicted_calls
     src = os.path.join(DATA_DIR, f"{split_name}.jsonl")
     sub_src = os.path.join(RESULTS_DIR, f"subset_{split_name}.jsonl")
     if not os.path.exists(src):
@@ -1660,8 +1986,13 @@ def predict_split(split_name: str, out_path: str, limit: Optional[int] = None,
                 "n_gt_calls": len(s.ground_truth_calls or []),
                 # R0.4: the decoded call list. ``tool_name``/``payload`` above stay
                 # the primary (call-0) view, so single-call consumers are unchanged.
+                # T8: ``n_pred_calls`` uses the SAME rule as Part 1, via the
+                # shared helper — a call with no tool name asserts nothing, so it
+                # is not a prediction. Counting raw ``len(res.calls)`` made Part 3
+                # report abstained decodes as calls and disagree with Part 1 on
+                # the very same resolver output.
                 "calls": [c.as_dict() for c in (getattr(res, "calls", None) or [])],
-                "n_pred_calls": len(getattr(res, "calls", None) or []),
+                "n_pred_calls": _n_predicted_calls(res),
                 "hit": bool(res.hit),
                 "status": getattr(res, "status", "hit" if res.hit else "partial"),
                 "payload": res.payload,
@@ -2117,6 +2448,8 @@ cells = [
     new_code_cell(CODE_TRAIN_RUN),
     new_markdown_cell(MARKDOWN_TRAIN_TELEMETRY),
     new_code_cell(CODE_TRAIN_TELEMETRY),
+    new_markdown_cell(MARKDOWN_LORA_ABLATION),
+    new_code_cell(CODE_LORA_ABLATION),
     new_markdown_cell(MARKDOWN_PICK_CP),
     new_code_cell(CODE_PICK_CP),
     new_markdown_cell(MARKDOWN_PREDICT_INTRO),

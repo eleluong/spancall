@@ -114,6 +114,8 @@ class LeanJointDecoder:
         allow_nested: bool = True,
         normalize_scores: bool = True,
         max_nodes: int = 50_000,
+        min_confidence: Optional[float] = None,
+        min_posterior: Optional[float] = None,
     ) -> None:
         self.top_k = int(top_k)
         self.overlap_allowed = overlap_allowed
@@ -121,6 +123,42 @@ class LeanJointDecoder:
         self.allow_nested = allow_nested
         self.normalize_scores = normalize_scores
         self.max_nodes = int(max_nodes)
+        # T6: refusal on the DECODE axis. Lean has no abstain head, so a param
+        # with a flat, low-score candidate distribution used to be force-assigned
+        # its argmax regardless — every param got a value and every call looked
+        # confident. These thresholds let the decoder emit "no choice" instead:
+        #   ``min_confidence`` — the winning candidate's own probability must
+        #                        clear this floor.
+        #   ``min_posterior``  — the winner must beat the runner-up by at least
+        #                        this much (a mass-tied distribution has no winner).
+        # Both default to None (never refuse), so existing callers and every
+        # current test keep byte-identical behaviour. Refusal is opt-in because
+        # it changes recall semantics and must be measured against the fixed
+        # candidate set (T2) before being enabled in production.
+        self.min_confidence = float(min_confidence) if min_confidence is not None else None
+        self.min_posterior = float(min_posterior) if min_posterior is not None else None
+        # T6: last refusal reasons, keyed by parameter name. Initialised here (not
+        # only inside ``decode_detailed``) so a resolver can read it before the
+        # first decode without an AttributeError.
+        self.last_refusals: Dict[str, str] = {}
+
+    def _should_refuse(self, choices: Sequence["LeanValueChoice"]) -> Tuple[bool, str]:
+        """T6: decide whether a param has a defensible winner at all.
+
+        Returns ``(refuse, reason)``. A parameter with NO candidates is not a
+        refusal — that is a coverage outcome the caller already reports — so
+        only a *populated* candidate set can trigger this.
+        """
+        if not choices:
+            return False, ""
+        best = float(getattr(choices[0], "prob", 0.0) or 0.0)
+        if self.min_confidence is not None and best < self.min_confidence:
+            return True, "below_min_confidence"
+        if self.min_posterior is not None and len(choices) > 1:
+            second = float(getattr(choices[1], "prob", 0.0) or 0.0)
+            if (best - second) < self.min_posterior:
+                return True, "indistinguishable_from_runner_up"
+        return False, ""
 
     def decode(
         self,
@@ -143,11 +181,20 @@ class LeanJointDecoder:
         entity_classes = entity_classes or {}
 
         per_param: Dict[str, List[LeanValueChoice]] = {}
+        self.last_refusals: Dict[str, str] = {}
         for name, entries in candidate_scores_per_param.items():
             cands = [_coerce_entry(e) for e in entries]
             choices = self._collapse(cands, k)
             for v in choices:
                 v.entity = entity_classes.get(name)
+            # T6: drop the winner entirely when the candidate distribution does
+            # not support one. An empty list makes the param fall into the
+            # caller's "missing" branch (the honest outcome) instead of the
+            # force-assign-argmax path that made every call look confident.
+            refuse, reason = self._should_refuse(choices)
+            if refuse:
+                self.last_refusals[name] = reason
+                choices = []
             per_param[name] = choices
 
         names = list(per_param.keys())

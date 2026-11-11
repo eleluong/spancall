@@ -331,6 +331,18 @@ class CandidateMaskBuilder:
     """Build deterministic, type-filtered candidate sets per parameter (P4)."""
 
     def __init__(self, max_seq_len: Optional[int] = None, max_span_width: int = 16) -> None:
+        # Retention policy when ``max_cands`` forces a truncation. ``head`` is
+        # the legacy behaviour (earliest utterance spans win), which is exactly
+        # what made serving differ from training: the trainer keeps the
+        # supervised positives plus a stratified spread, while the resolver kept
+        # the prompt's first utterances. ``stratified`` replicates the trainer's
+        # spread so a serve-time candidate set is a subset of the training one
+        # for the same row.
+        self.pack_fill: str = "head"
+        # Spans that MUST survive truncation, as ``(tok_start, tok_end)`` pairs.
+        # The trainer uses this for the supervised positives; the resolver uses
+        # it for GT spans in candidate-parity instrumentation.
+        self.pack_protected: Optional[set] = None
         # ``None`` (default) derives the window from the *actual* token count at
         # build time — there is no hardcoded 512-token cap (long-context fix).
         # ``_effective_max_seq_len`` resolves None -> len(token_offsets).
@@ -524,10 +536,16 @@ class CandidateMaskBuilder:
         # capping free utterance spans never evicts these high-priority candidates.
         reserved_tail = len(recent_cands) + len(free_recent) + len(null_cands)
         remain = None if max_cands is None else max(0, int(max_cands) - len(cands) - reserved_tail)
+        # Protected start tokens must survive the GENERATION-time cap. ``_pack``
+        # only sees what this generator emits, so protecting downstream alone
+        # cannot rescue a span that was never materialised (T2/T4 hole).
+        _prot = getattr(self, "pack_protected", None) or set()
+        protect_starts = {ts for ts, _te in _prot} if _prot else None
 
         cands.extend(self._free_utterance_spans(
             utterance_entries, tok_by_entry, token_offsets, eidx, utterance_text,
-            max_tok=max_tok, cap=remain, tindex=ctx.tindex))
+            max_tok=max_tok, cap=remain, tindex=ctx.tindex,
+            protect_starts=protect_starts))
         cands.extend(recent_cands)
         cands.extend(free_recent)
         cands.extend(null_cands)
@@ -538,14 +556,73 @@ class CandidateMaskBuilder:
     # ------------------------------------------------------------------
 
     def _pack(self, cands: List[Candidate], max_cands: Optional[int] = None) -> Dict[str, Any]:
-        # ``max_cands`` is re-applied here as the single authoritative clamp.
-        # If truncation is required, preserve the <|null|> slot (if present)
-        # by drawing truncation budget from non-null candidates first.
+        """Clamp the candidate set to ``max_cands`` under a retention policy.
+
+        ``max_cands`` is re-applied here as the single authoritative clamp, but
+        *which* candidates survive is now explicit rather than "whatever came
+        first". Priority order:
+
+        1. **Structured context slots** (``null``/``recent``/``time``/``enum``/
+           ``bool`` regions). These are supervision targets — the deterministic
+           ``<|null|>`` slot above all — and must never be evicted by free
+           utterance noise.
+        2. **Caller-protected spans** (``pack_protected``). The trainer passes
+           its supervised positives; parity instrumentation passes GT spans.
+        3. **Remaining budget** filled per ``pack_fill``: ``head`` is the legacy
+           earliest-first behaviour, ``stratified`` spreads the retained set
+           across the whole utterance exactly like the trainer's stride fill.
+
+        Under the legacy ``head`` policy the retained set began at the prompt's
+        first utterance token, so a GT value in a later utterance was never a
+        candidate at serve time even though it always was during training —
+        the single largest source of the train/serve extraction gap.
+        """
         if max_cands is not None and len(cands) > max_cands:
             cap = max(0, int(max_cands))
-            null_cands = [c for c in cands if getattr(c, "region", "") == "null"]
-            other_cands = [c for c in cands if getattr(c, "region", "") != "null"]
-            cands = other_cands[: max(0, cap - len(null_cands))] + null_cands
+            fill = str(getattr(self, "pack_fill", "head") or "head").lower()
+            protected = getattr(self, "pack_protected", None) or set()
+
+            ordered: List[Candidate] = []
+            seen: set = set()
+
+            def _take(c: Candidate) -> None:
+                if len(ordered) < cap and id(c) not in seen:
+                    seen.add(id(c))
+                    ordered.append(c)
+
+            # 1. Structured context slots first (they carry supervision).
+            for c in cands:
+                if getattr(c, "region", "") != "utterance":
+                    _take(c)
+            # 2. Protected spans next.
+            if protected:
+                for c in cands:
+                    if (c.tok_start, c.tok_end) in protected:
+                        _take(c)
+            # 3. Fill the rest under the configured policy.
+            pool = [c for c in cands if id(c) not in seen]
+            rem = cap - len(ordered)
+            if rem > 0:
+                if fill == "head" or len(pool) <= rem:
+                    for c in pool[:rem]:
+                        _take(c)
+                else:
+                    n = len(pool)
+                    stride = n / float(rem)
+                    for i in range(rem):
+                        _take(pool[min(int(i * stride), n - 1)])
+            # Emit in DOCUMENT order so candidate indices stay monotone in token
+            # position (the pointer head's geometry and the legacy start_ok/
+            # end_ok masks both assume it).
+            #
+            # NOTE: sorting by the candidate's position, NOT by its index in the
+            # incoming list. The old ``rank``-based sort silently assumed the
+            # builder emitted candidates in document order -- true before
+            # ``_free_utterance_spans`` was allowed to enumerate protected starts
+            # first, false after. Restoring *insertion* order would then leak a
+            # head-first list out of the function, exactly the layout T4 exists
+            # to prevent.
+            cands = sorted(ordered, key=lambda c: (c.tok_start, c.tok_end))
         # window for the legacy start_ok/end_ok convenience masks: the largest
         # token index among all candidates (never a hardcoded 512).
         seq_len = max((c.tok_end for c in cands), default=-1) + 1
@@ -666,6 +743,7 @@ class CandidateMaskBuilder:
         max_tok: Optional[int] = None,
         cap: Optional[int] = None,
         tindex: Optional[TokenIndex] = None,
+        protect_starts: Optional[set] = None,
     ) -> List[Candidate]:
         """All token pairs wholly inside the utterance, windowed by W_max (W_max=16).
 
@@ -677,6 +755,21 @@ class CandidateMaskBuilder:
         windowed enumeration is O(n·W) and the caller always truncated the
         result to ``max_cands`` afterwards; passing that headroom down means the
         surplus pairs are never materialised at all.
+
+        ``protect_starts`` are start-token indices that MUST be enumerated even
+        when ``cap`` is small. This closes a hole that survived the T4 rewrite:
+        ``_pack`` can only protect candidates that EXIST, and this generator
+        walked ``starts`` in ascending order and stopped at ``cap`` — so a GT
+        span late in the utterance was never materialised, and protecting it
+        downstream was impossible. Truncation at generation time is head-first
+        truncation no retention policy can undo.
+
+        The guarantee is *materialisation*, not *ordering*: ``cap`` is a budget
+        that protected starts may exceed, and the emitted list is always sorted
+        back into document order before returning. Emitting the protected spans
+        first would hand a non-monotone candidate list to the pointer head,
+        whose geometry (and the legacy ``start_ok``/``end_ok`` masks) assumes
+        ascending token positions.
         """
         out: List[Candidate] = []
         if not utterance_entries or cap == 0:
@@ -703,15 +796,31 @@ class CandidateMaskBuilder:
             for i in range(lo, hi)
             if max(token_offsets[i][0], u_start) < min(token_offsets[i][1], u_end)
         ]
-        starts = [i for i, (tcs, tce) in in_toks if tcs in word_bounds or tcs == 0]
         tok_map = dict(in_toks)
+        starts = [i for i, (tcs, tce) in in_toks if tcs in word_bounds or tcs == 0]
+        prot = set(protect_starts or ())
+        if prot:
+            # A GT span may begin MID-WORD (the aligner matches value substrings,
+            # not word starts). Such a start is not word-aligned, so the filter
+            # above never enumerated it and protecting it downstream was still a
+            # silent no-op. Admit protected starts explicitly -- but only ones
+            # that actually exist in this row's token window.
+            starts = sorted(set(starts) | {i for i in prot if i in tok_map})
+            # Visit protected starts first ONLY so the ``cap`` budget below
+            # cannot starve them; the returned list is re-sorted at the end.
+            _prot = [i for i in starts if i in prot]
+            _rest = [i for i in starts if i not in prot]
+            starts = _prot + _rest
         cand_set: Dict[Tuple[int, int], Candidate] = {}
         # O(n·W) instead of O(n²): a candidate end j only counts within
         # max_span_width of the start i, so scan the bounded window [i, i+W).
         # in_toks is a contiguous subset of token indices — dict lookup is O(1).
         full = cap is None
         for i in starts:
-            if not full and len(cand_set) >= cap:
+            if not full and len(cand_set) >= cap and i not in prot:
+                # Budget exhausted. Protected starts are still enumerated (they
+                # are visited first, so this never truncates them), and with no
+                # protection at all this is the legacy head-first stop.
                 break
             tcs_i, _ = tok_map[i]
             for j in range(i, min(i + self.max_span_width, max_tok)):
@@ -733,8 +842,12 @@ class CandidateMaskBuilder:
                         i, j, cs_i, ce_j, "utterance",
                         cval, eidx.for_char(cs_i))
                     cand_set[(i, j)] = cand
-                    if not full and len(cand_set) >= cap:
-                        return list(cand_set.values())
+                    if not full and len(cand_set) >= cap and i not in prot:
+                        # Stop this start's window; the outer loop stops on the
+                        # next non-protected start. (A protected start keeps
+                        # enumerating: an early ``return`` here would starve a
+                        # protected start that appears later in ``starts``.)
+                        break
         # also add single-token spans not starting on a word bound (whole tokens)
         # (only when the cap still has room — this pass only ever *adds* spans
         # that the loop above skipped, so it cannot reorder existing output)
@@ -755,7 +868,9 @@ class CandidateMaskBuilder:
                         cval = utterance_text[cs_i:ce_j]
                     cand_set[(i, i)] = Candidate(
                         i, i, cs_i, ce_j, "utterance", cval, eidx.for_char(cs_i))
-        return list(cand_set.values())
+        # Document order is a hard contract, not an incidental property: the
+        # priority reordering above trades position for survival only.
+        return sorted(cand_set.values(), key=lambda c: (c.tok_start, c.tok_end))
 
     def _free_recent_spans(
         self,

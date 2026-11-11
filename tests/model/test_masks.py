@@ -13,7 +13,7 @@ from typing import Any, List, Optional, Tuple
 import pytest
 
 from spancall.data.schema import ParameterSchema
-from spancall.model.masks import CandidateMaskBuilder
+from spancall.model.masks import CandidateMaskBuilder, TokenIndex
 
 
 @dataclass(frozen=True)
@@ -248,6 +248,121 @@ def test_cand_index_matches_char_spans(builder: CandidateMaskBuilder) -> None:
     n_toks = max((te for _, te in res["cand_index"]), default=-1) + 1
     assert len(res["start_ok"]) == n_toks
     assert all(len(m) <= builder.max_seq_len for m in (res["start_ok"], res["end_ok"]))
+
+
+# ---------------------------------------------------------------------------
+# T4 candidate retention policy under a max_cands truncation
+# ---------------------------------------------------------------------------
+
+PACK_TEXT = "alpha bravo charlie delta echo foxtrot golf hotel india juliet"
+
+
+def _pack_masks(builder: CandidateMaskBuilder, max_cands: Optional[int]):
+    """Build a free-string param over ``PACK_TEXT`` with the whole text as utterance."""
+    offsets = word_tokens(PACK_TEXT)
+    utt = Ent("string", "utterance", None, 0, len(PACK_TEXT), text=PACK_TEXT)
+    return builder.build_param_masks(
+        _p("q", "string"), [utt], offsets, PACK_TEXT, max_cands=max_cands
+    )
+
+
+def test_pack_head_fill_is_the_legacy_prefix(builder: CandidateMaskBuilder) -> None:
+    """``pack_fill='head'`` must reproduce the pre-T4 behaviour exactly.
+
+    The T4 rewrite is only safe if the legacy policy is still reachable and
+    unchanged: it is the control arm of the train/serve comparison.
+    """
+    builder.pack_fill = "head"
+    res = _pack_masks(builder, max_cands=3)
+    assert res["num_candidates"] == 3
+    # Head retention keeps the EARLIEST spans in document order.
+    starts = [c.tok_start for c in res["candidates"]]
+    assert starts == sorted(starts)
+    assert max(starts) < 4, f"head fill kept a late span: {starts}"
+
+
+def test_pack_protected_span_survives_truncation(builder: CandidateMaskBuilder) -> None:
+    """A protected (GT) span must never be evicted by ``max_cands``.
+
+    This is the actual T2 fix: parity protection is only meaningful if the span
+    survives the cap. It also guards the ``tool::param`` vs bare-param key
+    mismatch that previously made protection a silent no-op.
+    """
+    # NOTE: word_tokens yields CHAR offsets; candidates carry TOKEN indices.
+    # With this one-token-per-word tokenizer the last word is token index n-1.
+    last = len(word_tokens(PACK_TEXT)) - 1   # "juliet" -> (9, 9)
+    target = (last, last)
+    builder.pack_fill = "head"               # would definitely drop a late span
+    builder.pack_protected = {target}
+    res = _pack_masks(builder, max_cands=3)
+    kept = {(c.tok_start, c.tok_end) for c in res["candidates"]}
+    assert target in kept, f"protected span evicted by max_cands; kept={sorted(kept)}"
+
+
+def test_pack_result_stays_sorted_by_document_position(
+    builder: CandidateMaskBuilder,
+) -> None:
+    """Priority reordering must not leak out as a non-monotone candidate list.
+
+    The pointer head's geometry and the legacy ``start_ok``/``end_ok`` masks both
+    assume candidates ascend by token index; an unsorted list silently corrupts
+    them rather than raising.
+    """
+    last = len(word_tokens(PACK_TEXT)) - 1
+    target = (last, last)
+    builder.pack_fill = "stratified"
+    builder.pack_protected = {target}
+    res = _pack_masks(builder, max_cands=4)
+    starts = [c.tok_start for c in res["candidates"]]
+    assert starts == sorted(starts), f"candidate order not monotone: {starts}"
+    # The protected span survives under the OTHER fill policy too.
+    assert target in {(c.tok_start, c.tok_end) for c in res["candidates"]}
+
+
+def test_pack_protected_span_off_word_bound_survives(
+    builder: CandidateMaskBuilder,
+) -> None:
+    """A GT span whose snapped start is NOT a word-bound token must survive.
+
+    The generator only *spontaneously* emits starts at word boundaries, but the
+    resolver protects GT spans by snapping their CHAR range onto tokens. Word
+    bounds are derived from the joined entry text, so they need not coincide
+    with the rendered coordinates a GT span was measured in — a protected start
+    can therefore sit off the word-bound set. Widening the budget alone left
+    those spans un-materialised, i.e. protection was still a silent no-op.
+    """
+    offsets = char_tokens(PACK_TEXT)          # one token per non-space char
+    utt = Ent("string", "utterance", None, 0, len(PACK_TEXT), text=PACK_TEXT)
+    # "ravo": begins inside the word "bravo", ends on a word boundary.
+    cs = PACK_TEXT.index("bravo") + 1
+    target = TokenIndex(offsets, len(offsets)).snap_char_range(cs, cs + 4)
+    assert target is not None
+
+    # Control: head truncation without protection drops the span entirely.
+    builder.pack_protected = None
+    builder.pack_fill = "head"
+    control = builder.build_param_masks(
+        _p("q", "string"), [utt], offsets, PACK_TEXT, max_cands=3
+    )
+    assert target not in {(c.tok_start, c.tok_end) for c in control["candidates"]}
+
+    builder.pack_protected = {target}
+    res = builder.build_param_masks(
+        _p("q", "string"), [utt], offsets, PACK_TEXT, max_cands=3
+    )
+    kept = {(c.tok_start, c.tok_end) for c in res["candidates"]}
+    assert target in kept, f"off-bound protected span evicted; kept={sorted(kept)}"
+    starts = [c.tok_start for c in res["candidates"]]
+    assert starts == sorted(starts), f"candidate order not monotone: {starts}"
+
+
+def test_pack_without_protection_still_respects_the_cap(
+    builder: CandidateMaskBuilder,
+) -> None:
+    """Production path: ``pack_protected`` is None -> no protection, cap honoured."""
+    builder.pack_protected = None
+    res = _pack_masks(builder, max_cands=2)
+    assert res["num_candidates"] == 2
 
 
 # ---------------------------------------------------------------------------
