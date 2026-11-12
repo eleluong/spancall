@@ -1855,6 +1855,191 @@ else:
     print("      the GPU run is deferred. Enable the flag + `!pip install peft`.")
 '''
 
+MARKDOWN_BINARY_ABLATION = """### (Optional) v2.1 — Softmax H1 vs Binary H1 Ablation
+
+Does per-anchor `P(this tool is called)` beat a softmax over the packed
+distractors? This cell trains **both arms** from the same data with the same
+seed / fraction / epochs, so the only degree of freedom is the objective.
+
+- **`ce` arm** — the shipped softmax H1. `sum_t p_t = 1`, so a confident
+  distractor *lowers* the correct tool's probability.
+- **`binary` arm** — `BinaryToolHead` + `BCEWithLogits` against a one-hot of the
+  called anchors. Scores are independent, so `0.25` is an absolute `P(called)`
+  and a serve-time threshold is a real operating point.
+
+Knob placement matters: `use_binary_tool_head` is an **`OptimizationConfig`
+field**, so it is written under `optimization:`. Under `model:` or `training:`
+it would be silently ignored — the same class of bug as
+[`freeze_encoder_stages`](scripts/build_lean_v2_colab_notebook.py).
+
+**Reading the table.** `tool_acc` exists for both arms (the CE head is always
+evaluated); `tool_binary_acc` exists **only** for the binary arm, because the
+trainer emits `tool_binary_logits` only when the flag is on — a NaN there on the
+`ce` row is expected, not a failure. The kill criterion from
+[`plans/binary_tool_selection_plan.md`](../plans/binary_tool_selection_plan.md)
+is applied in the printed verdict: if `tool_binary_acc <= tool_acc` **and** there
+is no gate-conditioned param-precision separation, revert to softmax and record
+the negative result.
+
+Retraining is required — this is not an eval-only change. Serving the binary
+weights through a softmax resolver (or vice versa) is a scoring bug, so
+`LeanResolver` must be constructed with `tool_objective` matching the checkpoint
+(`provenance.json` records it, and the resolver raises if a binary arm is built
+against a model with no `tool_head_binary`)."""
+
+CODE_BINARY_ABLATION = '''# ---- v2.1: softmax H1 vs binary H1 ablation (opt-in; default OFF) ----
+import glob, json, math, os, yaml
+
+RUN_BINARY_TOOL_ABLATION = False   # flip to True to actually retrain BOTH arms
+BIN_ABLATION_EPOCHS = int(globals().get("NUM_EPOCHS", 5))   # identical for BOTH arms
+BIN_ABLATION_ARMS = (("ce", False), ("binary", True))
+
+
+def _write_binary_arm_config(base_cfg, use_binary, arm_name, arm_out):
+    """Materialise one arm's YAML.
+
+    ``use_binary_tool_head`` is an ``OptimizationConfig`` field, so it MUST be
+    written under ``optimization:``. Under ``model:`` or ``training:``
+    ``TrainingConfig.from_dict`` never looks for it and the arm silently trains
+    the softmax objective -- the same silent-no-op class of bug that made
+    ``freeze_encoder_stages`` do nothing (T11).
+    """
+    cfg = json.loads(json.dumps(base_cfg))          # yaml-safe deep copy
+    cfg.setdefault("experiment", {})
+    cfg["experiment"]["name"] = arm_name
+    cfg["experiment"]["output_dir"] = arm_out
+    cfg.setdefault("optimization", {})
+    cfg["optimization"]["use_binary_tool_head"] = bool(use_binary)
+    cfg["optimization"]["num_epochs"] = int(BIN_ABLATION_EPOCHS)
+    cfg.setdefault("data", {})
+    cfg["data"]["fraction"] = float(globals().get("TRAIN_FRACTION", 1.0))
+    cfg["data"]["pack_tools"] = int(globals().get("PACK_TOOLS_EPH", 1) or 1)
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    path = os.path.join(RESULTS_DIR, f"binary_tool_ablation_{arm_name}.yaml")
+    with open(path, "w") as fh:
+        yaml.safe_dump(cfg, fh)
+    return path
+
+
+def _bin_arm_summary(arm_root, exp_name):
+    """Read back one arm's tail-of-training dev metrics + objective provenance.
+
+    ``tool_binary_acc`` is NaN on the ``ce`` arm by construction: the trainer
+    emits ``tool_binary_logits`` only when ``use_binary_tool_head`` is on.
+    """
+    out = {
+        "train_loss": float("nan"),
+        "span_acc": float("nan"),
+        "exact_call": float("nan"),
+        "tool_acc": float("nan"),
+        "tool_binary_acc": float("nan"),
+        "tool_objective": None,
+    }
+    log_p = os.path.join(arm_root, f"{exp_name}_seed{SEED}", "train_log.jsonl")
+    recs = []
+    if os.path.exists(log_p):
+        with open(log_p) as fh:
+            recs = [json.loads(l) for l in fh if l.strip()]
+    evals = [r for r in recs if r.get("event") == "epoch_eval" and r.get("split") == "dev"]
+    if evals:
+        last = evals[-1]
+        for key in ("span_acc", "exact_call", "tool_acc", "tool_binary_acc"):
+            try:
+                out[key] = float(last.get(key))
+            except (TypeError, ValueError):
+                out[key] = float("nan")
+    ends = [r for r in recs if r.get("event") == "epoch_end"]
+    if ends:
+        try:
+            out["train_loss"] = float(ends[-1].get("mean_loss"))
+        except (TypeError, ValueError):
+            pass
+    provs = sorted(glob.glob(os.path.join(arm_root, "**", "provenance.json"), recursive=True))
+    if provs:
+        with open(provs[-1]) as fh:
+            out["tool_objective"] = json.load(fh).get("tool_objective")
+    return out
+
+
+if RUN_BINARY_TOOL_ABLATION:
+    from scripts.train_lean import main as train_lean_main
+
+    with open(CONFIG_PATH) as fh:
+        base_cfg = yaml.safe_load(fh)
+
+    results = {}
+    for arm_name, use_binary in BIN_ABLATION_ARMS:
+        arm_root = os.path.join(RESULTS_DIR, "binary_tool_ablation", arm_name)
+        cfg_path = _write_binary_arm_config(
+            base_cfg, use_binary, f"binary_tool_ablation_{arm_name}", arm_root
+        )
+        print("=" * 78)
+        print(f"[v2.1] arm={arm_name}  use_binary_tool_head={use_binary}  out={arm_root}")
+        print("=" * 78)
+        train_lean_main([
+            "--config", cfg_path,
+            "--experiment_name", f"binary_tool_ablation_{arm_name}",
+            "--output_dir", arm_root,
+            "--data_dir", TENSOR_DIR,
+            "--stages", "T2",
+            "--device", DEVICE,
+            "--seed", str(SEED),
+        ])
+        results[arm_name] = _bin_arm_summary(
+            arm_root, f"binary_tool_ablation_{arm_name}"
+        )
+
+    def _fmt_bin(x):
+        try:
+            v = float(x)
+        except (TypeError, ValueError):
+            return "n/a"
+        return "n/a" if not math.isfinite(v) else f"{v:.4f}"
+
+    print("=" * 78)
+    print("v2.1 H1 OBJECTIVE ABLATION - dev comparison (identical seed / fraction / epochs)")
+    print("=" * 78)
+    hdr = (f"{'arm':<10}{'objective':>12}{'train_loss':>12}{'span_acc':>10}"
+           f"{'exact_call':>12}{'tool_acc':>10}{'tool_bin_acc':>14}")
+    print(hdr)
+    print("-" * len(hdr))
+    for arm_name, _use_binary in BIN_ABLATION_ARMS:
+        m = results[arm_name]
+        print(f"{arm_name:<10}{str(m.get('tool_objective') or '-'):>12}"
+              f"{_fmt_bin(m['train_loss']):>12}{_fmt_bin(m['span_acc']):>10}"
+              f"{_fmt_bin(m['exact_call']):>12}{_fmt_bin(m['tool_acc']):>10}"
+              f"{_fmt_bin(m['tool_binary_acc']):>14}")
+
+    # ---- kill criterion (binary_tool_selection_plan.md §6) ----------------
+    _ce = results["ce"]["tool_acc"]
+    _bin = results["binary"]["tool_binary_acc"]
+    print()
+    if math.isfinite(_ce) and math.isfinite(_bin):
+        print(f"kill criterion: binary tool_acc {_bin:.4f} vs softmax {_ce:.4f} "
+              f"({_bin - _ce:+.4f})")
+        if _bin <= _ce:
+            print("  [KILL] the binary head does not beat the softmax arm on dev.")
+            print("         Revert to softmax and RECORD the negative result; do not")
+            print("         ship the arm on the strength of a single noisy split.")
+            print("         Check `cands/row` first: with T == 1 both objectives are")
+            print("         vacuous and the comparison means nothing.")
+        else:
+            print("  [WIN] the binary arm beats the softmax arm on dev tool selection.")
+            print("         Proceed to the gate-conditioned param-precision check before")
+            print("         declaring the W5 decision.")
+    else:
+        print("kill criterion: n/a -- one arm produced no dev tool metric.")
+        print("  Check that the arm actually trained (train_log.jsonl epoch_eval rows)")
+        print("  and that pack_tools >= 2. With T == 1 the CE arm has a single class")
+        print("  (CE == 0) and tool_acc is a vacuous 1.000.")
+else:
+    print("[v2.1] binary-tool ablation skipped (RUN_BINARY_TOOL_ABLATION = False).")
+    print("       Wiring is live: optimization.use_binary_tool_head, BinaryToolHead,")
+    print("       compute_lean_tool_loss_binary, trainer flag, resolver sigmoid mode.")
+    print("       Only the two-arm retrain is deferred. Note the resolver MUST be")
+    print("       constructed with tool_objective matching the checkpoint.")
+'''
+
 MARKDOWN_PICK_CP = """### Pick the Best Lean Checkpoint
 
 Selects `results_lean/{exp}_seed{seed}/best_checkpoint` (or the latest stage checkpoint)."""
@@ -3205,6 +3390,8 @@ cells = [
     new_code_cell(CODE_TRAIN_TELEMETRY),
     new_markdown_cell(MARKDOWN_LORA_ABLATION),
     new_code_cell(CODE_LORA_ABLATION),
+    new_markdown_cell(MARKDOWN_BINARY_ABLATION),
+    new_code_cell(CODE_BINARY_ABLATION),
     new_markdown_cell(MARKDOWN_PICK_CP),
     new_code_cell(CODE_PICK_CP),
     new_markdown_cell(MARKDOWN_PREDICT_INTRO),

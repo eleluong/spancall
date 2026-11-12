@@ -151,7 +151,56 @@ abstain from positive-side supervision alone.
    (binary targets are anchor-index-based, immune to the offset rot, but the
    param-favoring effect is only measurable on clean labels).
 
+## Implementation status
+
+Steps **1–3 are done and green** (658 tests, 28 of them new in
+`tests/test_lean_binary_tool.py`; the 630 pre-existing tests pass unchanged).
+
+| Step | State | Where |
+|---|---|---|
+| BinaryToolHead | done | [`heads.py:89`](spancall/model/heads.py:89), wired at [`model.py:154`](spancall/lean/model.py:154) |
+| `compute_lean_tool_loss_binary` | done | [`loss.py:107`](spancall/lean/loss.py:107) |
+| `tool_objective` / `lambda_tool_binary` on the container | done | [`loss.py:248`](spancall/lean/loss.py:248) |
+| Trainer flag, lock-step objective, `tool_binary_acc` | done | [`trainer.py:301`](spancall/lean/trainer.py:301) |
+| Resolver sigmoid + absolute gate (both entry points) | done | [`resolver.py:216`](spancall/lean/resolver.py:216) |
+| Config knobs | done | [`config.py:114`](spancall/train/config.py:114) |
+| Provenance records the arm | done | [`trainer.py:1441`](spancall/lean/trainer.py:1441) |
+| Calibration sweep + `eval_p1` P/R/F1 at τ | **pending** | — |
+| Notebook ablation cell | **pending** | — |
+
+### Deviations from the design above (and why)
+
+1. **Dead anchors are excluded from the mean, not merely zeroed.** `-1e4` makes
+   `BCEWithLogits` ≈ 0 for that column, but a plain `mean(-1)` would still
+   divide by the PADDED width, so a row whose anchor failed to snap would report
+   a systematically smaller loss than the same row fully live. The CE path
+   normalises over live anchors only (`exp(-1e4) == 0`), so the binary loss now
+   does too: `sum(-1) / live.sum(-1)`. Pinned by
+   `test_binary_loss_scale_is_invariant_to_padding_columns`.
+2. **A row whose every anchor is dead is unsupervised**, not a 0.0 loss —
+   otherwise a dead row is reported as a suspiciously perfect prediction.
+3. **The binary branch is gated on `tool_objective == "binary"`, not only on
+   the presence of `tool_binary_logits`.** With the flag off the trainer never
+   emits that key, so gating on presence alone was equivalent *for the current
+   trainer* — but an injected predictions dict would then silently train two
+   competing H1 objectives in the CE arm.
+4. **`use_binary_tool_head` resolves as explicit arg > optimization config >
+   False**, so a YAML-only ablation works and every existing caller is
+   unaffected (the arg is `Optional[bool]`, default `None`).
+5. **The trainer force-aligns an injected loss container's `tool_objective`.**
+   A CE container plus the flag on would train the OLD head while reporting a
+   binary arm — the one failure mode a kill-criterion ablation cannot have.
+6. **The resolver raises at construction in binary mode if the model has no
+   `tool_head_binary`**, and `_tool_scores` records `no_binary_tool_head`
+   rather than falling back to the CE head.
+7. **The `T == 1` short-circuit is shared by both arms** and the gate is
+   deliberately inert there: with one rendered anchor neither objective carries
+   information, and abstaining would break the single-candidate contract.
+8. **Provenance records `tool_objective`** so a checkpoint cannot be scored
+   with the wrong head — the resolver must be constructed with the same value.
+
 ## Files touched
-`spancall/lean/model.py`, `loss.py`, `trainer.py`, `resolver.py`, `eval_p1.py`;
-`scripts/build_lean_colab_notebook.py`; new `tests/test_lean_binary_tool.py`;
-regenerated notebook. **No tensorize changes.**
+`spancall/model/heads.py` (new head); `spancall/lean/model.py`, `loss.py`,
+`trainer.py`, `resolver.py`; `spancall/train/config.py`; new
+`tests/test_lean_binary_tool.py`. **No tensorize changes** — the one-hot scatter
+happens inside the loss, exactly as designed above.

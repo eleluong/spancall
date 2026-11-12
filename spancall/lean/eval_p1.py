@@ -253,8 +253,33 @@ def _fmt(v: Any, nd: int = 4) -> str:
 # Evaluation driver
 # --------------------------------------------------------------------------- #
 
-def _parity_spans_for_call(sample: UnifiedSample, call_index: int) -> Dict[str, List[Tuple[int, int]]]:
-    """T1: GT ``(char_start, char_end)`` spans per param for ONE call.
+def _parity_spans_for_call(
+    sample: UnifiedSample, call_index: int
+) -> Dict[str, List[Any]]:
+    """T1: GT span addresses per param for ONE call, render-invariant first.
+
+    Emits ``(rel_start, rel_end, expect)`` triples when the target carries the
+    ``utt_rel_*`` pair, and ``(char_start, char_end)`` pairs only when it does
+    not. The distinction is the whole P1 fix:
+
+    ``char_start``/``char_end`` are absolute in whichever render the ALIGNER
+    produced. The resolver builds a FRESH render at serve time (its own tool
+    pack, its own template pass), so an absolute pair from the split file
+    addresses different characters there — and the old membership check compared
+    those stale coordinates against the live candidate set. That is a measurement
+    defect, not a candidate-set defect: the reported parity 0.0806 was mostly the
+    utterance sitting at a different offset, exactly the staleness class W1 fixed
+    for training labels.
+
+    ``utt_rel_start``/``utt_rel_end`` are offsets into the utterance TEXT, which
+    is sanitize-stable, so the resolver can re-resolve them against its own
+    render (see ``resolve_utterance_span``). Returning the canonical value as
+    the third element makes the resolver verify the mapped slice rather than
+    trusting an offset that may have drifted with the text.
+
+    A target with no rel pair still yields its absolute pair so legacy splits
+    keep working; the resolver counts those as ``parity_rel_fallback``, so a
+    run that silently lost the rel pairs can never look like a clean one.
 
     Only extractable targets with a usable span can be parity-checked: an
     ``unresolved`` target has no span to offer, and a context-derived target
@@ -262,12 +287,25 @@ def _parity_spans_for_call(sample: UnifiedSample, call_index: int) -> Dict[str, 
     correct refusals the retrieval-first contract already accounts for, so
     including them would inflate the parity failure rate for the wrong reason.
     """
-    out: Dict[str, List[Tuple[int, int]]] = {}
+    out: Dict[str, List[Any]] = {}
     for pname, targets in (sample.targets_for_call(call_index) or {}).items():
-        spans: List[Tuple[int, int]] = []
+        spans: List[Any] = []
         for t in targets:
             if t.target_type in NON_EXTRACTABLE_TARGET_TYPES:
                 continue
+            rel_cs = getattr(t, "utt_rel_start", None)
+            rel_ce = getattr(t, "utt_rel_end", None)
+            if rel_cs is not None and rel_ce is not None:
+                canon = getattr(t, "canonical_value", None)
+                spans.append((
+                    int(rel_cs),
+                    int(rel_ce),
+                    None if canon is None else str(canon),
+                ))
+                continue
+            # Legacy target: no render-invariant address exists. Hand over the
+            # absolute pair instead of dropping it (that would hide the row), and
+            # let the resolver count the fallback.
             cs = getattr(t, "char_start", None)
             ce = getattr(t, "char_end", None)
             if cs is None or ce is None:
@@ -406,6 +444,15 @@ def eval_param_extraction_lean(
     parity_checked = 0
     parity_hit = 0
     parity_undetermined = 0            # resolver exposed no parity instrumentation
+    # P1 accounting: HOW the checked spans were addressed. ``rel`` came from the
+    # render-invariant pair (trustworthy), ``fallback`` from a stored absolute pair
+    # (still exposed to serve-time render skew) and ``unresolvable`` from a rel
+    # pair that did not map onto the served render (counted as a miss). Reported
+    # separately because a silent fallback would make a legacy split look like a
+    # clean P1 run.
+    parity_rel_resolved = 0
+    parity_rel_fallback = 0
+    parity_unresolvable = 0
     cands_per_param_hist: Counter = Counter()
     cands_per_param_rows = 0
     cand_cap_seen: Counter = Counter()
@@ -476,6 +523,13 @@ def eval_param_extraction_lean(
                     if "parity_checked" in _f:
                         parity_checked += int(_f.get("parity_checked", 0))
                         parity_hit += int(_f.get("parity_hit", 0))
+                        # ``rel_resolved``/``rel_fallback``/``unresolvable`` are
+                        # only present on a resolver that implements the P1 fix.
+                        # Their absence is NOT an error (old stubs keep working),
+                        # but it is also not silently counted as "all rel".
+                        parity_rel_resolved += int(_f.get("parity_rel_resolved", 0))
+                        parity_rel_fallback += int(_f.get("parity_rel_fallback", 0))
+                        parity_unresolvable += int(_f.get("parity_unresolvable", 0))
                     else:
                         parity_undetermined += sum(len(v) for v in _p_spans.values())
                 per_call.append((ci, gt_call, gt_tool, res))
@@ -838,6 +892,14 @@ def eval_param_extraction_lean(
         "candidate_parity_hit": parity_hit,
         "candidate_parity_undetermined": parity_undetermined,
         "candidate_miss_rate": _round(offered_miss_rate),
+        # P1: how the checked spans were ADDRESSED. ``rel_resolved`` is the
+        # trustworthy population (mapped onto the served render); ``rel_fallback``
+        # still carries stored absolute offsets and so is exposed to the very skew
+        # this phase removes; ``unresolvable`` counts labels that pointed at
+        # characters the served render does not have (a data bug).
+        "parity_rel_resolved": parity_rel_resolved,
+        "parity_rel_fallback": parity_rel_fallback,
+        "parity_unresolvable": parity_unresolvable,
         # T2: which arm of the experiment produced the numbers above. Without
         # this a protected run and a diagnosis run are indistinguishable in the
         # metrics dict, and the "did the fix work" comparison is unfalsifiable.
@@ -960,6 +1022,20 @@ def _print_report(
         print(f"  -> pack_fill={metrics['cand_pack_fill']} cap={metrics['cand_cap']} "
               f"cands/param hist={metrics['cands_per_param_hist']} "
               f"over {metrics['cands_per_param_rows']} param(s)")
+        # P1: the addressing mix. Printed unconditionally next to the parity number
+        # because the number means different things in each arm: all-rel is a clean
+        # render-invariant measurement, while any fallback means stored absolute
+        # offsets are still in play and the rate must be read as a lower bound.
+        _rel = int(metrics.get("parity_rel_resolved", 0))
+        _fb = int(metrics.get("parity_rel_fallback", 0))
+        _ur = int(metrics.get("parity_unresolvable", 0))
+        if (_rel or _fb or _ur):
+            print(f"  -> addressing: rel={_rel} (render-invariant) | "
+                  f"fallback={_fb} (absolute, still skew-exposed) | "
+                  f"unresolvable={_ur} (label points outside the served render)")
+            if _fb:
+                print("     WARNING: fallback spans present -- the split lacks "
+                      "utt_rel_* pairs, so parity is a LOWER BOUND, not the real rate")
         print("  -> parity low  = serve-time defect (GT span never offerable): fix candidate packing")
         print("  -> parity high = model picked the wrong candidate: fix training/signal")
     else:

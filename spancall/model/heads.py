@@ -86,6 +86,65 @@ class ToolHead(BaseHead, nn.Module):
 
 
 # --------------------------------------------------------------------------- #
+class BinaryToolHead(BaseHead, nn.Module):
+    """H1-binary — Per-anchor P(this tool is called), scored INDEPENDENTLY.
+
+    Same inputs and output shape as :class:`ToolHead` (``(B, T)`` one logit per
+    rendered ``<|tool|>`` anchor), so the two are directly comparable arms of the
+    same ablation. Only the objective differs: this head is trained with
+    ``binary_cross_entropy_with_logits`` against a one-hot of the called anchors
+    instead of a softmax cross-entropy.
+
+    Why a separate head instead of a config switch on ``ToolHead``:
+
+    - The softmax head forces ``sum_t p_t = 1``, so a confident distractor
+      *lowers* the correct tool's probability. A sigmoid has no such competition:
+      the score of one anchor is independent of the other anchors' scores.
+    - A sigmoid output is an absolute ``P(called)``, so a serve-time threshold is
+      a real operating point rather than "how much better than the runner-up".
+      With a softmax over ``T`` anchors, 0.25 means nothing on its own.
+
+    The honest limit (recorded so the ablation is falsifiable): with a single
+    rendered anchor (``T == 1``) BCE also has no negatives, so the row carries no
+    signal. ``jitter_pack_tools`` is what makes training-time ``T >= 2``.
+
+    A dead anchor's logit is filled with ``-1e4`` by the callers, and
+    ``BCEWithLogits(-1e4, 0) ~ 0`` — so padded anchors stay silent here exactly
+    as they do under the masked softmax cross-entropy.
+    """
+
+    def __init__(self, hidden_dim: int) -> None:
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(
+        self,
+        tool_token_embeddings: torch.Tensor,
+        cls_embedding: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Return per-anchor binary logits, ``(B, T)``.
+
+        Identical signature to :meth:`ToolHead.forward` so the trainer can swap
+        heads without touching the encodings: both consume ``[H_tau_t; H_CLS]``.
+        """
+        B, T, _ = tool_token_embeddings.shape
+        if cls_embedding is None:
+            cls = tool_token_embeddings.mean(dim=1, keepdim=True)
+        elif cls_embedding.dim() == 2:
+            cls = cls_embedding.unsqueeze(1)
+        else:
+            cls = cls_embedding
+        cls = cls.expand(B, T, -1)
+        inp = torch.cat([tool_token_embeddings, cls], dim=-1)  # (B, T, 2d)
+        return self.mlp(inp).squeeze(-1)  # (B, T)
+
+
+# --------------------------------------------------------------------------- #
 # H2 — Call-Count Head
 # --------------------------------------------------------------------------- #
 class CallCountHead(BaseHead, nn.Module):

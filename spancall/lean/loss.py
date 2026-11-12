@@ -3,6 +3,10 @@
 Provides:
 - compute_lean_pointer_loss: multi-positive softmax cross-entropy directly over
   candidate spans (B, K, C) without abstain columns or abstain weighting.
+- compute_lean_tool_loss: softmax cross-entropy (or set-marginal) over the
+  rendered ``<|tool|>`` anchors -- the original H1.
+- compute_lean_tool_loss_binary: per-anchor BCE, the v2.1 ablation arm. Same
+  logits, same targets, different objective.
 - LeanLossContainer: computes joint (tool_loss + pointer_loss).
 """
 
@@ -17,6 +21,12 @@ import torch.nn.functional as F
 # Shared sentinel with the tensorizer/collator. Kept as a literal fallback so
 # this module has no import cycle with ``tensorize``.
 PAD_INDEX: int = -1
+
+# The trainer masks a dead ``<|tool|>`` anchor with this logit. Restated here as
+# a NAMED constant (rather than a magic number) because the binary loss uses it
+# to decide which anchors are live, and that choice changes the loss scale.
+DEAD_ANCHOR_LOGIT: float = -1e4
+_DEAD_ANCHOR_LOGIT: float = DEAD_ANCHOR_LOGIT
 
 
 def compute_lean_tool_loss(
@@ -100,6 +110,105 @@ def _lean_tool_supervision_count(
     return valid.any(-1).sum().float()
 
 
+def compute_lean_tool_loss_binary(
+    tool_logits: torch.Tensor,
+    tool_targets: torch.Tensor,
+    pos_weight: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """Binary H1 loss: each rendered anchor is scored as called / not-called.
+
+    Consumes the SAME ``(B, T)`` logit tensor and the SAME targets as
+    :func:`compute_lean_tool_loss`; only the objective changes. The one-hot
+    target is scattered INSIDE this function, so no new batch key is required and
+    the tensorizer is untouched.
+
+    Accepts both target shapes, mirroring the CE path:
+
+    - ``(B,)`` -- one correct anchor per row (legacy contract).
+    - ``(B, P)`` -- up to ``P`` correct anchors per row (R0.4 multi-call). Every
+      member is a positive, so a two-call row supervises two anchors at target 1
+      and the rest at 0. This is the property softmax cannot express cleanly:
+      a set of positives is just a one-hot vector with several ones.
+
+    ``pos_weight`` counters the 1-positive-of-T imbalance (a good default is
+    ``T - 1``).
+
+    Dead anchors already carry ``-1e4`` from the callers and are EXCLUDED from
+    both terms here. Two reasons, and the second is the important one:
+
+    1. ``BCEWithLogits(-1e4, 0) ~ 0``, so they contribute no gradient -- which
+       is why the caller needs no extra mask argument.
+    2. They must not dilute the denominator either. The CE path normalises over
+       live anchors only (``exp(-1e4)`` is 0 in its ``logsumexp``), so a row
+       whose anchor failed to snap would otherwise carry a systematically
+       SMALLER binary loss than the same row with every anchor live. Averaging
+       over a padded column is exactly the kind of silent scale difference that
+       makes an ablation uninterpretable.
+
+    Returns ``None`` when no row carries supervision, mirroring the CE contract:
+    callers must SKIP the term, never add a zero.
+    """
+    if tool_logits.dim() != 2 or tool_logits.numel() == 0:
+        return None
+    C = int(tool_logits.size(-1))
+    T = tool_targets
+    if not isinstance(T, torch.Tensor) or T.numel() == 0:
+        return None
+
+    if T.dim() <= 1:
+        flat = T.reshape(-1)
+        if int(flat.size(0)) != int(tool_logits.size(0)):
+            return None
+        valid = (flat >= 0) & (flat < C)
+        has_row = valid
+        # Scatter the scalar target into a one-hot (B, C).
+        one_hot = torch.zeros_like(tool_logits)
+        one_hot[torch.arange(int(flat.size(0)), device=flat.device)[valid], flat[valid]] = 1.0
+    else:
+        if T.dim() != 2 or int(T.size(0)) != int(tool_logits.size(0)):
+            return None
+        valid = (T >= 0) & (T < C)
+        has_row = valid.any(-1)
+        one_hot = torch.zeros_like(tool_logits)
+        rows = torch.arange(int(T.size(0)), device=T.device).unsqueeze(-1).expand_as(T)
+        # ``valid`` already excludes PAD_INDEX, so the scatter can never write to
+        # a negative column; two calls naming the SAME tool are idempotent.
+        one_hot[rows[valid], T[valid]] = 1.0
+
+    # Live anchors only: the caller signals "dead" by filling the logit with
+    # -1e4, so this threshold identifies exactly the anchors that carry signal.
+    live = tool_logits > _DEAD_ANCHOR_LOGIT
+    # A row whose every anchor is dead is NOT scoreable: it would otherwise be
+    # averaged as a diluted 0.0, i.e. reported as a suspiciously good loss. It is
+    # excluded exactly like an unsupervised row (``has_row`` also filters the
+    # denominator), mirroring how the CE path treats ``exp(-1e4) == 0``.
+    has_row = has_row & live.any(-1)
+    if not bool(has_row.any()):
+        return None
+
+    per_anchor = F.binary_cross_entropy_with_logits(
+        tool_logits, one_hot, reduction="none", pos_weight=pos_weight
+    )
+    per_anchor = per_anchor * live
+    # Average over LIVE anchors inside supervised ROWS only; a row with no
+    # supervised anchor (every target -1) contributes nothing to either side.
+    per_row = per_anchor.sum(-1) / live.sum(-1).clamp(min=1.0)
+    return (per_row * has_row).sum() / has_row.sum().clamp(min=1)
+
+
+def _lean_tool_binary_supervision_count(
+    tool_logits: torch.Tensor,
+    tool_targets: torch.Tensor,
+) -> torch.Tensor:
+    """Rows with binary H1 supervision -- the micro-average denominator.
+
+    Shares the supervision rules with the CE counter, so ``loss x count``
+    reconstructs the batch SUM that was averaged, keeping the trainer's
+    slot-weighted accumulation valid for both arms.
+    """
+    return _lean_tool_supervision_count(tool_logits, tool_targets)
+
+
 def compute_lean_pointer_loss(
     candidate_logits: torch.Tensor,
     positive_indices: torch.Tensor,
@@ -157,10 +266,23 @@ class LeanLossContainer(nn.Module):
         self,
         lambda_pointer: float = 1.0,
         lambda_tool: float = 1.0,
+        lambda_tool_binary: float = 1.0,
+        tool_objective: str = "ce",
     ) -> None:
         super().__init__()
         self.lambda_pointer = lambda_pointer
         self.lambda_tool = lambda_tool
+        # Weight for the v2.1 binary arm. Kept separate from ``lambda_tool`` so
+        # an ablation can track both terms independently.
+        self.lambda_tool_binary = lambda_tool_binary
+        # Which H1 objective actually TRAINS: ``ce`` (default, the shipped
+        # head) or ``binary`` (v2.1). This is deliberately an explicit string
+        # rather than "whichever logits happen to be present", because a silent
+        # fallback would make a mis-wired ablation look like a successful one.
+        obj = str(tool_objective or "ce").lower()
+        if obj not in ("ce", "binary"):
+            raise ValueError(f"tool_objective must be 'ce' or 'binary', got {tool_objective!r}")
+        self.tool_objective = obj
 
     def forward(
         self,
@@ -242,16 +364,55 @@ class LeanLossContainer(nn.Module):
                 t_loss = compute_lean_tool_loss(tool_logits, tool_targets)
                 if t_loss is not None:
                     out["tool"] = t_loss.detach()
-                    # Same micro-average bookkeeping as the pointer term: report
-                    # the per-batch SUM and the number of supervised rows so the
-                    # trainer can weight batches by supervision instead of by
-                    # batch count (see the note above).
-                    n_tool_sup = _lean_tool_supervision_count(tool_logits, tool_targets)
-                    out["tool_sum"] = t_loss.detach() * n_tool_sup
-                    out["tool_count"] = n_tool_sup
-                    total_loss = total_loss + self.lambda_tool * t_loss
+                    # In the ``binary`` arm the CE value is a REFERENCE metric
+                    # only: it is reported so the two objectives can be compared
+                    # on identical data, but it must not enter the total (that
+                    # would train two competing H1 objectives at once and make
+                    # the ablation uninterpretable). ``tool_sum``/``tool_count``
+                    # are withheld for the same reason -- they are what the
+                    # trainer's micro-average reads.
+                    if self.tool_objective != "binary":
+                        # Same micro-average bookkeeping as the pointer term:
+                        # report the per-batch SUM and the number of supervised
+                        # rows so the trainer can weight batches by supervision
+                        # instead of by batch count (see the note above).
+                        n_tool_sup = _lean_tool_supervision_count(tool_logits, tool_targets)
+                        out["tool_sum"] = t_loss.detach() * n_tool_sup
+                        out["tool_count"] = n_tool_sup
+                        total_loss = total_loss + self.lambda_tool * t_loss
                 else:
                     out["tool"] = torch.zeros((), device=tool_logits.device)
+
+        # 3. Binary tool loss (H1-binary, v2.1 ablation arm)
+        #
+        # Dispatched ONLY on the presence of ``tool_binary_logits``, which the
+        # trainer emits only when its flag is on. With the flag off this block is
+        # never entered, so the CE path above stays byte-identical and every
+        # stored prediction / historical run remains reproducible.
+        if self.tool_objective == "binary" and "tool_binary_logits" in predictions:
+            bin_logits = predictions["tool_binary_logits"]
+            bin_targets = targets.get("call_tool_targets")
+            if bin_targets is None:
+                bin_targets = targets.get("tool_targets")
+            if bin_targets is not None:
+                # ``T - 1`` as the positive weight: with T rendered anchors and
+                # one called tool the raw BCE is dominated by the negatives, and
+                # an un-weighted head learns to emit ~0 everywhere.
+                n_anchor = int(bin_logits.size(-1)) if bin_logits.dim() == 2 else 1
+                pos_weight = torch.full(
+                    (n_anchor,), float(max(n_anchor - 1, 1)), device=bin_logits.device
+                )
+                b_loss = compute_lean_tool_loss_binary(
+                    bin_logits, bin_targets, pos_weight=pos_weight
+                )
+                if b_loss is not None:
+                    out["tool_binary"] = b_loss.detach()
+                    n_bin_sup = _lean_tool_binary_supervision_count(bin_logits, bin_targets)
+                    out["tool_binary_sum"] = b_loss.detach() * n_bin_sup
+                    out["tool_binary_count"] = n_bin_sup
+                    total_loss = total_loss + self.lambda_tool_binary * b_loss
+                else:
+                    out["tool_binary"] = torch.zeros((), device=bin_logits.device)
 
         out["loss"] = total_loss
         return out

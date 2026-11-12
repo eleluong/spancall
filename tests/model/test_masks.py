@@ -365,6 +365,106 @@ def test_pack_without_protection_still_respects_the_cap(
     assert res["num_candidates"] == 2
 
 
+def test_free_utterance_generation_honours_the_stratified_policy(
+    builder: CandidateMaskBuilder,
+) -> None:
+    """P2: ``pack_fill='stratified'`` must be applied at GENERATION time too.
+
+    ``_pack`` implements the retention policy, but it can only choose among the
+    candidates the generator materialised. The generator used to stop as soon as
+    it had ``cap`` pairs, i.e. it was always head-first, so ``_pack`` only ever
+    saw the surviving head prefix and could not spread the retained set. The
+    resolver meanwhile reported ``cand_pack_fill='stratified'`` in its features:
+    the telemetry named a policy that was not in force.
+
+    Measured on ``hermes_eval`` (200 rows, 285 spans, cap 512): parity 0.0772
+    with the head-first generator vs 0.2175 once the stride is real.
+    """
+    builder.pack_protected = None
+    builder.pack_fill = "head"
+    head = _pack_masks(builder, max_cands=4)
+    head_starts = [c.tok_start for c in head["candidates"]]
+
+    builder.pack_fill = "stratified"
+    strat = _pack_masks(builder, max_cands=4)
+    strat_starts = [c.tok_start for c in strat["candidates"]]
+
+    assert strat["num_candidates"] == head["num_candidates"] == 4
+    # Both stay monotone: document order is a contract, not a property of the policy.
+    assert strat_starts == sorted(strat_starts)
+    # And the policies must actually differ -- the regression was that they did not.
+    assert strat_starts != head_starts, (
+        "stratified retention produced the head prefix; the generation-time cap is "
+        "overriding pack_fill again"
+    )
+    # Stratified spreads across the whole utterance, so it reaches past the head.
+    assert max(strat_starts) > max(head_starts)
+
+
+def test_stratified_generation_reaches_a_span_the_head_policy_cannot(
+    builder: CandidateMaskBuilder,
+) -> None:
+    """The end-to-end payload of the P2 fix, on a single deterministic row.
+
+    A late span is reachable under ``stratified`` and unreachable under ``head``
+    at the same cap. This is the mechanism the parity number depends on, asserted
+    directly so a future refactor of the enumeration cannot silently restore
+    head-first truncation.
+
+    The utterance is deliberately long (60 words). The stride samples
+    ``int(i * n / rem)`` over the *pair* universe, and early starts contribute
+    more pairs than late ones, so with a tiny utterance a cap of 3 legitimately
+    lands in the first few starts. The property under test -- retention spans the
+    document instead of its head -- only has teeth at a size comparable to the
+    real rows (median 2.6k pairs per free-string parameter).
+    """
+    text = " ".join(f"w{i}" for i in range(60))
+    offsets = word_tokens(text)
+    utt = Ent("string", "utterance", None, 0, len(text), text=text)
+    late_third = (2 * len(offsets)) // 3
+
+    builder.pack_protected = None
+    builder.pack_fill = "head"
+    head = builder.build_param_masks(
+        _p("q", "string"), [utt], offsets, text, max_cands=8
+    )
+    head_starts = [c.tok_start for c in head["candidates"]]
+    assert max(head_starts) < late_third, (
+        f"head fill unexpectedly reached the last third: {head_starts}"
+    )
+
+    builder.pack_fill = "stratified"
+    strat = builder.build_param_masks(
+        _p("q", "string"), [utt], offsets, text, max_cands=8
+    )
+    strat_starts = [c.tok_start for c in strat["candidates"]]
+    assert max(strat_starts) >= late_third, (
+        "the stratified policy must retain a span in the last third of the "
+        f"utterance, the head prefix it replaces cannot: got {strat_starts}"
+    )
+    assert strat_starts == sorted(strat_starts)
+    assert len(strat_starts) == 8
+
+
+def test_retain_pairs_never_exceeds_the_cap_and_keeps_protected(
+    builder: CandidateMaskBuilder,
+) -> None:
+    """``_retain_pairs`` contract: protected first, cap respected, no duplicates."""
+    pairs = [(i, i) for i in range(20)]
+    n_prot = 2                                       # first two are "protected"
+    for fill in ("head", "stratified"):
+        builder.pack_fill = fill
+        kept = builder._retain_pairs(pairs, 5, n_prot)
+        assert len(kept) == 5, f"{fill}: cap not honoured"
+        assert len(set(kept)) == 5, f"{fill}: duplicate pairs retained"
+        assert kept[:n_prot] == pairs[:n_prot], f"{fill}: protected pairs not first"
+    # No cap -> the whole universe, unchanged order.
+    builder.pack_fill = "stratified"
+    assert builder._retain_pairs(pairs, None, n_prot) == pairs
+    # The universe already fits -> no policy applies.
+    assert builder._retain_pairs(pairs, 20, n_prot) == pairs
+
+
 # ---------------------------------------------------------------------------
 # marker registration helper (idempotent on a mock tokenizer)
 # ---------------------------------------------------------------------------

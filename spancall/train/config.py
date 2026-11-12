@@ -113,6 +113,14 @@ class OptimizationConfig:
     min_lr_ratio: float = 0.10        # cosine floor as a fraction of the peak LR
     label_smoothing: float = 0.0      # 0 disables; >0 smooths the tool CE
     dropout: Optional[float] = None   # head dropout override (None => model.dropout)
+    # v2.1 ablation arm. `False` keeps the shipped softmax H1 byte-identical: no
+    # extra loss term, no extra metrics, no threshold at serve time. `True`
+    # switches H1 to `BinaryToolHead` (independent per-anchor BCE, pos_weight=T-1)
+    # and makes the resolver threshold the sigmoid at `tool_call_threshold`.
+    # Both knobs must travel together -- a binary head scored with a softmax, or a
+    # softmax head thresholded as if it were absolute, is a silent no-op.
+    use_binary_tool_head: bool = False
+    tool_call_threshold: float = 0.5
     # Early stopping on the first eval split. `patience=0` disables it (old
     # behaviour: always run every epoch). `restore_best_on_exit` puts the best
     # epoch's weights back so the stage checkpoint is NOT the overfit final epoch.

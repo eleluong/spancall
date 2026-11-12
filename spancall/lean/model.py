@@ -3,6 +3,11 @@
 Provides:
 - LeanPointerHead: H3 span scorer over (B, K, C) candidate spans (no abstain logit/projection).
 - LeanSpanCallModel: Encoder + H1 ToolHead + LeanPointerHead (no H4 abstain head, no accept head, no correctness head).
+  Also carries ``tool_head_binary`` (H1-binary, v2.1 ablation): an independent
+  per-anchor BCE head with the same inputs as ``tool_head``. It is always
+  constructed but only *used* when the trainer's flag is on, so old checkpoints
+  keep loading (``load_state_dict(strict=False)``) and the default path is
+  unchanged.
 """
 
 from __future__ import annotations
@@ -13,7 +18,7 @@ import torch
 import torch.nn as nn
 
 from spancall.model.encoder import BaseEncoder
-from spancall.model.heads import BaseHead, ToolHead
+from spancall.model.heads import BaseHead, BinaryToolHead, ToolHead
 
 
 class LeanPointerHead(BaseHead, nn.Module):
@@ -141,4 +146,10 @@ class LeanSpanCallModel(nn.Module):
         self.pointer_head = LeanPointerHead(
             self.hidden_dim, head_dim=head_dim, max_span_width=max_span_width
         )
+        # v2.1 ablation arm. Constructed unconditionally so enabling the flag
+        # needs no model surgery, but nothing calls it unless the trainer's flag
+        # is on -- and it contributes no loss term unless the trainer emits
+        # ``tool_binary_logits``. Old checkpoints stay loadable because
+        # ``load_checkpoint`` uses ``strict=False``.
+        self.tool_head_binary = BinaryToolHead(self.hidden_dim)
 

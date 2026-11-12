@@ -1,6 +1,7 @@
 """Unit tests for the Lean flow (spancall/lean)."""
 
 import math
+from datetime import date
 from types import SimpleNamespace
 
 import pytest
@@ -17,8 +18,10 @@ from spancall.data.schema import (
 )
 from spancall.infer.resolver import FakeTokenizer
 from spancall.lean.decode import LeanJointDecoder
+from spancall.data.align import tooldef_to_template_tool
 from spancall.lean.eval_p1 import (
     EXTRACTABLE_TARGET_TYPES,
+    _parity_spans_for_call,
     e3_aligner_violation,
     eval_param_extraction_lean,
     param_is_groundable,
@@ -29,7 +32,12 @@ from spancall.lean.loss import (
     compute_lean_tool_loss,
 )
 from spancall.lean.model import LeanPointerHead, LeanSpanCallModel
-from spancall.lean.resolver import LeanResolver
+from spancall.lean.resolver import (
+    LeanResolver,
+    _absolutize_parity_spans,
+    _iter_parity_entries,
+)
+from span_template.template import build_input_multi, resolve_utterance_span
 from spancall.lean.tensorize import (
     PAD_INDEX,
     LeanBatchCollate,
@@ -909,6 +917,304 @@ def test_eval_part1_runs_both_parity_arms(tmp_path) -> None:
     assert fix.seen[0].get("parity_spans"), "protection must still report parity"
     assert fix.seen[0].get("protect_parity_spans") is True
     assert m_fix["parity_protection"] is True
+
+
+# ---------------------------------------------------------------------------
+# P1 — span ADDRESSING: utterance-relative pairs vs stored absolute offsets
+# ---------------------------------------------------------------------------
+
+
+def _p1_schemas() -> tuple:
+    """Two tools with a shared ``city`` param — the shape that shifts offsets."""
+    weather = ToolDefinition(
+        name="get_weather",
+        description="Get weather",
+        parameters=[
+            ParameterSchema(name="city", description="City", param_type="string", required=True),
+        ],
+    )
+    forecast = ToolDefinition(
+        name="get_forecast",
+        description="Get forecast",
+        parameters=[
+            ParameterSchema(name="city", description="City", param_type="string", required=True),
+        ],
+    )
+    return weather, forecast
+
+
+def _p1_resolver(**kw) -> LeanResolver:
+    encoder = TinyDummyEncoder(hidden_dim=32)
+    model = LeanSpanCallModel(encoder=encoder, head_dim=16, hidden_dim=32)
+    return LeanResolver(model=model, max_seq_len=512, **kw)
+
+
+def _p1_render_absolute(schema, utterance: str, schemas=None) -> tuple:
+    """The ABSOLUTE offsets the aligner's render would have stored for ``Tokyo``.
+
+    This is the address the OLD ``_parity_spans_for_call`` emitted: correct inside
+    the render that produced it, and wrong inside any other render.
+    """
+    out = build_input_multi(
+        [tooldef_to_template_tool(s) for s in (schemas or [schema])],
+        utterance,
+        recent_context=[],
+        now=date(2026, 11, 9),
+    )
+    span = resolve_utterance_span(out, 11, 16, expect="Tokyo")
+    assert span is not None, "fixture assumption broken: Tokyo not found in render"
+    return span
+
+
+def test_parity_rel_pair_hits_when_the_serve_render_shifts_the_utterance() -> None:
+    """P1: the rel pair remains correct under the render the resolver SERVES.
+
+    The defect being fixed: ``char_start``/``char_end`` are absolute in whichever
+    render the ALIGNER built. The resolver renders afresh at serve time, and
+    adding a second tool pushes every utterance offset to the right, so the stored
+    absolute pair lands on the wrong characters and parity reads as a candidate
+    loss that never happened. The utterance-relative pair is immune because it
+    addresses the utterance TEXT, not the rendered prompt.
+    """
+    weather, forecast = _p1_schemas()
+    utterance = "weather in Tokyo"
+    resolver = _p1_resolver()
+
+    single = _p1_render_absolute(weather, utterance, schemas=[weather])
+    two_tool = _p1_render_absolute(weather, utterance, schemas=[weather, forecast])
+    assert single != two_tool, (
+        "fixture assumption broken: packing a distractor tool must shift the "
+        "utterance, otherwise this test cannot distinguish the two addressings"
+    )
+
+    # Legacy absolute pair, scored against the single-tool render it came from.
+    ok = resolver.try_resolve(weather, utterance=utterance, parity_spans={"city": [single]})
+    assert ok.features["parity_checked"] == 1
+    assert ok.features["parity_hit"] == 1
+    assert ok.features["parity_rel_fallback"] == 1, "legacy pair must be flagged as a fallback"
+    assert ok.features["parity_rel_resolved"] == 0
+
+    # SAME stored pair, but the resolver now serves the two-tool render.
+    stale = resolver.try_resolve(
+        weather, utterance=utterance, context_schemas=[weather, forecast],
+        parity_spans={"city": [single]},
+    )
+    assert stale.features["parity_hit"] == 0, (
+        "a stored absolute pair must MISS once the serve render shifts -- this is "
+        "the H0 measurement defect, and it must remain visible, not be papered over"
+    )
+    assert stale.features["parity_rel_fallback"] == 1
+
+    # The fix: address the utterance, not the prompt.
+    fixed = resolver.try_resolve(
+        weather, utterance=utterance, context_schemas=[weather, forecast],
+        parity_spans={"city": [(11, 16, "Tokyo")]},
+    )
+    assert fixed.features["parity_checked"] == 1
+    assert fixed.features["parity_hit"] == 1
+    assert fixed.features["parity_rel_resolved"] == 1
+    assert fixed.features["parity_rel_fallback"] == 0
+    assert fixed.features["parity_unresolvable"] == 0
+
+
+def test_parity_absolute_fallback_is_counted_loudly() -> None:
+    """P1: a legacy split must be counted and reported, never silently 'clean'.
+
+    Keeping legacy callers working is necessary; letting them look like a clean
+    P1 run is not. Every absolute pair bumps ``parity_rel_fallback`` so the
+    printed report can say the number is a lower bound.
+    """
+    weather, _ = _p1_schemas()
+    resolver = _p1_resolver()
+
+    # 2-tuples and char_start/char_end dicts are both the legacy contract.
+    for spans in ({"city": [(11, 16)]}, {"city": [{"char_start": 11, "char_end": 16}]}):
+        res = resolver.try_resolve(weather, utterance="weather in Tokyo", parity_spans=spans)
+        assert res.features["parity_checked"] == 1
+        assert res.features["parity_rel_fallback"] == 1
+        assert res.features["parity_rel_resolved"] == 0
+        assert res.features["parity_unresolvable"] == 0
+
+    # Ambiguity guard: arity decides, so a 3-tuple can never be read as absolute.
+    assert _iter_parity_entries([(11, 16)]) == [("abs", 11, 16, None)]
+    assert _iter_parity_entries([(11, 16, "Tokyo")]) == [("rel", 11, 16, "Tokyo")]
+
+
+def test_parity_unresolvable_rel_pair_is_counted_as_a_miss() -> None:
+    """P1: a rel pair that cannot map onto the served render is a MISS, not an n/a.
+
+    Dropping it would let a drifted label file report a perfect parity rate -- the
+    same accounting mistake as trusting an unresolved label, repeated on the eval
+    side. The pair is counted in the denominator and contributes no hit.
+    """
+    weather, forecast = _p1_schemas()
+    resolver = _p1_resolver()
+
+    cases = {
+        # The mapped slice does not spell the expected value: the render's text
+        # drifted under the label, so the address is not trustworthy.
+        "wrong expect": [(11, 16, "Osaka")],
+        # The label points past the end of any possible render.
+        "out of range": [(9000, 9005, None)],
+    }
+    for label, spans in cases.items():
+        res = resolver.try_resolve(
+            weather, utterance="weather in Tokyo", context_schemas=[weather, forecast],
+            parity_spans={"city": spans},
+        )
+        feats = res.features
+        assert feats["parity_unresolvable"] == 1, f"{label}: must be counted as unresolvable"
+        assert feats["parity_checked"] == 1, f"{label}: must stay in the denominator"
+        assert feats["parity_hit"] == 0, f"{label}: an unresolvable pair can never hit"
+        assert feats["parity_rel_resolved"] == 0
+
+    # Denominator stays MASK-GATED: a GT param absent from the schema has no
+    # candidate set, so counting it would inflate the defect with unmeasurable rows.
+    res = resolver.try_resolve(
+        weather, utterance="weather in Tokyo", parity_spans={"not_a_param": [(11, 16, "Tokyo")]},
+    )
+    assert res.features["parity_checked"] == 0
+
+
+def test_eval_p1_emits_rel_pairs_for_modern_targets_and_legacy_pairs_otherwise() -> None:
+    """P1 (emit side): the harness must hand over the render-invariant address.
+
+    Emitting the stored absolute pair is what created the defect, so the eval must
+    prefer ``utt_rel_*``. It must ALSO keep emitting the absolute pair when that is
+    all a legacy split has -- dropping the row instead would hide it entirely.
+    """
+    tool = ToolDefinition(
+        name="get_weather",
+        description="Get weather",
+        parameters=[
+            ParameterSchema(name="city", description="City", param_type="string", required=True),
+        ],
+    )
+    assert tool.name == "get_weather"
+    base = {
+        "sample_id": "p1_emit",
+        "source_dataset": "test",
+        "utterance": "weather in Tokyo",
+        "tools": [{
+            "name": "get_weather",
+            "description": "Get weather",
+            "parameters": [
+                {"name": "city", "description": "City", "param_type": "string", "required": True},
+            ],
+        }],
+        "ground_truth_calls": [{"tool_name": "get_weather", "arguments": {"city": "Tokyo"}}],
+        "current_time_iso": "2026-11-09",
+        "stratum": "F",
+    }
+
+    modern = UnifiedSample.from_dict({
+        **base,
+        "target_spans": {"city": [{
+            "param_name": "city",
+            "target_type": "utterance_span",
+            "canonical_value": "Tokyo",
+            "char_start": 372,
+            "char_end": 377,
+            "utt_rel_start": 11,
+            "utt_rel_end": 16,
+        }]},
+    })
+    spans = _parity_spans_for_call(modern, 0)["city"]
+    assert spans == [(11, 16, "Tokyo")], (
+        "a target carrying utt_rel_* must be emitted as a rel triple, not as the "
+        "stored absolute pair"
+    )
+
+    legacy = UnifiedSample.from_dict({
+        **base,
+        "target_spans": {"city": [{
+            "param_name": "city",
+            "target_type": "utterance_span",
+            "canonical_value": "Tokyo",
+            "char_start": 11,
+            "char_end": 16,
+        }]},
+    })
+    assert _parity_spans_for_call(legacy, 0)["city"] == [(11, 16)], (
+        "a legacy target must still be emitted (as an absolute pair) so the row is "
+        "counted rather than silently dropped"
+    )
+
+
+def test_parity_protection_actually_rescues_a_truncated_gt_span() -> None:
+    """P1/T2: protection must genuinely move the GT span past ``max_cands``.
+
+    This arm used to be dead: ``_RowCtx`` exposed no ``snap_char_range``, so every
+    protected run raised inside ``_resolve``'s blanket handler and reported
+    ``render_or_encode_error`` for the whole row. A regression here would make the
+    T2 experiment report zero effect for a reason that has nothing to do with the
+    pack policy, so it is asserted directly instead of inferred from a metric.
+
+    The fill policy is pinned to ``head`` on BOTH arms on purpose. Under the
+    default ``stratified`` the generation-time stride can legitimately retain a
+    late span even with no protection at all (that is P2's fix), so the
+    unprotected arm would not reliably demonstrate the defect this test is
+    about. ``head`` is the legacy prefix, where a late GT span is unreachable
+    unless protection materialises it.
+    """
+    weather, _ = _p1_schemas()
+    utterance = "please look up the current conditions in that far away city of Kobe for me"
+    kobe = utterance.index("Kobe")
+    spans = {"city": [(kobe, kobe + 4, "Kobe")]}
+
+    for cap in (2, 5):
+        diag = _p1_resolver(max_cands=cap, candidate_pack_fill="head").try_resolve(
+            weather, utterance=utterance, parity_spans=spans, protect_parity_spans=False,
+        )
+        assert not str(diag.error_reason or "").startswith("render_or_encode_error")
+        assert diag.features["parity_checked"] == 1
+        assert diag.features["parity_hit"] == 0, (
+            f"cap={cap}: a late GT span is expected to fall outside the truncated "
+            "head-filled candidate set -- that is the defect T2 fixes"
+        )
+
+        fix = _p1_resolver(max_cands=cap, candidate_pack_fill="head").try_resolve(
+            weather, utterance=utterance, parity_spans=spans, protect_parity_spans=True,
+        )
+        # The T2 arm used to die here with a swallowed "'_RowCtx' object has no
+        # attribute 'snap_char_range'" and surface as ``render_or_encode_error``.
+        # That is the specific regression to catch; a decode-time reason such as
+        # ``schema_invalid`` is legitimate (the encoder here is a dummy, so the
+        # pointer's argmax is arbitrary) and says nothing about protection.
+        assert not str(fix.error_reason or "").startswith("render_or_encode_error")
+        assert fix.features["parity_checked"] == 1
+        assert fix.features["parity_hit"] == 1, (
+            f"cap={cap}: protection must force the GT span into the candidate set"
+        )
+
+
+def test_parity_absolutizer_accepts_both_address_forms() -> None:
+    """P1 unit: the normalizer is the single place arity is interpreted."""
+    weather, forecast = _p1_schemas()
+    out = build_input_multi(
+        [tooldef_to_template_tool(weather), tooldef_to_template_tool(forecast)],
+        "weather in Tokyo",
+        recent_context=[],
+        now=date(2026, 11, 9),
+    )
+
+    absolutes, unresolvable, counters = _absolutize_parity_spans(
+        out,
+        {
+            "city": [
+                (11, 16, "Tokyo"),                                  # rel -> resolved
+                {"utt_rel_start": 11, "utt_rel_end": 16},           # dict rel
+                {"char_start": 0, "char_end": 3},                   # dict abs
+            ],
+            "other": [(11, 16, "Nope")],                            # bad expect
+        },
+    )
+    assert counters["rel_resolved"] == 2
+    assert counters["rel_fallback"] == 1
+    assert counters["rel_unresolvable"] == 1
+    assert unresolvable == {"other": 1}
+    assert len(absolutes["city"]) == 3
+    assert "other" not in absolutes
 
 
 def test_eval_param_extraction_scores_groundable_params_only(tmp_path) -> None:

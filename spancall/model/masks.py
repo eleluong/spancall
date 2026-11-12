@@ -312,6 +312,23 @@ class _RowCtx:
         self.snaps[key] = r
         return r
 
+    def snap_char_range(self, cs: int, ce: int) -> Optional[Tuple[int, int]]:
+        """Token span overlapping a RAW char range, via the shared token index.
+
+        NOT memoised on purpose: keys here are arbitrary ``(cs, ce)`` ranges
+        (candidate-parity spans, usually one or two per param), not stable entry
+        identities, so a cache keyed by identity would grow without ever hitting.
+
+        This delegates instead of reimplementing the bisect logic so the parity
+        protection path and every candidate mask agree on what "overlaps" means.
+        The resolver's ``_protected_token_spans`` has always called this method;
+        ``_RowCtx`` simply never exposed it, so every ``protect_parity_spans=True``
+        run died inside the resolver's blanket ``except`` and reported
+        ``render_or_encode_error: '_RowCtx' object has no attribute
+        'snap_char_range'`` -- i.e. the T2 "fix under test" arm was unreachable.
+        """
+        return self.tindex.snap_char_range(int(cs), int(ce))
+
 
 def _normalize_param_type(raw_type: Optional[str]) -> Tuple[str, bool]:
     """Normalize JSON-schema parameter type (including union strings like ``"['string', 'null']"``).
@@ -752,28 +769,27 @@ class CandidateMaskBuilder:
         ReverseAligner's ``_word_bounded_matches`` behavior for consistency.
 
         ``cap`` bounds how many candidates this function may produce. The
-        windowed enumeration is O(n·W) and the caller always truncated the
-        result to ``max_cands`` afterwards; passing that headroom down means the
-        surplus pairs are never materialised at all.
+        windowed enumeration is O(n·W); the pair *universe* is computed first
+        and only the retained pairs are materialised as :class:`Candidate`
+        objects, so the surplus never becomes objects even though every pair is
+        evaluated when choosing what to keep.
 
-        ``protect_starts`` are start-token indices that MUST be enumerated even
-        when ``cap`` is small. This closes a hole that survived the T4 rewrite:
-        ``_pack`` can only protect candidates that EXIST, and this generator
-        walked ``starts`` in ascending order and stopped at ``cap`` — so a GT
-        span late in the utterance was never materialised, and protecting it
-        downstream was impossible. Truncation at generation time is head-first
-        truncation no retention policy can undo.
+        ``protect_starts`` are start-token indices that MUST survive even when
+        ``cap`` is small. ``_pack`` can only protect candidates that EXIST, so a
+        GT span late in the utterance has to be materialised here.
 
-        The guarantee is *materialisation*, not *ordering*: ``cap`` is a budget
-        that protected starts may exceed, and the emitted list is always sorted
-        back into document order before returning. Emitting the protected spans
-        first would hand a non-monotone candidate list to the pointer head,
-        whose geometry (and the legacy ``start_ok``/``end_ok`` masks) assumes
-        ascending token positions.
+        Retention is delegated to :meth:`_retain_pairs` and honours
+        ``pack_fill``. It must: ``_pack`` also implements a ``pack_fill``, but a
+        candidate evicted here is invisible to it, so a head-first truncation at
+        this layer silently overrides the policy ``_pack`` was configured with.
+
+        Ordering: the emitted list is always sorted into document order before
+        returning. Emitting the protected spans first would hand a non-monotone
+        candidate list to the pointer head, whose geometry (and the legacy
+        ``start_ok``/``end_ok`` masks) assumes ascending token positions.
         """
-        out: List[Candidate] = []
         if not utterance_entries or cap == 0:
-            return out
+            return []
         # build the full utterance char range from entry extremes
         u_start = min(e.char_start for e in utterance_entries)
         u_end = max(e.char_end for e in utterance_entries)
@@ -806,71 +822,107 @@ class CandidateMaskBuilder:
             # silent no-op. Admit protected starts explicitly -- but only ones
             # that actually exist in this row's token window.
             starts = sorted(set(starts) | {i for i in prot if i in tok_map})
-            # Visit protected starts first ONLY so the ``cap`` budget below
-            # cannot starve them; the returned list is re-sorted at the end.
-            _prot = [i for i in starts if i in prot]
-            _rest = [i for i in starts if i not in prot]
-            starts = _prot + _rest
-        cand_set: Dict[Tuple[int, int], Candidate] = {}
+
+        # ---- enumerate the FULL valid (tok_start, tok_end) set first ----------
+        # Enumerate *pairs*, not ``Candidate`` objects. Pair enumeration is index
+        # arithmetic; keeping it separate from object construction is what makes
+        # honest retention affordable: a 2.4k-token utterance yields ~2.6k pairs
+        # per parameter, but only ``cap`` of them are ever materialised.
+        #
+        # This is the fix for a defect that made ``pack_fill`` a lie. The previous
+        # version stopped enumerating as soon as it had ``cap`` candidates, i.e.
+        # it always truncated HEAD-FIRST, and then ``_pack`` -- which is where the
+        # ``pack_fill`` policy actually lives -- only ever saw the surviving head
+        # prefix. ``stratified`` could therefore not reach a span late in the
+        # utterance, yet the resolver still reported ``cand_pack_fill=stratified``
+        # in its features. Measured on hermes_eval: parity 0.0772 under the
+        # reported-stratified-but-actually-head policy vs 0.2175 when the stride
+        # is genuinely applied at a 512 cap.
+        seen: Dict[Tuple[int, int], None] = {}
+        prot_pairs: List[Tuple[int, int]] = []
+        other_pairs: List[Tuple[int, int]] = []
+
+        def _add(i: int, j: int) -> None:
+            if (i, j) in seen:
+                return
+            seen[(i, j)] = None
+            (prot_pairs if i in prot else other_pairs).append((i, j))
+
         # O(n·W) instead of O(n²): a candidate end j only counts within
         # max_span_width of the start i, so scan the bounded window [i, i+W).
         # in_toks is a contiguous subset of token indices — dict lookup is O(1).
-        full = cap is None
         for i in starts:
-            if not full and len(cand_set) >= cap and i not in prot:
-                # Budget exhausted. Protected starts are still enumerated (they
-                # are visited first, so this never truncates them), and with no
-                # protection at all this is the legacy head-first stop.
-                break
-            tcs_i, _ = tok_map[i]
             for j in range(i, min(i + self.max_span_width, max_tok)):
                 if j not in tok_map:
                     continue
-                tce_j = tok_map[j][1]
-                if tce_j in word_bounds or tce_j == u_end:
-                    cs_i, ce_j = tcs_i, tce_j
-                    cval: Optional[str] = None
-                    if len(utterance_text) >= ce_j:
-                        while cs_i < ce_j and utterance_text[cs_i].isspace():
-                            cs_i += 1
-                        while ce_j > cs_i and utterance_text[ce_j - 1].isspace():
-                            ce_j -= 1
-                        if cs_i >= ce_j:
-                            continue
-                        cval = utterance_text[cs_i:ce_j]
-                    cand = Candidate(
-                        i, j, cs_i, ce_j, "utterance",
-                        cval, eidx.for_char(cs_i))
-                    cand_set[(i, j)] = cand
-                    if not full and len(cand_set) >= cap and i not in prot:
-                        # Stop this start's window; the outer loop stops on the
-                        # next non-protected start. (A protected start keeps
-                        # enumerating: an early ``return`` here would starve a
-                        # protected start that appears later in ``starts``.)
-                        break
-        # also add single-token spans not starting on a word bound (whole tokens)
-        # (only when the cap still has room — this pass only ever *adds* spans
-        # that the loop above skipped, so it cannot reorder existing output)
-        if full or len(cand_set) < cap:
-            for i, (tcs, tce) in in_toks:
-                if not full and len(cand_set) >= cap:
-                    break
-                if (i, i) not in cand_set:
-                    cs_i, ce_j = tcs, tce
-                    cval = None
-                    if len(utterance_text) >= ce_j:
-                        while cs_i < ce_j and utterance_text[cs_i].isspace():
-                            cs_i += 1
-                        while ce_j > cs_i and utterance_text[ce_j - 1].isspace():
-                            ce_j -= 1
-                        if cs_i >= ce_j:
-                            continue
-                        cval = utterance_text[cs_i:ce_j]
-                    cand_set[(i, i)] = Candidate(
-                        i, i, cs_i, ce_j, "utterance", cval, eidx.for_char(cs_i))
+                if tok_map[j][1] in word_bounds or tok_map[j][1] == u_end:
+                    _add(i, j)
+        # Whole-token spans that do not begin on a word boundary. Previously a
+        # separate pass gated on leftover budget; folding it into the enumeration
+        # keeps the pair universe independent of the cap, which is precisely what
+        # a retention policy needs in order to be a *policy* rather than a stop.
+        for i in tok_map:
+            _add(i, i)
+
+        all_pairs = prot_pairs + other_pairs
+        # ---- apply the retention policy, then materialise ---------------------
+        selected = self._retain_pairs(all_pairs, cap, len(prot_pairs))
+        cands: List[Candidate] = []
+        for i, j in selected:
+            tcs_i = tok_map[i][0]
+            tce_j = tok_map[j][1]
+            cs_i, ce_j = tcs_i, tce_j
+            cval: Optional[str] = None
+            if len(utterance_text) >= ce_j:
+                while cs_i < ce_j and utterance_text[cs_i].isspace():
+                    cs_i += 1
+                while ce_j > cs_i and utterance_text[ce_j - 1].isspace():
+                    ce_j -= 1
+                if cs_i >= ce_j:
+                    continue
+                cval = utterance_text[cs_i:ce_j]
+            cands.append(Candidate(
+                i, j, cs_i, ce_j, "utterance", cval, eidx.for_char(cs_i)))
         # Document order is a hard contract, not an incidental property: the
         # priority reordering above trades position for survival only.
-        return sorted(cand_set.values(), key=lambda c: (c.tok_start, c.tok_end))
+        return sorted(cands, key=lambda c: (c.tok_start, c.tok_end))
+
+    def _retain_pairs(
+        self,
+        pairs: Sequence[Tuple[int, int]],
+        cap: Optional[int],
+        n_protected: int,
+    ) -> List[Tuple[int, int]]:
+        """Choose which ``(tok_start, tok_end)`` pairs survive ``cap``.
+
+        ``pairs`` is the full universe in document order, with the protected
+        subset first (as counted by ``n_protected``). Protected pairs always
+        survive -- ``cap`` is a budget they may exceed, matching ``_pack``.
+
+        Retention for the remainder follows ``pack_fill``:
+
+        * ``head`` -- the legacy prefix. Kept byte-identical so flag-off runs and
+          the pre-T4 tests still reproduce.
+        * ``stratified`` -- a stride across the *whole* remaining universe, which
+          is what the trainer already does (``tensorize.py``) and what the
+          ``cand_pack_fill`` feature has always claimed.
+        """
+        if cap is None or len(pairs) <= cap:
+            return list(pairs)
+        head = list(pairs[:n_protected])
+        pool = list(pairs[n_protected:])
+        rem = max(0, int(cap) - len(head))
+        if rem <= 0:
+            return head
+        if len(pool) <= rem:
+            return head + pool
+        fill = str(getattr(self, "pack_fill", "head") or "head").lower()
+        if fill != "stratified":
+            return head + pool[:rem]
+        n = len(pool)
+        stride = n / float(rem)
+        # ``rem <= n`` here, so ``stride >= 1`` and the indices are distinct.
+        return head + [pool[min(int(i * stride), n - 1)] for i in range(rem)]
 
     def _free_recent_spans(
         self,

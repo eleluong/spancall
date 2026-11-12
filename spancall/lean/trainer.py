@@ -111,7 +111,7 @@ class _MicroLossAccumulator:
 
     def add(self, out: Dict[str, Any]) -> None:
         """Accumulate one batch's ``*_sum`` / ``*_count`` pairs from the loss dict."""
-        for key in ("pointer", "tool"):
+        for key in ("pointer", "tool", "tool_binary"):
             s = out.get(f"{key}_sum")
             c = out.get(f"{key}_count")
             if s is None or c is None:
@@ -133,18 +133,30 @@ class _MicroLossAccumulator:
             return float("nan")
         return _log_loss(self._sums.get(key, 0.0) / c)
 
-    def combined(self, lambda_pointer: float = 1.0, lambda_tool: float = 1.0) -> float:
+    def combined(
+        self,
+        lambda_pointer: float = 1.0,
+        lambda_tool: float = 1.0,
+        lambda_tool_binary: float = 0.0,
+    ) -> float:
         """The same weighting the objective uses, but slot-weighted.
 
         Mirrors ``lambda_ptr * L_ptr + lambda_tool * L_tool`` on micro averages,
         and degrades to just the terms that were actually supervised so a
         pointer-only or tool-only split still reports a real number.
+
+        ``lambda_tool_binary`` defaults to 0 so the CE arm's micro loss is
+        numerically unchanged; the binary arm passes its own lambda from the
+        container. A binary term only exists when the trainer emitted it, so
+        ``value("tool_binary")`` is NaN (and thus skipped) in the CE arm.
         """
         parts = []
         if math.isfinite(self.value("pointer")):
             parts.append(lambda_pointer * self.value("pointer"))
         if math.isfinite(self.value("tool")):
             parts.append(lambda_tool * self.value("tool"))
+        if lambda_tool_binary and math.isfinite(self.value("tool_binary")):
+            parts.append(lambda_tool_binary * self.value("tool_binary"))
         if not parts:
             return float("nan")
         return _log_loss(sum(parts))
@@ -286,11 +298,24 @@ class LeanTrainer:
         use_amp: bool = True,
         mixed_precision: Optional[str] = None,
         tokenizer: Optional[Any] = None,
+        use_binary_tool_head: Optional[bool] = None,
     ) -> None:
         self.model = model
         self.config = config
         self.tokenizer = tokenizer
-        self.loss_container = loss_container or LeanLossContainer()
+        # v2.1 ablation switch. Resolved as: explicit arg > optimization config >
+        # OFF. OFF is the default so every existing caller, test and checkpoint
+        # reproduces the shipped softmax H1 byte-for-byte. When ON the binary head
+        # is ALSO evaluated and its logits are emitted, and the loss container
+        # trains on the binary objective instead of the CE one (see
+        # ``LeanLossContainer.tool_objective``).
+        if use_binary_tool_head is None:
+            _opt = getattr(config, "optimization", None) if config is not None else None
+            use_binary_tool_head = bool(getattr(_opt, "use_binary_tool_head", False))
+        self.use_binary_tool_head = bool(use_binary_tool_head)
+        self.loss_container = loss_container or LeanLossContainer(
+            tool_objective="binary" if self.use_binary_tool_head else "ce"
+        )
 
         opt_cfg = getattr(config, "optimization", None) if config is not None else None
         self.lr_encoder = float(
@@ -361,6 +386,15 @@ class LeanTrainer:
         self.global_step = 0
         self._accum_i = 0
         self.stage = "T2"
+        # Keep the loss objective in lock-step with the flag even when a caller
+        # injected its own container: an injected CE container plus the flag on
+        # would silently train the OLD head and report a binary arm that was
+        # never trained -- the exact failure a kill-criterion ablation must not
+        # have.
+        if self.use_binary_tool_head:
+            self.loss_container.tool_objective = "binary"
+        elif getattr(self.loss_container, "tool_objective", "ce") == "binary":
+            self.loss_container.tool_objective = "ce"
         self.history: Dict[str, Any] = {"train_loss": [], "dev": {}, "epoch_eval": []}
         self._rng = random.Random(int(getattr(config, "seed", 42) or 42))
         self.collator = LeanBatchCollate()
@@ -530,6 +564,13 @@ class LeanTrainer:
                     "tool_targets",
                     torch.full((H.size(0),), -1, dtype=torch.long, device=self.device),
                 )
+                # v2.1: compute the binary head on the SAME anchor hidden states
+                # and mask, so the two arms differ only in objective. Emitted
+                # only when the flag is on -- its presence is what makes the loss
+                # container train the binary term, so flag-off stays identical.
+                if self.use_binary_tool_head:
+                    bl = self.model.tool_head_binary(tool_h, cls_h)
+                    preds["tool_binary_logits"] = bl.masked_fill(b["tool_positions"] < 0, -1e4)
                 # R0.4: the call axis is the set-valued target. It is forwarded
                 # only when the collator supplied it, so single-call batches keep
                 # the bit-identical (B,) cross-entropy path. The scalar
@@ -564,8 +605,14 @@ class LeanTrainer:
         # the dev `eval_loss` (which uses the same accumulation).
         _acc = _MicroLossAccumulator()
         _acc.add(loss_out)
+        _lam_bin = float(getattr(self.loss_container, "lambda_tool_binary", 0.0))
+        _train_binary = getattr(self.loss_container, "tool_objective", "ce") == "binary"
         out_metrics["micro_loss"] = _acc.combined(
-            self.loss_container.lambda_pointer, self.loss_container.lambda_tool
+            self.loss_container.lambda_pointer,
+            # In the binary arm the CE term is reference-only, so it must not be
+            # added into the comparable micro loss either.
+            0.0 if _train_binary else self.loss_container.lambda_tool,
+            _lam_bin if _train_binary else 0.0,
         )
         if "pointer" in loss_out:
             out_metrics["pointer_loss"] = _log_loss(loss_out["pointer"].item())
@@ -575,12 +622,23 @@ class LeanTrainer:
             out_metrics["tool_loss"] = _log_loss(loss_out["tool"].item())
             out_metrics["tool"] = out_metrics["tool_loss"]
             out_metrics["tool_micro"] = _acc.value("tool")
+        if "tool_binary" in loss_out:
+            # Reference metric in the CE arm, trained objective in the binary arm.
+            out_metrics["tool_binary_loss"] = _log_loss(loss_out["tool_binary"].item())
+            out_metrics["tool_binary_micro"] = _acc.value("tool_binary")
         # Raw sums/counts are returned so `run_stage` can aggregate them across
         # micro-batches without re-deriving them from a rounded mean.
         out_metrics["_pointer_sum"] = float(loss_out.get("pointer_sum", 0.0))
         out_metrics["_pointer_count"] = float(loss_out.get("pointer_count", 0.0))
         out_metrics["_tool_sum"] = float(loss_out.get("tool_sum", 0.0))
         out_metrics["_tool_count"] = float(loss_out.get("tool_count", 0.0))
+        # Only present when the binary arm actually ran. Emitting 0.0
+        # unconditionally would put ``_tool_binary_*`` keys in every flag-off
+        # run's history -- i.e. the shipped arm would stop being byte-identical
+        # for exactly the fields this ablation adds.
+        if "tool_binary_sum" in loss_out:
+            out_metrics["_tool_binary_sum"] = float(loss_out.get("tool_binary_sum", 0.0))
+            out_metrics["_tool_binary_count"] = float(loss_out.get("tool_binary_count", 0.0))
 
         if "span_logits" in fp32_preds and "pos_indices" in b:
             span_acc, _, _ = self.exact_span_match(fp32_preds["span_logits"], b["pos_indices"])
@@ -597,6 +655,17 @@ class LeanTrainer:
                 t_correct = (t_logits.argmax(-1)[valid_t] == t_targets[valid_t]).float().mean()
                 out_metrics["tool_acc"] = float(t_correct.item())
                 out_metrics["n_tool"] = float(int(valid_t.sum().item()))
+            # v2.1: the SAME argmax semantics as ``tool_acc`` so the two arms are
+            # directly comparable -- this is the kill-criterion metric, so it must
+            # not be a different statistic. Sigmoid scores are monotonic, so the
+            # argmax of the logits equals the argmax of P(called).
+            if "tool_binary_logits" in fp32_preds:
+                b_logits = fp32_preds["tool_binary_logits"]
+                valid_b = (t_targets >= 0) & (t_targets < b_logits.size(-1))
+                if bool(valid_b.any()):
+                    b_correct = (b_logits.argmax(-1)[valid_b] == t_targets[valid_b]).float().mean()
+                    out_metrics["tool_binary_acc"] = float(b_correct.item())
+                    out_metrics["n_tool_binary"] = float(int(valid_b.sum().item()))
             n_cand = self._live_candidate_counts(b)
             if n_cand is not None and n_cand.numel():
                 out_metrics["mean_n_candidates"] = float(n_cand.mean().item())
@@ -686,6 +755,10 @@ class LeanTrainer:
         n_span = 0
         tool_hits = 0
         n_tool = 0
+        # v2.1 ablation counters: identical denominator and argmax rule as the
+        # CE arm above, so ``tool_binary_acc`` and ``tool_acc`` are comparable.
+        tool_bin_hits = 0
+        n_tool_bin = 0
         tool_cand_sum = 0.0
         tool_cand_rows = 0
         exact_hits = 0.0
@@ -732,6 +805,14 @@ class LeanTrainer:
                             "tool_targets",
                             torch.full((H.size(0),), -1, dtype=torch.long, device=self.device),
                         )
+                        # v2.1: mirror ``train_step`` exactly. Evaluating the
+                        # binary head on the same rows/batches is what makes the
+                        # ``tool_binary_acc`` vs ``tool_acc`` pair a fair ablation.
+                        if self.use_binary_tool_head:
+                            bl = self.model.tool_head_binary(tool_h, cls_h)
+                            preds["tool_binary_logits"] = bl.masked_fill(
+                                b["tool_positions"] < 0, -1e4
+                            )
 
                 fp32_preds = {k: (v.float() if isinstance(v, torch.Tensor) else v) for k, v in preds.items()}
                 loss_out = self.loss_container(fp32_preds, targs)
@@ -765,6 +846,13 @@ class LeanTrainer:
                     if valid_tool.any():
                         tool_hits += int(((pred_tools == tt) & valid_tool).sum().item())
                         n_tool += int(valid_tool.sum().item())
+                    # v2.1 ablation arm: identical denominator and argmax rule.
+                    if "tool_binary_logits" in fp32_preds:
+                        b_pred = fp32_preds["tool_binary_logits"].argmax(-1)
+                        valid_bin = (tt >= 0) & (tt < fp32_preds["tool_binary_logits"].size(-1))
+                        if valid_bin.any():
+                            tool_bin_hits += int(((b_pred == tt) & valid_bin).sum().item())
+                            n_tool_bin += int(valid_bin.sum().item())
                     # rows without a supervised tool target are not penalised.
                     row_ok = row_ok & ((pred_tools == tt) | ~valid_tool)
                     # Diagnostic: mean number of real candidate tools per row.
@@ -809,8 +897,20 @@ class LeanTrainer:
         # `eval_loss_batchmean` so historical runs stay comparable, but new
         # analysis should read `eval_loss`: it is invariant to batching, so a
         # train/dev gap is a model gap rather than a bucketing artifact.
+        # Mirror ``train_step``'s objective isolation so ``eval_loss`` and the
+        # train ``mean_loss`` remain ONE statistic. In the binary arm the CE term
+        # is reference-only (it has no ``tool_sum``/``tool_count`` to average
+        # anyway) and the binary term is the trained objective, so it is the one
+        # that must enter the comparable loss.
+        _eval_binary = getattr(self.loss_container, "tool_objective", "ce") == "binary"
         micro_loss = micro.combined(
-            self.loss_container.lambda_pointer, self.loss_container.lambda_tool
+            self.loss_container.lambda_pointer,
+            0.0 if _eval_binary else self.loss_container.lambda_tool,
+            (
+                float(getattr(self.loss_container, "lambda_tool_binary", 0.0))
+                if _eval_binary
+                else 0.0
+            ),
         )
         res: Dict[str, float] = {
             "eval_loss": micro_loss if math.isfinite(micro_loss) else total_loss / n_batches,
@@ -839,6 +939,11 @@ class LeanTrainer:
         if n_tool > 0:
             res["tool_acc"] = tool_hits / n_tool
             res["n_tool"] = float(n_tool)
+        if n_tool_bin > 0:
+            # Only present when the binary arm actually ran; absent (rather than
+            # NaN) keeps the flag-off result dict byte-identical.
+            res["tool_binary_acc"] = tool_bin_hits / n_tool_bin
+            res["n_tool_binary"] = float(n_tool_bin)
         if tool_cand_rows > 0:
             res["mean_n_candidates"] = tool_cand_sum / tool_cand_rows
 
@@ -855,6 +960,11 @@ class LeanTrainer:
                     tool_str += f" candidates/row={mean_c:.2f}"
                     if mean_c < 1.5:
                         tool_str += " [!vacuous: single-candidate H1]"
+            if "tool_binary_acc" in res:
+                # Printed on its own line: with the flag on this is the number the
+                # v2.1 decision reads, and it must be impossible to confuse with
+                # the CE ``tool_acc`` printed above.
+                tool_str += f" tool_bin_acc={res['tool_binary_acc']:.4f} (n={int(res['n_tool_binary'])})"
             # Print the micro (slot-weighted) loss FIRST because it is the scale
             # that matches the train epoch `mean_loss`; the legacy batch-mean is
             # shown alongside so a reader can see how much of the old gap was
@@ -1047,8 +1157,8 @@ class LeanTrainer:
             # `mean_loss` reported to `train_log.jsonl` is the micro average so it
             # can be plotted against `eval_loss` on the same axis; the legacy
             # mean-of-micro-batch-means is kept as `mean_loss_batchmean`.
-            ep_micro_sums: Dict[str, float] = {"pointer": 0.0, "tool": 0.0}
-            ep_micro_counts: Dict[str, float] = {"pointer": 0.0, "tool": 0.0}
+            ep_micro_sums: Dict[str, float] = {"pointer": 0.0, "tool": 0.0, "tool_binary": 0.0}
+            ep_micro_counts: Dict[str, float] = {"pointer": 0.0, "tool": 0.0, "tool_binary": 0.0}
             for batch_list in self.make_batches(rows, bs, shuffle=True, rng=self._rng):
                 if not batch_list:
                     continue
@@ -1059,7 +1169,7 @@ class LeanTrainer:
                 if math.isfinite(losses.get("loss", float("nan"))):
                     ep_sum += losses["loss"]
                     ep_n += 1
-                for _k in ("pointer", "tool"):
+                for _k in ("pointer", "tool", "tool_binary"):
                     ep_micro_sums[_k] += float(losses.get(f"_{_k}_sum", 0.0) or 0.0)
                     ep_micro_counts[_k] += float(losses.get(f"_{_k}_count", 0.0) or 0.0)
                 pbar.update(1)
@@ -1088,11 +1198,19 @@ class LeanTrainer:
                 return _log_loss(ep_micro_sums.get(key, 0.0) / c)
 
             ptr_micro, tool_micro = _micro("pointer"), _micro("tool")
+            bin_micro = _micro("tool_binary")
+            _train_binary = getattr(self.loss_container, "tool_objective", "ce") == "binary"
             parts = []
             if math.isfinite(ptr_micro):
                 parts.append(self.loss_container.lambda_pointer * ptr_micro)
-            if math.isfinite(tool_micro):
+            # Only the objective that is actually TRAINED enters the epoch mean;
+            # the other head's value is still logged (below) as a reference.
+            if math.isfinite(tool_micro) and not _train_binary:
                 parts.append(self.loss_container.lambda_tool * tool_micro)
+            if math.isfinite(bin_micro) and _train_binary:
+                parts.append(
+                    float(getattr(self.loss_container, "lambda_tool_binary", 1.0)) * bin_micro
+                )
             # `mean_loss` is the slot-weighted value so it shares a scale with
             # `eval_loss`; the legacy mean-of-batch-means stays as
             # `mean_loss_batchmean` for continuity with older logs.
@@ -1102,6 +1220,7 @@ class LeanTrainer:
                 f"mean_loss={mean_loss:.4f} (batchmean={batch_mean_loss:.4f})"
                 + (f" ptr={ptr_micro:.4f}" if math.isfinite(ptr_micro) else "")
                 + (f" tool={tool_micro:.4f}" if math.isfinite(tool_micro) else "")
+                + (f" tool_bin={bin_micro:.4f}" if math.isfinite(bin_micro) else "")
             )
             self._log_event({
                 "event": "epoch_end",
@@ -1111,6 +1230,7 @@ class LeanTrainer:
                 "mean_loss_batchmean": batch_mean_loss,
                 "pointer_loss": ptr_micro,
                 "tool_loss": tool_micro,
+                "tool_binary_loss": bin_micro,
                 "n_pointer_slots": ep_micro_counts.get("pointer", 0.0),
                 "n_tool_rows": ep_micro_counts.get("tool", 0.0),
             })
@@ -1154,6 +1274,11 @@ class LeanTrainer:
                     # the fact. ``mean_n_candidates`` ~1.0 => vacuous.
                     "tool_acc": _f("tool_acc"),
                     "n_tool": _f("n_tool"),
+                    # v2.1: persisted alongside ``tool_acc`` so the kill criterion
+                    # (binary <= CE => revert) can be read off the epoch history
+                    # without re-running either arm.
+                    "tool_binary_acc": _f("tool_binary_acc"),
+                    "n_tool_binary": _f("n_tool_binary"),
                     "mean_n_candidates": _f("mean_n_candidates"),
                 }
                 self.history["epoch_eval"].append(ep_rec)
@@ -1313,6 +1438,15 @@ class LeanTrainer:
             # otherwise cannot tell the two arms of the ablation apart.
             "use_lora": bool(getattr(self, "lora_enabled", False)),
             "lora_param_count": int(getattr(self, "lora_param_count", 0)),
+            # v2.1: the same rule for the H1 objective. The two arms produce
+            # DIFFERENT weights from the same data, so a checkpoint that does not
+            # name its objective can only be identified by guessing -- and the
+            # resolver must be constructed with the matching value or it will
+            # score the binary weights with a softmax.
+            "tool_objective": str(
+                getattr(self.loss_container, "tool_objective", "ce")
+            ),
+            "use_binary_tool_head": bool(getattr(self, "use_binary_tool_head", False)),
             **(metadata or {}),
         }
         with open(out_p / "provenance.json", "w", encoding="utf-8") as f:

@@ -32,6 +32,7 @@ from span_template.template import (
     RecentRow,
     SpanTemplateOutput,
     build_input_multi,
+    resolve_utterance_span,
     tokenize_legend,
     tokenize_offset_mapping,
 )
@@ -177,6 +178,100 @@ def _to_date(val: Any) -> date:
     return date(2026, 1, 1)
 
 
+#: One parity entry, normalised. ``rel`` means "offset into the utterance TEXT";
+#: ``abs`` means "offset into whatever render the producer happened to build".
+_ParityEntry = Tuple[str, int, int, Optional[str]]
+
+
+def _iter_parity_entries(spans: Sequence[Any]) -> List[_ParityEntry]:
+    """Normalise one param's parity spans into explicit ``rel``/``abs`` entries.
+
+    Accepted forms (all produced by real callers, so all must keep working):
+
+    - ``(cs, ce)``                      -> absolute pair (legacy contract)
+    - ``(rel_start, rel_end, expect)``  -> utterance-relative pair + optional
+      expected substring; this is the render-invariant form
+    - ``{"utt_rel_start", "utt_rel_end"[, "expect"|"canonical_value"]}``
+    - ``{"char_start", "char_end"}``    -> absolute pair
+
+    Arity disambiguates the tuple forms: an absolute pair is always exactly two
+    numbers, so a 3-tuple can only be the rel form. Silently reinterpreting a
+    2-tuple as a rel pair would turn every legacy caller's coordinates into
+    garbage without any error, which is the failure mode this whole change
+    exists to remove.
+    """
+    out: List[_ParityEntry] = []
+    for e in spans or ():
+        if isinstance(e, dict):
+            rs = e.get("utt_rel_start")
+            re_ = e.get("utt_rel_end")
+            if rs is not None and re_ is not None:
+                expect = e.get("expect", e.get("canonical_value"))
+                out.append(("rel", int(rs), int(re_),
+                            None if expect is None else str(expect)))
+                continue
+            cs = e.get("char_start")
+            ce = e.get("char_end")
+            if cs is not None and ce is not None:
+                out.append(("abs", int(cs), int(ce), None))
+            continue
+        if isinstance(e, (tuple, list)):
+            if len(e) >= 3:
+                expect = e[2]
+                out.append(("rel", int(e[0]), int(e[1]),
+                            None if expect is None else str(expect)))
+            elif len(e) == 2:
+                out.append(("abs", int(e[0]), int(e[1]), None))
+            continue
+        raise TypeError(
+            f"parity span must be a 2/3-tuple or dict, got {type(e).__name__}"
+        )
+    return out
+
+
+def _absolutize_parity_spans(
+    output: SpanTemplateOutput,
+    parity_spans: Dict[str, Sequence[Any]],
+) -> Tuple[Dict[str, List[Tuple[int, int]]], Dict[str, int], Dict[str, int]]:
+    """Map every parity entry onto ``output`` -- the render being served.
+
+    Returns ``(absolutes, unresolvable, counters)``:
+
+    - ``absolutes``: ``{param: [(abs_start, abs_end), ...]}`` for entries that
+      address characters in THIS render.
+    - ``unresolvable``: ``{param: n}`` for rel pairs that do not map onto this
+      render (utterance text drifted, or the pair falls outside it). These are
+      counted as parity MISSES by the caller, never dropped: an entry we cannot
+      locate is not evidence that the candidate set contained it.
+    - ``counters``: ``rel_resolved`` / ``rel_unresolvable`` / ``rel_fallback``.
+
+    ``rel_fallback`` counts entries that arrived as an absolute pair, i.e. the
+    producer had no render-invariant address to offer. Surfaced loudly because a
+    silent fallback would make a legacy caller look like a clean rel-pair run.
+
+    No render happens here: the caller passes the ``SpanTemplateOutput`` it is
+    already about to serve, which is the only way the measurement can describe
+    the real candidate set.
+    """
+    absolutes: Dict[str, List[Tuple[int, int]]] = {}
+    unresolvable: Dict[str, int] = {}
+    counters = {"rel_resolved": 0, "rel_unresolvable": 0, "rel_fallback": 0}
+    for p_name, spans in (parity_spans or {}).items():
+        for kind, a, b, expect in _iter_parity_entries(spans):
+            if kind == "abs":
+                absolutes.setdefault(p_name, []).append((a, b))
+                counters["rel_fallback"] += 1
+                continue
+            resolved = resolve_utterance_span(output, a, b, expect=expect)
+            if resolved is None:
+                unresolvable[p_name] = unresolvable.get(p_name, 0) + 1
+                counters["rel_unresolvable"] += 1
+                continue
+            absolutes.setdefault(p_name, []).append((int(resolved[0]), int(resolved[1])))
+            counters["rel_resolved"] += 1
+    return absolutes, unresolvable, counters
+
+
 class LeanResolver:
     """Streamlined one-pass inference pipeline without abstain machinery."""
 
@@ -213,6 +308,8 @@ class LeanResolver:
         min_confidence: Optional[float] = None,
         min_posterior: Optional[float] = None,
         min_joint_margin: Optional[float] = None,
+        tool_objective: str = "ce",
+        tool_call_threshold: float = 0.5,
         **kwargs: Any,
     ) -> None:
         if model is None and encoder is not None:
@@ -300,6 +397,31 @@ class LeanResolver:
         self.min_joint_margin = (
             float(min_joint_margin) if min_joint_margin is not None else None
         )
+        # v2.1: which H1 head scores the anchors, and -- in binary mode -- the
+        # ABSOLUTE P(called) a tool must reach to be admitted.
+        #
+        # ``ce`` (default) keeps ``softmax`` + the existing ``call_min_prob``
+        # relative gate, so every stored prediction is reproducible.
+        # ``binary`` swaps in ``sigmoid`` over ``tool_head_binary``. The threshold
+        # is meaningful there in a way a softmax probability is not: sigmoid
+        # gives an absolute P(called), so 0.5 means "more likely called than
+        # not", whereas a softmax 0.5 just means "the biggest share of a
+        # distribution that always sums to 1" (over T=1 anchors it is exactly
+        # 1.0 for every row, which is why the CE gate could never use it).
+        obj = str(tool_objective or "ce").lower()
+        if obj not in ("ce", "binary"):
+            raise ValueError(f"tool_objective must be 'ce' or 'binary', got {tool_objective!r}")
+        self.tool_objective = obj
+        self.tool_call_threshold = float(tool_call_threshold)
+        if self.tool_objective == "binary":
+            # Fail loudly at construction, not silently at serve time: a binary
+            # resolver with no binary head would fall back to the CE head and
+            # report a v2.1 arm that was never actually run.
+            if model is not None and getattr(model, "tool_head_binary", None) is None:
+                raise ValueError(
+                    "tool_objective='binary' requires a model exposing "
+                    "`tool_head_binary`; got a model without one."
+                )
         # T3: why the LAST ``_tool_scores`` call returned nothing. Eval reads this
         # to attribute an empty ``tool_scores`` row to a specific serve-side cause
         # (no anchors / anchor loss / class mismatch) instead of treating it as a
@@ -347,8 +469,14 @@ class LeanResolver:
                 "tool_scores": [],
                 "gated_hit": False,
                 "abstain_reason": "no_candidates",
+                "tool_objective": getattr(self, "tool_objective", "ce"),
+                "tool_call_threshold": None,
             }
         if len(candidate_schemas) == 1:
+            # Single-candidate short-circuit, identical in BOTH arms: with T == 1
+            # there is no competition to score, so neither a softmax nor a sigmoid
+            # adds information, and the binary threshold is deliberately NOT
+            # applied here. The gate only ever decides between competing anchors.
             return {
                 "tool_name": candidate_schemas[0].name,
                 "tool_idx": 0,
@@ -357,6 +485,8 @@ class LeanResolver:
                 "tool_scores": [(candidate_schemas[0].name, 1.0)],
                 "gated_hit": True,
                 "abstain_reason": None,
+                "tool_objective": getattr(self, "tool_objective", "ce"),
+                "tool_call_threshold": None,
             }
         if self.model is None:
             return {
@@ -367,6 +497,8 @@ class LeanResolver:
                 "tool_scores": [],
                 "gated_hit": False,
                 "abstain_reason": "no_model_loaded",
+                "tool_objective": getattr(self, "tool_objective", "ce"),
+                "tool_call_threshold": None,
             }
 
         eff_budget = min(self.context_budget_tokens, max(64, self.max_seq_len // 2))
@@ -396,6 +528,12 @@ class LeanResolver:
                 "gated_hit": False,
                 "abstain_reason": f"sanitize: {exc}",
                 "tool_scores_reason": "sanitize_error",
+                "tool_objective": getattr(self, "tool_objective", "ce"),
+                "tool_call_threshold": (
+                    float(self.tool_call_threshold)
+                    if getattr(self, "tool_objective", "ce") == "binary"
+                    else None
+                ),
             }
 
         choices = self._tool_scores(output, H, per_token)
@@ -411,6 +549,12 @@ class LeanResolver:
                 # then say "anchor_loss:1of2" instead of blaming H1.
                 "abstain_reason": f"no_tool_scores:{self.last_tool_scores_reason}",
                 "tool_scores_reason": self.last_tool_scores_reason,
+                "tool_objective": getattr(self, "tool_objective", "ce"),
+                "tool_call_threshold": (
+                    float(self.tool_call_threshold)
+                    if getattr(self, "tool_objective", "ce") == "binary"
+                    else None
+                ),
             }
 
         winner_name, winner_p = choices[0]
@@ -419,6 +563,28 @@ class LeanResolver:
             (idx for idx, s in enumerate(candidate_schemas) if s.name == winner_name),
             0,
         )
+        # v2.1 absolute-confidence gate. ONLY in binary mode: a softmax prob is
+        # relative, so thresholding it here would silently change the shipped
+        # behaviour and break comparability with stored predictions. In binary
+        # mode the score IS P(called) over this anchor, so below-threshold means
+        # "the model does not believe this tool was called", which is a real
+        # abstention rather than a close-race artefact.
+        if (
+            getattr(self, "tool_objective", "ce") == "binary"
+            and float(winner_p) < float(self.tool_call_threshold)
+        ):
+            return {
+                "tool_name": winner_name,
+                "tool_idx": winner_idx,
+                "tool_prob": float(winner_p),
+                "tool_margin": float(margin),
+                "tool_scores": choices,
+                "gated_hit": False,
+                "abstain_reason": "tool_below_threshold",
+                "tool_scores_reason": self.last_tool_scores_reason,
+                "tool_objective": getattr(self, "tool_objective", "ce"),
+                "tool_call_threshold": float(self.tool_call_threshold),
+            }
         return {
             "tool_name": winner_name,
             "tool_idx": winner_idx,
@@ -430,6 +596,12 @@ class LeanResolver:
             # "ok" on the normal path; "anchor_loss:kofN" / "class_mismatch:..."
             # still yields scores but flags a degraded layout (T3).
             "tool_scores_reason": self.last_tool_scores_reason,
+            "tool_objective": getattr(self, "tool_objective", "ce"),
+            "tool_call_threshold": (
+                float(self.tool_call_threshold)
+                if getattr(self, "tool_objective", "ce") == "binary"
+                else None
+            ),
         }
 
     def try_resolve_candidates(
@@ -487,7 +659,18 @@ class LeanResolver:
                 abstain_reason=reason,
                 error_reason=reason,
                 latency_ms=(time.perf_counter() - t0) * 1000,
-                features=dict(ctx_features),
+                # Provenance on the failure path too: a run that died before
+                # scoring still has to say WHICH objective it was attempting, or
+                # an all-errors ablation arm is unattributable.
+                features={
+                    **ctx_features,
+                    "tool_objective": getattr(self, "tool_objective", "ce"),
+                    "tool_call_threshold": (
+                        float(self.tool_call_threshold)
+                        if getattr(self, "tool_objective", "ce") == "binary"
+                        else None
+                    ),
+                },
             )
         t_enc = time.perf_counter()
 
@@ -499,6 +682,16 @@ class LeanResolver:
             "enc_ms": (time.perf_counter() - t_enc) * 1000,
             "tool_scores": dict(choices),
             "temperature": self.temperature,
+            # Provenance: an ablation arm must be identifiable from its own
+            # output. ``tool_scores`` is a softmax distribution in "ce" mode and a
+            # set of independent probabilities in "binary" mode, so the raw dict
+            # is not comparable without this label.
+            "tool_objective": getattr(self, "tool_objective", "ce"),
+            "tool_call_threshold": (
+                float(self.tool_call_threshold)
+                if getattr(self, "tool_objective", "ce") == "binary"
+                else None
+            ),
             # T3: same attribution as ``predict_tool`` so Part-2 and Part-3 can
             # never disagree about why H1 produced no distribution.
             "tool_scores_reason": self.last_tool_scores_reason,
@@ -519,6 +712,26 @@ class LeanResolver:
 
         winner_name, winner_p = choices[0]
         winner = next((s for s in candidate_schemas if s.name == winner_name), candidate_schemas[0])
+
+        # v2.1 absolute-confidence gate. ONLY in binary mode: a sigmoid is an
+        # absolute P(called), so a fixed threshold is a real operating point. In
+        # "ce" mode the score is a softmax over T anchors with no such meaning,
+        # so this gate stays out of that path to keep the two arms comparable.
+        if (
+            getattr(self, "tool_objective", "ce") == "binary"
+            and float(winner_p) < float(self.tool_call_threshold)
+        ):
+            features["winner_prob"] = float(winner_p)
+            features["n_calls"] = 0
+            features["gated_tool_below_threshold"] = True
+            return LeanResolveResult(
+                hit=False,
+                status="abstain",
+                abstain_reason="tool_below_threshold",
+                error_reason="tool_below_threshold",
+                latency_ms=(time.perf_counter() - t0) * 1000,
+                features=features,
+            )
 
         # R0.4: decide how many calls to emit. The winner is always call 0. A
         # further call is admitted only if H1 gives its tool real probability --
@@ -581,7 +794,7 @@ class LeanResolver:
         raw_mode: Optional[bool] = None,
         context_schemas: Optional[Sequence[ToolDefinition]] = None,
         call_schemas: Optional[Sequence[ToolDefinition]] = None,
-        parity_spans: Optional[Dict[str, Sequence[Tuple[str, str]]]] = None,
+        parity_spans: Optional[Dict[str, Sequence[Any]]] = None,
         protect_parity_spans: bool = False,
     ) -> LeanResolveResult:
         """Resolve a single tool call.
@@ -600,11 +813,15 @@ class LeanResolver:
                 and appended to ``calls``. ``schema``'s own result still
                 populates ``tool_name``/``payload``, so single-call callers are
                 unaffected.
-            parity_spans: T1 candidate-parity hook. ``{param_name:
-                [(char_start, char_end), ...]}`` GT spans whose presence in the
-                candidate set is reported in ``features["parity_hit"]``.
-                Evaluation-only; leave ``None`` in production so the mask
-                builder takes its fastest path.
+            parity_spans: T1 candidate-parity hook. ``{param_name: [address,
+                ...]}`` GT spans whose presence in the candidate set is reported
+                in ``features["parity_hit"]``. An ``address`` is either
+                ``(utt_rel_start, utt_rel_end, expect)`` — PREFERRED, because it
+                is resolved against the render THIS call serves — or a legacy
+                ``(char_start, char_end)`` pair, which is used verbatim and
+                counted as ``features["parity_rel_fallback"]``. Dicts with the
+                same keys are accepted. Evaluation-only; leave ``None`` in
+                production so the mask builder takes its fastest path.
             protect_parity_spans: T2 switch. When True the same spans are also
                 forced past a ``max_cands`` truncation, which is the parity fix
                 under test. Keep it False when *measuring* the defect — with
@@ -637,7 +854,7 @@ class LeanResolver:
         now: Optional[Any],
         encoded_bundle: Optional[Tuple[SpanTemplateOutput, torch.Tensor, Sequence[Optional[Entry]], Dict[str, Any]]] = None,
         context_schemas: Optional[Sequence[ToolDefinition]] = None,
-        parity_spans: Optional[Dict[str, Sequence[Tuple[str, str]]]] = None,
+        parity_spans: Optional[Dict[str, Sequence[Any]]] = None,
         protect_parity_spans: bool = False,
     ) -> LeanResolveResult:
         # T1/T2 split, deliberately two switches:
@@ -649,7 +866,16 @@ class LeanResolver:
         #                                  forced past ``max_cands`` truncation.
         # Fusing them would make every diagnosis report a trivially perfect
         # parity rate, which is precisely the bug that section 3.3 describes.
-        protected_spans = parity_spans if protect_parity_spans else None
+        # NOTE: ``protected_spans`` is NOT computed here. Every span address must
+        # first be mapped onto the render we are about to SERVE; only then can
+        # protection and measurement agree. Computing it from the raw input would
+        # protect whichever render the producer had in mind while the candidate
+        # set came from this one — the exact skew the parity number was measuring.
+        protected_spans: Optional[Dict[str, Sequence[Tuple[str, str]]]] = None
+        # Normalised parity state, filled in both render branches below.
+        parity_absolutes: Dict[str, List[Tuple[int, int]]] = {}
+        parity_unresolvable: Dict[str, int] = {}
+        parity_counters = {"rel_resolved": 0, "rel_unresolvable": 0, "rel_fallback": 0}
         # ``render_schemas`` is what actually goes into the prompt; ``schema`` is
         # only what we score. Keeping them separate is the whole point of R0.2.
         render_schemas: List[ToolDefinition] = list(context_schemas) if context_schemas else [schema]
@@ -677,6 +903,14 @@ class LeanResolver:
             # ``mask_ms``/``enc_ms`` were attributed to the wrong stages. The
             # render and the encode both happened in ``try_resolve_candidates``,
             # so the honest report is: pre=0, enc=0, and mask = the work below.
+            # Parity normalisation happens HERE, against the bundle's own render,
+            # so the candidate membership check below is computed in the same
+            # coordinate system the mask builder used.
+            parity_absolutes, parity_unresolvable, parity_counters = (
+                _absolutize_parity_spans(output, parity_spans or {})
+            )
+            if protect_parity_spans:
+                protected_spans = parity_absolutes
             t_pre = time.perf_counter()
             # Recovering offsets by re-encoding would be a second full pass. The
             # bundle already carries the token count; derive the geometry from
@@ -724,6 +958,12 @@ class LeanResolver:
                     recent_context=_to_recent_rows(selected_recent),
                     now=_to_date(now),
                 )
+                # Same normalisation as the bundle path, against THIS render.
+                parity_absolutes, parity_unresolvable, parity_counters = (
+                    _absolutize_parity_spans(output, parity_spans or {})
+                )
+                if protect_parity_spans:
+                    protected_spans = parity_absolutes
                 t_pre = time.perf_counter()
                 # ONE tokenization: the same offsets feed both the legend mapping
                 # and the candidate masks (R4). Previously this encoded the text
@@ -934,22 +1174,36 @@ class LeanResolver:
         # NOTE: measured against ``parity_spans`` (the requested set), never
         # against ``protected_spans`` — otherwise the diagnosis would only run
         # when the fix was also on, and would then always report 1.0.
+        # Accounting rules, all three deliberate:
+        #   * the denominator stays MASK-GATED. A GT param that is not in this
+        #     schema has no candidate set at all, and counting it as a miss would
+        #     inflate the defect with rows where parity was never measurable.
+        #   * an unresolvable rel pair IS a miss, not an "n/a": the label pointed
+        #     at characters this render does not have, so the candidate set
+        #     provably could not contain them. Dropping it would let a drifted
+        #     label file report a clean parity number (the W1.3 accounting
+        #     mistake, repeated on the eval side).
+        #   * a fallback (absolute) pair is counted and checked exactly like a
+        #     resolved one; only the provenance counter distinguishes them.
         parity_checked = 0
         parity_hit = 0
-        if parity_spans:
-            for p_name, spans in parity_spans.items():
-                key = self._mask_key(schema.name, p_name)
-                m = cand_masks.get(key)
-                if m is None or not spans:
-                    continue
-                have = {
-                    (int(getattr(c, "char_start", -1)), int(getattr(c, "char_end", -1)))
-                    for c in m["candidates"]
-                }
-                for cs, ce in spans:
-                    parity_checked += 1
-                    if (int(cs), int(ce)) in have:
-                        parity_hit += 1
+        for p_name in set(parity_absolutes) | set(parity_unresolvable):
+            key = self._mask_key(schema.name, p_name)
+            m = cand_masks.get(key)
+            if m is None:
+                continue
+            parity_checked += int(parity_unresolvable.get(p_name, 0))
+            spans = parity_absolutes.get(p_name) or ()
+            if not spans:
+                continue
+            have = {
+                (int(getattr(c, "char_start", -1)), int(getattr(c, "char_end", -1)))
+                for c in m["candidates"]
+            }
+            for cs, ce in spans:
+                parity_checked += 1
+                if (int(cs), int(ce)) in have:
+                    parity_hit += 1
         features = {
             **ctx_features,
             "pre_ms": (t_pre - t0) * 1000,
@@ -972,6 +1226,14 @@ class LeanResolver:
             },
             "parity_checked": int(parity_checked),
             "parity_hit": int(parity_hit),
+            # Where the checked spans came from. A non-zero ``parity_rel_fallback``
+            # means the producer offered only absolute offsets, so the number stays
+            # exposed to render skew and must be read as a lower bound. A non-zero
+            # ``parity_unresolvable`` means labels pointed at characters this render
+            # does not have -- a data bug, counted as a miss rather than an n/a.
+            "parity_rel_resolved": int(parity_counters.get("rel_resolved", 0)),
+            "parity_rel_fallback": int(parity_counters.get("rel_fallback", 0)),
+            "parity_unresolvable": int(parity_counters.get("rel_unresolvable", 0)),
             "decode_refusals": decode_refusals,
             "n_decode_refusals": len(decode_refusals),
             "min_confidence": self.min_confidence,
@@ -1237,7 +1499,12 @@ class LeanResolver:
         H: torch.Tensor,
         per_token: Sequence[Optional[Entry]],
     ) -> List[Tuple[str, float]]:
-        """H1 softmax over <|tool|> anchors (bridge_text with e.tool != None), descending.
+        """H1 scores over ``<|tool|>`` anchors (bridge_text with e.tool != None), descending.
+
+        The score type follows ``tool_objective``: a softmax distribution over the
+        T rendered anchors in ``ce`` mode, an independent per-anchor ``sigmoid``
+        in ``binary`` mode. Both return one ``(name, score)`` pair per anchor in
+        descending order, which is all the top-1 contract needs.
 
         T3: an empty return used to be indistinguishable from a real H1 result of
         "no anchors", so an eval row with ``tool_scores == []`` looked like a
@@ -1249,9 +1516,20 @@ class LeanResolver:
         if self.model is None:
             self.last_tool_scores_reason = "no_model"
             return []
-        if self.model.tool_head is None:
-            self.last_tool_scores_reason = "no_tool_head"
-            return []
+        # v2.1: pick the head the SAME way the flag names it, and never fall
+        # back silently -- a binary resolver that quietly scored with the CE head
+        # would make the ablation report a result for a model that never ran.
+        _head = None
+        if getattr(self, "tool_objective", "ce") == "binary":
+            _head = getattr(self.model, "tool_head_binary", None)
+            if _head is None:
+                self.last_tool_scores_reason = "no_binary_tool_head"
+                return []
+        else:
+            _head = self.model.tool_head
+            if _head is None:
+                self.last_tool_scores_reason = "no_tool_head"
+                return []
 
         positions = [
             i
@@ -1281,8 +1559,14 @@ class LeanResolver:
         cls_h = H[:, 0]
 
         with torch.no_grad():
-            tl = self.model.tool_head(tool_h, cls_h)  # (1, n_tools)
-            tp = torch.softmax(tl / max(self.temperature, 1e-6), dim=-1)
+            tl = _head(tool_h, cls_h)  # (1, n_tools)
+            if getattr(self, "tool_objective", "ce") == "binary":
+                # No softmax: each anchor's score is an independent P(called), so
+                # a confident distractor cannot suppress the correct tool. Sorting
+                # descending still yields a total order for the top-1 contract.
+                tp = torch.sigmoid(tl / max(self.temperature, 1e-6))
+            else:
+                tp = torch.softmax(tl / max(self.temperature, 1e-6), dim=-1)
 
         names = [t.name for t in output.tools]
         if int(tp.size(-1)) != len(names):
