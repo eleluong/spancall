@@ -78,7 +78,13 @@ class TestBoilerplateIntegrity(unittest.TestCase):
         cfg = TrainingConfig.from_yaml("configs/default.yaml")
         self.assertEqual(cfg.model.backbone_name, "Qwen/Qwen3-Embedding-0.6B")
         self.assertEqual(cfg.optimization.learning_rate_encoder, 3e-5)
-        self.assertEqual(cfg.optimization.batch_size, 64)
+        # Refined recipe: `batch_size` is the MICRO batch and
+        # `effective_batch_size` (micro x accum) is what the optimizer sees.
+        self.assertEqual(cfg.optimization.batch_size, 32)
+        self.assertEqual(cfg.optimization.effective_batch_size, 128)
+        self.assertEqual(cfg.optimization.optimizer, "adamw")
+        self.assertEqual(cfg.optimization.min_lr_ratio, 0.10)
+        self.assertTrue(cfg.optimization.restore_best_on_exit)
         self.assertEqual(cfg.optimization.num_epochs, 4)
         self.assertEqual(cfg.output_dir, "results")
         self.assertEqual(cfg.seed, 42)

@@ -75,6 +75,31 @@ def compute_lean_tool_loss(
     return (per_row * has_row).sum() / has_row.sum().clamp(min=1)
 
 
+def _lean_tool_supervision_count(
+    tool_logits: torch.Tensor,
+    tool_targets: torch.Tensor,
+) -> torch.Tensor:
+    """Number of rows that actually carry H1 supervision (the loss denominator).
+
+    Mirrors the masking rules of :func:`compute_lean_tool_loss` exactly, so
+    ``loss × count`` reconstructs the batch SUM that was averaged into ``loss``.
+    Returning the count as a tensor keeps it device-local and differentiable-free.
+    """
+    C = int(tool_logits.size(-1)) if tool_logits.dim() == 2 else 0
+    if tool_logits.dim() != 2 or C == 0 or tool_targets.numel() == 0:
+        return torch.zeros((), device=tool_logits.device, dtype=torch.float32)
+    if tool_targets.dim() <= 1:
+        flat = tool_targets.reshape(-1)
+        if int(flat.size(0)) != int(tool_logits.size(0)):
+            return torch.zeros((), device=tool_logits.device, dtype=torch.float32)
+        has = (flat >= 0) & (flat < C)
+        return has.sum().float()
+    if int(tool_targets.size(0)) != int(tool_logits.size(0)):
+        return torch.zeros((), device=tool_logits.device, dtype=torch.float32)
+    valid = (tool_targets >= 0) & (tool_targets < C)
+    return valid.any(-1).sum().float()
+
+
 def compute_lean_pointer_loss(
     candidate_logits: torch.Tensor,
     positive_indices: torch.Tensor,
@@ -159,7 +184,21 @@ class LeanLossContainer(nn.Module):
         out: Dict[str, Any] = {}
         total_loss = torch.tensor(0.0, device=predictions["span_logits"].device if "span_logits" in predictions else "cpu")
 
-        # 1. Pointer loss (H3)
+        # NOTE on the reported `*_sum` / `*_count` pairs below.
+        #
+        # `pointer` and `tool` are per-BATCH means (each term is divided by the
+        # count inside its own batch). Averaging those means across batches is a
+        # mean-of-ratios, so it depends on how rows happen to be bucketed: one
+        # long 1-row batch carries the same weight as a full 8-row batch. That is
+        # why the trainer's `mean_loss` and `eval_loss` were not on a common scale
+        # (docs: train fell 17x while dev rose 32% purely from overfitting, but the
+        # absolute gap was partly an accounting artifact).
+        #
+        # The raw `sum` and `count` are therefore exposed so the trainer can
+        # accumulate `sum(sum) / sum(count)` -- a slot-weighted (micro) average
+        # that is invariant to batch composition and identical for train and eval.
+        # Gradients are unaffected: `ptr_loss` / `t_loss` still normalise per
+        # batch, exactly as before.
         if "span_logits" in predictions and "pointer_positives" in targets:
             span_logits = predictions["span_logits"]
             positives = targets["pointer_positives"]
@@ -167,13 +206,20 @@ class LeanLossContainer(nn.Module):
 
             if "pointer_mask" in targets:
                 ptr_per_param = ptr_per_param * targets["pointer_mask"].float()
-                n_active = targets["pointer_mask"].sum().clamp(min=1.0)
+                n_active_raw = targets["pointer_mask"].sum()
             else:
                 n_pos = (positives >= 0) & (positives < span_logits.size(-1))
-                n_active = (n_pos.sum(-1) > 0).sum().clamp(min=1.0)
+                n_active_raw = (n_pos.sum(-1) > 0).sum()
+
+            # `clamp` guards the divisor only; the TRUE count is what gets
+            # reported, so a batch with no supervised slots contributes 0 to both
+            # the numerator and the denominator of the micro average.
+            n_active = n_active_raw.clamp(min=1.0)
 
             ptr_loss = ptr_per_param.sum() / n_active
             out["pointer"] = ptr_loss.detach()
+            out["pointer_sum"] = ptr_per_param.sum().detach()
+            out["pointer_count"] = n_active_raw.detach()
             total_loss = total_loss + self.lambda_pointer * ptr_loss
 
         # 2. Tool loss (H1)
@@ -196,6 +242,13 @@ class LeanLossContainer(nn.Module):
                 t_loss = compute_lean_tool_loss(tool_logits, tool_targets)
                 if t_loss is not None:
                     out["tool"] = t_loss.detach()
+                    # Same micro-average bookkeeping as the pointer term: report
+                    # the per-batch SUM and the number of supervised rows so the
+                    # trainer can weight batches by supervision instead of by
+                    # batch count (see the note above).
+                    n_tool_sup = _lean_tool_supervision_count(tool_logits, tool_targets)
+                    out["tool_sum"] = t_loss.detach() * n_tool_sup
+                    out["tool_count"] = n_tool_sup
                     total_loss = total_loss + self.lambda_tool * t_loss
                 else:
                     out["tool"] = torch.zeros((), device=tool_logits.device)

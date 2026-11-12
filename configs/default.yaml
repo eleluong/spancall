@@ -84,9 +84,32 @@ optimization:
   learning_rate_head: 1.0e-4
   weight_decay: 0.01
   warmup_ratio: 0.06
-  batch_size: 64
+  # `batch_size` is the MICRO batch; rows per OPTIMIZER step is
+  # `effective_batch_size`, and the accumulation factor is DERIVED from the two
+  # (accum = effective // micro). Before this, the two knobs were independent and
+  # the Colab recipe ran bs=8 / accum=4 => effective 32 on ~3.9k rows = ~122
+  # optimizer steps/epoch, which is why dev peaked at epoch 2 of 5 and then
+  # decayed while train loss fell 17x. 128 is a sane full-finetune effective
+  # batch; raise it before raising the LR.
+  batch_size: 32
+  effective_batch_size: 128
+  # Length-bucketed cap for one micro batch. This used to be hardcoded
+  # `bs * 1024`, so it silently changed meaning when bs changed and produced
+  # 1-row batches that skewed the loss accounting.
+  max_tokens_per_batch: 4096
+  optimizer: "adamw"              # adamw | adamw_8bit (needs bitsandbytes)
+  scheduler: "cosine_warmup"      # cosine_warmup | linear | constant
+  # Cosine floor as a fraction of the peak LR. 0.0 = historical decay-to-zero,
+  # which left the final epochs at ~1e-9 LR -- exactly when dev was decaying.
+  min_lr_ratio: 0.10
   num_epochs: 4
   mixed_precision: "bf16"
+  # Early stopping on the first eval split, and restoring the best epoch's
+  # weights so the stage checkpoint is NOT the overfit final epoch.
+  # patience=0 disables early stopping (old behaviour: run every epoch).
+  early_stopping_patience: 1
+  early_stopping_min_delta: 1.0e-4
+  restore_best_on_exit: true
   # H-T2: 0.5 (half the old 1.0) de-collapses the pointer — the single biggest
   # measured lever (5.33->2.87 loss at 74 rows; F-only recall 0.083 baseline)
   abstain_weight: 0.5

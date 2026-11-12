@@ -221,19 +221,43 @@ def build_parameter_groups(
 
 
 class CosineWarmupSchedule:
-    """Linear warmup then cosine decay to 0 (plan §3.4.1)."""
+    """Linear warmup then cosine decay.
 
-    def __init__(self, optimizer: torch.optim.Optimizer, warmup_steps: int, total_steps: int) -> None:
+    ``min_lr_ratio`` sets the floor the decay approaches, as a FRACTION of each
+    group's peak LR. The default 0.0 reproduces the historical "decay to zero"
+    curve exactly; a floor > 0 is what the 0.2-fraction runs want, because
+    decaying to ~1e-9 for the last epochs means those epochs only overfit the
+    pointer head (dev loss rose while train loss kept falling). ``kind`` selects
+    the decay shape: ``cosine`` (default), ``linear`` or ``constant``.
+    """
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        warmup_steps: int,
+        total_steps: int,
+        min_lr_ratio: float = 0.0,
+        kind: str = "cosine",
+    ) -> None:
         self.warmup_steps = max(int(warmup_steps), 0)
         self.total_steps = max(int(total_steps), 1)
+        self.min_lr_ratio = min(max(float(min_lr_ratio), 0.0), 1.0)
+        self.kind = str(kind or "cosine").lower()
 
         def lr_lambda(step: int) -> float:
             if self.warmup_steps > 0 and step < self.warmup_steps:
                 return float(step + 1) / float(self.warmup_steps)
-            if step >= self.total_steps:
-                return 0.0
+            if self.total_steps <= self.warmup_steps:
+                return 1.0
             progress = (step - self.warmup_steps) / max(self.total_steps - self.warmup_steps, 1)
-            return 0.5 * (1.0 + math.cos(math.pi * progress))
+            progress = min(max(progress, 0.0), 1.0)
+            if self.kind == "constant":
+                base = 1.0
+            elif self.kind == "linear":
+                base = 1.0 - progress
+            else:
+                base = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return self.min_lr_ratio + (1.0 - self.min_lr_ratio) * base
 
         self.scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
 

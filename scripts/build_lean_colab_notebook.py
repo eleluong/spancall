@@ -1194,7 +1194,14 @@ MARKDOWN_TRAIN = """---
 ## 4. Training — Lean Flow (`scripts/train_lean.py`)
 
 Runs [`scripts/train_lean.py`](../scripts/train_lean.py) on stage `T2` with `LeanSpanCallModel` and `LeanLossContainer` ($L = \\lambda_{\\text{ptr}} L_{\\text{ptr}} + \\lambda_{\\text{tool}} L_{\\text{tool}}$).
-- Uses the same optimizer hyperparameters (`num_epochs=5`, `batch_size=8`, `gradient_accumulation_steps=4`, `bf16`, `CosineWarmupSchedule`) as the legacy notebook for a clean apples-to-apples comparison."""
+
+**Refined recipe (bs=128 effective).** The previous run used `bs=8` with `accum=4`, i.e. an *effective batch of 32* on ~3.9k rows → only ~122 optimizer steps/epoch. Dev `exact_call` peaked at epoch 2 of 5 and then decayed monotonically while train loss fell 17×. The knobs below target that:
+
+- `effective_batch_size=128` is authoritative; `accum` is **derived** from `micro_bs`, so the two can never disagree.
+- `min_lr_ratio=0.10` floors the cosine decay — decaying to ~1e-9 left the final epochs doing nothing but overfitting.
+- `early_stopping_patience=1` + `restore_best_on_exit=True` stop the run at the dev minimum and put the **best** epoch's weights back, so the stage checkpoint is no longer the overfit final epoch.
+
+**Loss scale (train ↔ eval alignment).** `mean_loss` (train) and `eval_loss` (dev) are now both **slot-weighted micro averages** — every supervised param slot / supervised row contributes once, regardless of how rows were bucketed. Previously each was a mean of per-batch means, so a 1-row batch produced by the token cap weighed as much as a full batch and the two series were on different scales. The legacy numbers remain available as `mean_loss_batchmean` / `eval_loss_batchmean`."""
 
 CODE_COLAB_CFG = '''import yaml, os
 
@@ -1210,9 +1217,29 @@ cfg["experiment"]["data_dir"] = TENSOR_DIR
 
 NUM_EPOCHS = 5
 cfg["optimization"]["num_epochs"] = NUM_EPOCHS
-cfg["optimization"]["batch_size"] = 8
+# MICRO batch. Rows per OPTIMIZER step is EFFECTIVE_BATCH_SIZE and the
+# accumulation factor is derived from the two, so they cannot disagree.
+# The old recipe (bs=8, accum=4 => effective 32) gave ~122 optimizer steps/epoch
+# on ~3.9k rows; dev exact_call then peaked at epoch 2/5 and decayed while train
+# loss fell 17x. A larger effective batch reduces that memorisation pressure.
+MICRO_BATCH_SIZE = 32
+EFFECTIVE_BATCH_SIZE = 128
+cfg["optimization"]["batch_size"] = MICRO_BATCH_SIZE
+cfg["optimization"]["effective_batch_size"] = EFFECTIVE_BATCH_SIZE
+cfg["optimization"]["max_tokens_per_batch"] = 4096
+cfg["optimization"]["optimizer"] = "adamw"
+cfg["optimization"]["scheduler"] = "cosine_warmup"
+# LR floor: cosine-to-zero left the last epochs at ~1e-9 LR, i.e. pure overfitting.
+cfg["optimization"]["min_lr_ratio"] = 0.10
+# Early stop on the first eval split and restore the best epoch's weights so the
+# stage checkpoint is not the (empirically worst) final epoch.
+cfg["optimization"]["early_stopping_patience"] = 1
+cfg["optimization"]["restore_best_on_exit"] = True
 cfg["optimization"]["mixed_precision"] = "bf16"
-cfg["training"]["gradient_accumulation_steps"] = 4
+# Accumulation is DERIVED from effective_batch_size // micro_batch_size; this value
+# is only a fallback for a config that lacks effective_batch_size.
+cfg["training"]["gradient_accumulation_steps"] = max(
+    int(round(EFFECTIVE_BATCH_SIZE / MICRO_BATCH_SIZE)), 1)
 cfg["training"]["gradient_checkpointing"] = True
 cfg["training"]["eval_splits"] = ["dev"]
 cfg["training"]["eval_limit"] = 500
@@ -1234,8 +1261,15 @@ cfg["data"]["pack_tools"] = _EFFECTIVE_PACK_TOOLS
 out = "configs/colab_lean.yaml"
 with open(out, "w") as fh:
     yaml.safe_dump(cfg, fh)
-print(f"wrote {out} (epochs={NUM_EPOCHS}, bs=8, accum=4, bf16=True, freeze=[], "
+print(f"wrote {out} (epochs={NUM_EPOCHS}, micro_bs={MICRO_BATCH_SIZE}, "
+      f"effective_bs={EFFECTIVE_BATCH_SIZE}, accum={cfg['training']['gradient_accumulation_steps']}, "
+      f"optimizer={cfg['optimization']['optimizer']}, lr_floor={cfg['optimization']['min_lr_ratio']}, "
+      f"early_stop_patience={cfg['optimization']['early_stopping_patience']}, bf16=True, "
       f"data_fraction={TRAIN_FRACTION}, pack_tools={_EFFECTIVE_PACK_TOOLS})")
+print(f"loss scale: train mean_loss and dev eval_loss are now BOTH slot-weighted "
+      f"(micro averages), so the two series are directly comparable. The legacy "
+      f"mean-of-batch-means is still logged as mean_loss_batchmean / "
+      f"eval_loss_batchmean for continuity with older runs.")
 if _EFFECTIVE_PACK_TOOLS < 2:
     print("[!VACUOUS-H1] effective pack_tools < 2: H1 is a single-class softmax "
           "(CE == 0). Any tool_acc printed as 1.000 is an artifact.")
@@ -1357,14 +1391,63 @@ if train_log:
     else:
         print("  no epoch_eval events")
 
+    # ------------------------------------------------------------------
+    # ALIGNED TRAIN vs EVAL LOSS
+    # Both numbers are now SLOT-WEIGHTED micro averages (sum of per-slot
+    # losses / number of supervised slots), so they live on ONE scale and
+    # the `gap` column is meaningful. Previously `mean_loss` was a mean of
+    # per-batch means over shuffled train batches while eval loss was a mean
+    # over length-sorted batches, which made the two numbers incomparable.
+    # The `legacy` columns reproduce the old batch-mean values.
+    # ------------------------------------------------------------------
     print("\\n" + "=" * 78)
-    print("PER-EPOCH MEAN TRAIN LOSS (epoch_end events)")
+    print("ALIGNED TRAIN vs EVAL LOSS (slot-weighted micro averages)")
     print("=" * 78)
     ends = [r for r in train_log if r.get("event") == "epoch_end"]
     if ends:
-        print(f"  {'stage':<8}{'epoch':>6}{'mean_loss':>12}")
+        print(f"  {'stage':<8}{'ep':>4}{'train_loss':>12}{'dev_loss':>11}"
+              f"{'gap':>10}{'ptr':>9}{'tool':>9}{'train_bm':>10}{'dev_bm':>9}")
         for r in ends:
-            print(f"  {str(r.get('stage','?')):<8}{r.get('epoch','?'):>6}{r.get('mean_loss', 0):>12.4f}")
+            ep = r.get("epoch", "?")
+            tr = _num(r, "mean_loss")
+            tr_bm = _num(r, "mean_loss_batchmean")
+            ptr = _num(r, "pointer_loss")
+            tool = _num(r, "tool_loss")
+            # The same-epoch, same-stage dev row carries the aligned eval loss.
+            dev_row = next(
+                (e for e in evals
+                 if e.get("stage") == r.get("stage") and e.get("epoch") == ep),
+                None,
+            )
+            dv = _num(dev_row, "eval_loss") if dev_row is not None else None
+            dv_bm = _num(dev_row, "eval_loss_batchmean") if dev_row is not None else None
+            gap = (dv - tr) if (dv is not None and tr is not None) else None
+            tr_s = f"{tr:>12.4f}" if tr is not None else f"{'—':>12}"
+            dv_s = f"{dv:>11.4f}" if dv is not None else f"{'—':>11}"
+            gap_s = f"{gap:>+10.4f}" if gap is not None else f"{'—':>10}"
+            ptr_s = f"{ptr:>9.4f}" if ptr is not None else f"{'—':>9}"
+            tool_s = f"{tool:>9.4f}" if tool is not None else f"{'—':>9}"
+            trbm_s = f"{tr_bm:>10.4f}" if tr_bm is not None else f"{'—':>10}"
+            dvbm_s = f"{dv_bm:>9.4f}" if dv_bm is not None else f"{'—':>9}"
+            print(f"  {str(r.get('stage','?')):<8}{str(ep):>4}"
+                  f"{tr_s}{dv_s}{gap_s}{ptr_s}{tool_s}{trbm_s}{dvbm_s}")
+        print("\\n  gap = dev_loss - train_loss on the SAME (slot-weighted) scale.")
+        print("  A gap that GROWS after the first epochs is genuine overfitting;")
+        print("  ptr/tool columns split the train loss into its two heads.")
+        print("  train_bm/dev_bm are the LEGACY batch-mean values (mean of ratios);")
+        print("  they are kept only for continuity and are composition-sensitive.")
+        rounds = [(_num(r, "mean_loss"),
+                   _num(next((e for e in evals
+                              if e.get("stage") == r.get("stage")
+                              and e.get("epoch") == r.get("epoch")), None),
+                         "eval_loss")) for r in ends]
+        rounds = [(t, d) for t, d in rounds if t is not None and d is not None]
+        if len(rounds) >= 2:
+            first_gap = rounds[0][1] - rounds[0][0]
+            best_i = min(range(len(rounds)), key=lambda i: rounds[i][1])
+            print(f"\\n  first-epoch gap={first_gap:+.4f}; "
+                  f"dev_loss is lowest at epoch {ends[best_i].get('epoch')} "
+                  f"({rounds[best_i][1]:.4f}).")
     else:
         print("  no epoch_end events")
 

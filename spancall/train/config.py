@@ -87,6 +87,39 @@ class OptimizationConfig:
     abstain_weight: float = 1.0   # B2/H-T2: abstain column loss weight (0.5 de-collapses)
     max_pos: int = 3              # T3: positive slots per param (1 = top-1 only)
 
+    # ---- Optimizer / schedule / batching (measured on the 0.2-fraction runs) --
+    #
+    # Motivates these defaults: dev metrics peaked at epoch 2 of 5 and decayed
+    # monotonically afterwards while train loss fell 17x, i.e. the recipe was
+    # overfitting well before the cosine tail. Two levers matter:
+    #
+    # 1. More rows per optimizer step. The old recipe used bs=8 with accum=4 ->
+    #    an EFFECTIVE batch of 32 on ~3919 rows, which is ~122 optimizer steps per
+    #    epoch. Such small steps + a 3e-5 head LR let the pointer memorise
+    #    candidate spans. `effective_batch_size` is the single source of truth:
+    #    `batch_size` is the micro-batch and `gradient_accumulation_steps` is
+    #    derived as effective//micro, so raising the effective batch does not
+    #    require editing two knobs consistently.
+    # 2. Explicit regularisation: decoupled (AdamW) weight decay, an LR floor so
+    #    the cosine schedule does not spend the last epochs at ~0, and a slightly
+    #    shorter schedule.
+    #
+    # `optimizer`/`scheduler` are strings so a new choice fails loudly rather
+    # than being silently ignored.
+    optimizer: str = "adamw"          # adamw | adamw_8bit (needs bitsandbytes)
+    scheduler: str = "cosine_warmup"  # cosine_warmup | constant | linear
+    effective_batch_size: int = 128   # rows per OPTIMIZER step (micro x accum)
+    max_tokens_per_batch: int = 4096  # length-bucketed token cap for a micro-batch
+    min_lr_ratio: float = 0.10        # cosine floor as a fraction of the peak LR
+    label_smoothing: float = 0.0      # 0 disables; >0 smooths the tool CE
+    dropout: Optional[float] = None   # head dropout override (None => model.dropout)
+    # Early stopping on the first eval split. `patience=0` disables it (old
+    # behaviour: always run every epoch). `restore_best_on_exit` puts the best
+    # epoch's weights back so the stage checkpoint is NOT the overfit final epoch.
+    early_stopping_patience: int = 0
+    early_stopping_min_delta: float = 1e-4
+    restore_best_on_exit: bool = True
+
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> "OptimizationConfig":
         """Build from the YAML ``optimization`` section; missing keys keep defaults."""

@@ -1,5 +1,6 @@
 """Unit tests for the Lean flow (spancall/lean)."""
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -40,6 +41,7 @@ from spancall.lean.tensorize import (
 )
 from spancall.lean.trainer import (
     LeanTrainer,
+    _MicroLossAccumulator,
     apply_lora,
     build_lean_optimizer_groups,
 )
@@ -3259,5 +3261,56 @@ def test_trainer_provenance_records_whether_lora_was_used(tmp_path) -> None:
     assert meta["use_lora"] is False
     assert meta["lora_param_count"] == 0
     assert path.endswith("model.pt")
+
+
+def test_micro_loss_is_invariant_to_batch_composition() -> None:
+    """Train `mean_loss` and eval `eval_loss` must share ONE scale.
+
+    The bug this pins: `pointer` / `tool` are per-BATCH means, so the old
+    `mean of batch means` moved when the SAME rows were merely bucketed
+    differently (shuffled train batches vs. length-sorted eval batches).
+    Re-bucketing 8 identical rows into 5+3 flipped the reported loss by >1 nat,
+    which is what made train and dev losses look like different statistics.
+    The slot-weighted (micro) average must be invariant to that regrouping.
+    """
+    torch.manual_seed(0)
+    container = LeanLossContainer(lambda_pointer=1.0, lambda_tool=1.0)
+
+    def _make(bs: int):
+        B, K, C, P, T = bs, 3, 25, 2, 12
+        span = torch.randn(B, K, C)
+        pos = torch.full((B, K, P), -1, dtype=torch.long)
+        pos[:, 0, 0] = 1                      # one supervised slot per row
+        tool = torch.randn(B, T)
+        tgt = torch.full((B,), -1, dtype=torch.long)
+        tgt[: max(B // 2, 1)] = 4             # only half the rows carry H1.
+        return ({"span_logits": span, "tool_logits": tool},
+                {"pointer_positives": pos, "tool_targets": tgt})
+
+    preds, tgts = _make(8)
+    a = ({k: v[:5] for k, v in preds.items()}, {k: v[:5] for k, v in tgts.items()})
+    b = ({k: v[5:] for k, v in preds.items()}, {k: v[5:] for k, v in tgts.items()})
+
+    one = _MicroLossAccumulator()
+    one.add(container(preds, tgts))
+
+    two = _MicroLossAccumulator()
+    two.add(container(*a))
+    two.add(container(*b))
+
+    lam = (container.lambda_pointer, container.lambda_tool)
+    assert abs(one.combined(*lam) - two.combined(*lam)) < 1e-5
+
+    # ...and the legacy statistic is exactly what must NOT be trusted for this.
+    legacy = 0.5 * (float(container(*a)["loss"]) + float(container(*b)["loss"]))
+    assert abs(float(container(preds, tgts)["loss"]) - legacy) > 1e-3
+
+
+def test_micro_loss_reports_nan_when_nothing_is_supervised() -> None:
+    """An unsupervised batch must not fake a 0.0 loss on the aligned scale."""
+    acc = _MicroLossAccumulator()
+    assert math.isnan(acc.value("pointer"))
+    assert math.isnan(acc.value("tool"))
+    assert math.isnan(acc.combined(1.0, 1.0))
 
 
