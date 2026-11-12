@@ -36,7 +36,23 @@ def _enum_of(enum_type: Type[Enum], value: Any) -> Any:
 
 @dataclass
 class SpanTarget:
-    """Represents a ground truth target for a parameter."""
+    """Represents a ground truth target for a parameter.
+
+    ``char_start``/``char_end`` are ABSOLUTE offsets into the render the aligner
+    produced. That render is only one of several legal renders of the same
+    sample (single-tool vs packed multi-tool, template revisions, distractor
+    packing), so absolute offsets go stale whenever the grammar or the packed
+    tool set changes — the defect measured in
+    ``docs/lean_eval_diagnosis_walkthrough.md`` (100% stale ``utterance_span``
+    offsets, drift +29..+43).
+
+    ``utt_rel_start``/``utt_rel_end`` are the RENDER-INVARIANT form: offsets
+    relative to the start of the utterance entry. The utterance text itself is
+    sanitize-stable, so a consumer that re-renders the sample (tensorize,
+    resolver) resolves the rel pair against ITS OWN render and gets the correct
+    absolute span no matter how many ``<|tool|>`` blocks were packed. New
+    alignments populate both; readers should prefer the rel pair when present.
+    """
     param_name: str
     target_type: str  # "utterance_span", "recent_ctx", "time_ctx", "enum_ctx", "boolean_ctx", "unresolved"
     char_start: Optional[int] = None
@@ -45,6 +61,8 @@ class SpanTarget:
     token_end: Optional[int] = None
     ctx_key: Optional[str] = None
     canonical_value: Optional[Any] = None
+    utt_rel_start: Optional[int] = None
+    utt_rel_end: Optional[int] = None
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> "SpanTarget":
@@ -57,6 +75,8 @@ class SpanTarget:
             token_end=d.get("token_end"),
             ctx_key=d.get("ctx_key"),
             canonical_value=d.get("canonical_value"),
+            utt_rel_start=d.get("utt_rel_start"),
+            utt_rel_end=d.get("utt_rel_end"),
         )
 
 

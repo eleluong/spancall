@@ -26,7 +26,7 @@ from spancall.data.schema import (
     ToolDefinition,
     UnifiedSample,
 )
-from span_template.template import RecentRow, build_input_multi
+from span_template.template import RecentRow, build_input_multi, resolve_utterance_span
 
 # The one and only "absent / padded" sentinel for integer index tensors.
 # ``0`` is a *real* index (the first candidate span, the ``<|cls|>`` token,
@@ -769,9 +769,35 @@ def tensorize_sample_lean(
                 # which silently disabled the multi-positive marginal likelihood
                 # in compute_lean_pointer_loss (R7).
                 span_hits: List[int] = []
-                if t.char_start is not None and t.char_end is not None:
+                # Resolve the target against THIS render. A pre-v2 target only
+                # carries absolute ``char_*`` offsets, which address whichever
+                # render the aligner produced (single-tool, or an older
+                # template revision). When the render-invariant
+                # ``utt_rel_*`` pair is present it is authoritative: the
+                # utterance text is sanitize-stable, so it maps onto this
+                # render's absolute offsets no matter how many ``<|tool|>``
+                # blocks training packed. Falls back to the absolute pair for
+                # context targets and for legacy rows that lack the rel pair.
+                t_start, t_end = t.char_start, t.char_end
+                if t.utt_rel_start is not None and t.utt_rel_end is not None:
+                    resolved = resolve_utterance_span(
+                        out,
+                        int(t.utt_rel_start),
+                        int(t.utt_rel_end),
+                        expect=str(t.canonical_value) if t.canonical_value is not None else None,
+                    )
+                    if resolved is not None:
+                        t_start, t_end = resolved
+                    elif stats is not None:
+                        # Counted, never silent: a rel pair that does not map
+                        # onto this render means the utterance text drifted
+                        # (sanitization change) and the label is unusable.
+                        stats["utt_rel_unresolved"] = int(
+                            stats.get("utt_rel_unresolved", 0)
+                        ) + 1
+                if t_start is not None and t_end is not None:
                     for ci, c in enumerate(cands):
-                        if c.char_start == t.char_start and c.char_end == t.char_end:
+                        if c.char_start == t_start and c.char_end == t_end:
                             span_hits.append(ci)
                 if span_hits:
                     for ci in span_hits:

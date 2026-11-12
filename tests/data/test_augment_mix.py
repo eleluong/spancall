@@ -136,7 +136,7 @@ def _render_utterance_entry(sample: UnifiedSample) -> tuple:
     """
     from datetime import date as _date
 
-    from span_template.template import RecentRow, build_input
+    from span_template.template import RecentRow, build_input_multi
     from spancall.data.align import _find_utterance_entry, tooldef_to_template_tool
 
     tool_def = next(
@@ -150,8 +150,8 @@ def _render_utterance_entry(sample: UnifiedSample) -> tuple:
         RecentRow(key=r["key"], value=r["value"], source=r.get("source", "recent"))
         for r in sample.recent_context
     ]
-    out = build_input(
-        tool=tooldef_to_template_tool(tool_def),
+    out = build_input_multi(
+        tools=[tooldef_to_template_tool(tool_def)],
         utterance=sample.utterance,
         recent_context=recent,
         now=base,

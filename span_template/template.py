@@ -363,6 +363,52 @@ def build_input(
     )
 
 
+def resolve_utterance_span(
+    output: SpanTemplateOutput,
+    rel_start: int,
+    rel_end: int,
+    *,
+    expect: Optional[str] = None,
+) -> Optional[Tuple[int, int]]:
+    """Map an utterance-relative span onto THIS render's absolute char offsets.
+
+    ``SpanTarget.char_start/char_end`` are absolute in the render the aligner
+    happened to produce. That render is only one legal render of the sample:
+    training packs a different number of ``<|tool|>`` blocks, and the template
+    itself can be revised. The utterance text, in contrast, is sanitize-stable,
+    so an offset relative to the start of the utterance entry survives all of it.
+
+    This is the one place that conversion happens, so aligner, tensorizer and
+    diagnostics cannot disagree about it (the same reason ``norm_value`` is
+    shared in eval_p1).
+
+    Args:
+        output: a render of the sample under the grammar the caller will use.
+        rel_start/rel_end: offsets into the utterance TEXT.
+        expect: optional expected substring; when given, the mapped slice must
+            equal it, otherwise the pair is rejected (returns ``None``) instead
+            of silently producing a span that points at different characters.
+
+    Returns:
+        ``(abs_start, abs_end)`` in ``output.text``, or ``None`` when the render
+        has no usable utterance entry / the pair falls outside it / validation
+        fails.
+    """
+    utt = None
+    for e in output.entries:
+        if e.segment == "utterance" and e.selectable:
+            utt = e
+            break
+    if utt is None or not isinstance(utt.value, str):
+        return None
+    text = utt.value
+    if not (0 <= rel_start <= rel_end <= len(text)):
+        return None
+    if expect is not None and text[rel_start:rel_end] != expect:
+        return None
+    return (utt.char_start + rel_start, utt.char_start + rel_end)
+
+
 def _normalize(utterance: str, sanitize: bool) -> Tuple[str, Optional[NormalizedText]]:
     """P0/P1 before rendering (shared by single/multi build paths).
 

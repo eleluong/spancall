@@ -212,6 +212,17 @@ def _norm(v: Any) -> Any:
     return low if low in ("true", "false") else s
 
 
+def norm_value(v: Any) -> Any:
+    """Public alias of :func:`_norm` so another module cannot fork the rule.
+
+    ``spancall.lean.diagnostics`` scores the same GT/pred pairs outside the Part-1
+    driver. Importing the private name would work but invites a copy-paste
+    re-implementation, and two subtly different cast/normalisation rules would
+    make the diagnostics disagree with the headline it is meant to explain.
+    """
+    return _norm(v)
+
+
 def _ratio(num: int, den: int) -> float:
     """Ratio that is NaN — not a fake 1.0 — when the denominator is empty."""
     return num / den if den else float("nan")

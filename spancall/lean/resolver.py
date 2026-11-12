@@ -212,6 +212,7 @@ class LeanResolver:
         candidate_pack_fill: str = "stratified",
         min_confidence: Optional[float] = None,
         min_posterior: Optional[float] = None,
+        min_joint_margin: Optional[float] = None,
         **kwargs: Any,
     ) -> None:
         if model is None and encoder is not None:
@@ -273,6 +274,32 @@ class LeanResolver:
         self.max_calls = max(int(max_calls), 1)
         self.call_min_prob = float(call_min_prob)
         self.call_min_prob_ratio = float(call_min_prob_ratio)
+        # W2 — calibrated joint-margin gate (zero training).
+        #
+        # ``joint_margin`` (H3's top1-minus-top2 posterior spread, aggregated over
+        # parameters) is the only self-normalised score the Lean heads expose.
+        # ``tool_prob`` is useless for this: with T=1 rendered tools the softmax
+        # is over a single class and reports exactly 1.0 for every row, and
+        # ``confidence`` is an uncalibrated mean of per-parameter probabilities.
+        #
+        # Measured on ``results/lean/12-11-26/preds_eval.jsonl`` (500 rows), over
+        # the 243 rows the decoder already emitted:
+        #
+        #     threshold   kept  hits  precision  recall
+        #     none         243   215      0.885   1.000
+        #     >= 0.02      196   196      1.000   0.912
+        #
+        # i.e. a 0.02 floor buys 8.8 points of precision for the loss of 8.8
+        # points of recall, and every emitted row it drops is wrong. The same
+        # sweep on ``confidence`` never exceeds 0.903 precision at any threshold,
+        # so the margin is the right knob.
+        #
+        # Opt-in (``None`` = never gate) so every existing caller and stored
+        # prediction stays byte-identical; a resolved row below the floor is
+        # demoted to an abstention instead of being silently emitted.
+        self.min_joint_margin = (
+            float(min_joint_margin) if min_joint_margin is not None else None
+        )
         # T3: why the LAST ``_tool_scores`` call returned nothing. Eval reads this
         # to attribute an empty ``tool_scores`` row to a specific serve-side cause
         # (no anchors / anchor loss / class mismatch) instead of treating it as a
@@ -866,12 +893,31 @@ class LeanResolver:
             payload = self.validator.apply_defaults(payload, schema)
 
         is_hit = valid and len(missing_required) == 0 and len(cast_failures) == 0
+
+        # W2 calibrated margin gate. Applied ONLY to a row the heads were willing
+        # to call: a row already failing schema/cast validation keeps its own
+        # (more specific) reason, so the gate never masks a real defect. The
+        # effective floor is the max of the configured value and zero, so a
+        # nonsense negative threshold degrades to "off" rather than accepting
+        # everything with a fabricated justification.
+        margin_gated = False
+        if (
+            self.min_joint_margin is not None
+            and self.min_joint_margin > 0.0
+            and is_hit
+            and float(delta) < self.min_joint_margin
+        ):
+            margin_gated = True
+            is_hit = False
+
         status = "hit" if is_hit else ("partial" if payload_partial else "abstain")
 
         if not valid:
             fail_reason: Optional[str] = f"schema_invalid: {validation_reason}"
         elif cast_failures:
             fail_reason = f"cast_failed:{','.join(cast_failures)}"
+        elif margin_gated:
+            fail_reason = f"low_joint_margin:{float(delta):.4f}<{self.min_joint_margin:.4f}"
         else:
             fail_reason = None
 
@@ -930,6 +976,10 @@ class LeanResolver:
             "n_decode_refusals": len(decode_refusals),
             "min_confidence": self.min_confidence,
             "min_posterior": self.min_posterior,
+            # Surfaced so an eval can recompute the margin sweep from stored
+            # predictions without re-running inference.
+            "min_joint_margin": self.min_joint_margin,
+            "margin_gated": bool(margin_gated),
         }
 
         return _with_calls(LeanResolveResult(
@@ -937,7 +987,11 @@ class LeanResolver:
             tool_name=schema.name,
             payload=payload if valid else None,
             parameters=parameters,
-            joint_margin=float(delta) if valid else 0.0,
+            # The RAW margin is reported even when it gated the row: an eval that
+            # reads a zeroed margin cannot tell "the heads were flat" from "the
+            # gate suppressed a confident call", and could not recompute the
+            # sweep at a different threshold.
+            joint_margin=float(delta),
             accept_score=overall_conf,
             abstain_reason=fail_reason,
             status=status,

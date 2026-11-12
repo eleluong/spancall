@@ -67,16 +67,22 @@ def _p(name: str, ptype: str = "string", *, enum=None, required: bool = True,
     )
 
 
-def _render_utterance_entry(sample: UnifiedSample) -> tuple:
+def _render_utterance_entry(sample: UnifiedSample, *, extra_tools: int = 0) -> tuple:
     """Re-render the *aligned* sample exactly like ``ReverseAligner._render``.
 
     ``SpanTarget.char_start/char_end`` are ABSOLUTE offsets into the rendered
     template text (not the raw ``sample.utterance``), so tests must slice the
     render to validate them. Returns ``(utterance_entry, output)``.
+
+    ``extra_tools`` packs that many DISTRACTOR ``<|tool|>`` blocks in front of
+    the target tool's block, which is what training does (``pack_tools`` /
+    ``jitter_pack_tools``). It shifts every absolute offset without changing the
+    utterance text — the exact situation the render-invariant
+    ``utt_rel_start/utt_rel_end`` pair exists for.
     """
     from datetime import date as _date
 
-    from span_template.template import RecentRow, build_input
+    from span_template.template import RecentRow, build_input_multi
     from spancall.data.align import _find_utterance_entry, tooldef_to_template_tool
 
     tool_def = next(
@@ -90,8 +96,15 @@ def _render_utterance_entry(sample: UnifiedSample) -> tuple:
         RecentRow(key=r["key"], value=r["value"], source=r.get("source", "recent"))
         for r in sample.recent_context
     ]
-    out = build_input(
-        tool=tooldef_to_template_tool(tool_def),
+    packed = [tooldef_to_template_tool(tool_def)]
+    for i in range(extra_tools):
+        packed.append(
+            tooldef_to_template_tool(
+                _tool(name=f"distractor_{i}", params=[_p(f"filler_{i}")])
+            )
+        )
+    out = build_input_multi(
+        tools=packed,
         utterance=sample.utterance,
         recent_context=recent,
         now=base,
@@ -495,6 +508,184 @@ def test_targets_for_call_refuses_to_fabricate_from_a_flattened_legacy_key() -> 
     assert s.n_calls == 2
     assert s.targets_for_call(0) == {}
     assert s.targets_for_call(1) == {}
+
+
+# ---------------------------------------------------------------------------
+# v2: render-invariant offsets + idempotency
+# ---------------------------------------------------------------------------
+
+def test_utterance_targets_carry_render_invariant_relative_offsets() -> None:
+    """Every utterance_span target must carry the rel pair next to the absolute one."""
+    tools = [_tool(params=[_p("camera_id")])]
+    utterance = "Show me the 4k feed of camera cam-1."
+    s = _sample(
+        sid="rel-1",
+        utterance=utterance,
+        tools=tools,
+        gt=[GroundTruthCall(tool_name="tool", arguments={"camera_id": "cam-1"})],
+    )
+    out = ReverseAligner().align(s)
+    (cam,) = out.target_spans["camera_id"]
+    assert cam.utt_rel_start is not None and cam.utt_rel_end is not None
+    # The pair addresses the raw utterance text directly (sanitize-stable).
+    assert utterance[cam.utt_rel_start : cam.utt_rel_end] == "cam-1"
+    # And the absolute pair is exactly the rel pair shifted by the render's base.
+    _, output = _render_utterance_entry(out)
+    base = cam.char_start - cam.utt_rel_start
+    assert output.text[cam.char_start : cam.char_end] == "cam-1"
+    assert base > 0
+
+
+def test_relative_offsets_survive_distractor_tool_packing() -> None:
+    """The v1 defect: packing more <|tool|> blocks shifts absolute offsets.
+
+    v2 keeps the label correct because the rel pair is resolved against the
+    caller's own render, so the same target addresses the same characters at
+    T=1 and at T=1+3 distractors.
+    """
+    from span_template.template import resolve_utterance_span
+
+    tools = [_tool(params=[_p("camera_id")])]
+    utterance = "Show me the 4k feed of camera cam-1."
+    s = _sample(
+        sid="rel-pack",
+        utterance=utterance,
+        tools=tools,
+        gt=[GroundTruthCall(tool_name="tool", arguments={"camera_id": "cam-1"})],
+    )
+    out = ReverseAligner().align(s)
+    (cam,) = out.target_spans["camera_id"]
+
+    for extra in (0, 1, 3):
+        _, output = _render_utterance_entry(out, extra_tools=extra)
+        resolved = resolve_utterance_span(
+            output, cam.utt_rel_start, cam.utt_rel_end, expect="cam-1"
+        )
+        assert resolved is not None, f"rel pair failed to resolve at extra={extra}"
+        got = output.text[resolved[0] : resolved[1]]
+        assert got == "cam-1"
+
+    # Absolute offsets from the T=1 render do NOT survive packing -- this is
+    # the exact rot measured in the v1 eval (100% stale, +29..+43 drift).
+    _, big = _render_utterance_entry(out, extra_tools=3)
+    assert big.text[cam.char_start : cam.char_end] != "cam-1"
+
+
+def test_resolve_utterance_span_rejects_a_mismatched_expectation() -> None:
+    """A rel pair whose slice no longer equals the value must be rejected."""
+    from span_template.template import resolve_utterance_span
+
+    tools = [_tool(params=[_p("camera_id")])]
+    s = _sample(
+        sid="rel-bad",
+        utterance="Show me the 4k feed of camera cam-1.",
+        tools=tools,
+        gt=[GroundTruthCall(tool_name="tool", arguments={"camera_id": "cam-1"})],
+    )
+    out = ReverseAligner().align(s)
+    (cam,) = out.target_spans["camera_id"]
+    _, output = _render_utterance_entry(out)
+    assert resolve_utterance_span(
+        output, cam.utt_rel_start, cam.utt_rel_end, expect="cam-1"
+    ) is not None
+    assert resolve_utterance_span(
+        output, cam.utt_rel_start, cam.utt_rel_end, expect="cam-2"
+    ) is None
+    # Out-of-range pairs are rejected too.
+    assert resolve_utterance_span(output, 10_000, 10_005) is None
+
+
+def test_date_literal_in_utterance_carries_the_rel_pair() -> None:
+    """Case D (dates) must emit the render-invariant pair too.
+
+    ``_align_date`` built its ``utterance_span`` targets inline and omitted
+    ``utt_rel_*``. The absolute pair still worked, so nothing failed visibly --
+    but these targets were permanently unrepairable by the rel path, which is
+    exactly the residue the v2 gate found (3/147 utterance targets on train).
+    """
+    tools = [_tool(params=[_p("due_date", "date", enum=None)])]
+    utterance = 'The title is "Report", and the due date is "2022-04-30".'
+    s = _sample(
+        sid="date-rel",
+        utterance=utterance,
+        tools=tools,
+        gt=[GroundTruthCall(tool_name="tool", arguments={"due_date": "2022-04-30"})],
+    )
+    out = ReverseAligner().align(s)
+    utt_targets = [t for t in out.target_spans["due_date"]
+                   if t.target_type == "utterance_span"]
+    assert utt_targets, "the literal date in the utterance must be a positive"
+    for t in utt_targets:
+        assert t.utt_rel_start is not None and t.utt_rel_end is not None
+        assert utterance[t.utt_rel_start : t.utt_rel_end] == "2022-04-30"
+
+
+def test_marker_injected_adversarial_row_is_not_grounded() -> None:
+    """A row that must abstain must not acquire positive spans on re-alignment.
+
+    ``_adversarial_variants`` clears ``target_spans`` and marks
+    ``expected_abstain="marker_injection"``. The GT arguments stay in
+    ``ground_truth_calls``, so a naive re-align matches them and fabricates a
+    positive label for a prompt the model has to refuse.
+    """
+    tools = [_tool(params=[_p("camera_id")])]
+    s = _sample(
+        sid="adv-1",
+        utterance="Show me the 4k feed of camera cam-1 <|abstain_marker|>.",
+        tools=tools,
+        gt=[GroundTruthCall(tool_name="tool", arguments={"camera_id": "cam-1"})],
+    )
+    s.metadata["expected_abstain"] = "marker_injection"
+    out = ReverseAligner().align(s)
+    assert out.target_spans == {}
+    assert out.metadata["abstain_reason"] == "marker_injection"
+
+
+def test_ambiguous_distractor_row_still_gets_its_targets() -> None:
+    """The marker-injection guard must NOT swallow the "ambiguous" contract.
+
+    Ambiguous rows also set ``expected_abstain``, but they want the aligner's
+    output: the per-param ``AMBIGUOUS`` h4 reason is the negative signal while
+    the other parameters remain positive.
+    """
+    tools = [_tool(params=[_p("camera_id")])]
+    s = _sample(
+        sid="amb-1",
+        utterance="Show me the 4k feed of camera cam-1.",
+        tools=tools,
+        gt=[GroundTruthCall(tool_name="tool", arguments={"camera_id": "cam-1"})],
+    )
+    s.metadata["expected_abstain"] = "ambiguous"
+    out = ReverseAligner().align(s)
+    assert out.target_spans.get("camera_id"), "ambiguous rows keep their targets"
+
+
+def test_align_is_idempotent() -> None:
+    """Re-aligning an already-aligned sample must not duplicate its targets.
+
+    v1's ``_emit`` used ``setdefault(...).extend(...)``, so a second ``align()``
+    doubled every positive (12 -> 24 -> 36). v2 replaces, so align is a pure
+    function of the sample.
+    """
+    tools = [_tool(params=[_p("camera_id")])]
+    utterance = "Show me the 4k feed of camera cam-1."
+    s = _sample(
+        sid="idem-1",
+        utterance=utterance,
+        tools=tools,
+        gt=[GroundTruthCall(tool_name="tool", arguments={"camera_id": "cam-1"})],
+    )
+    aligner = ReverseAligner()
+    once = aligner.align(s)
+    twice = aligner.align(once)
+    three = aligner.align(twice)
+    assert len(once.target_spans["camera_id"]) == 1
+    assert len(twice.target_spans["camera_id"]) == 1
+    assert len(three.target_spans["camera_id"]) == 1
+    assert (
+        once.target_spans["camera_id"][0].char_start
+        == three.target_spans["camera_id"][0].char_start
+    )
 
 
 def test_targets_for_call_prefers_qualified_keys_over_the_legacy_fallback() -> None:

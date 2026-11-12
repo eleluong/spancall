@@ -38,7 +38,7 @@ from span_template.template import (
     RecentRow,
     SpanTemplateOutput,
     Tool,
-    build_input,
+    build_input_multi,
 )
 
 from spancall.data.base import BaseAligner
@@ -390,11 +390,46 @@ class ReverseAligner(BaseAligner):
 
     # ------------------------------------------------------------------ main
     def align(self, sample: UnifiedSample) -> UnifiedSample:
-        """Ground every GT argument into ``sample.target_spans`` + stratum/H4 tags."""
+        """Ground every GT argument into ``sample.target_spans`` + stratum/H4 tags.
+
+        PURE FUNCTION OF THE SAMPLE: existing ``target_spans`` are discarded and
+        rebuilt from the utterance + schemas, so ``align(align(x)) == align(x)``
+        and re-aligning an already-aligned file is a no-op rather than a merge.
+        Merging was the v1 behaviour (``setdefault(...).extend(...)``) and it
+        both duplicated positives on every pass and made a stale label
+        impossible to overwrite — which is exactly what the v2 re-alignment has
+        to do.
+        """
         sample = _copy_sample(sample)
+
+        # ABSTAIN CONTRACT (marker injection only).
+        #
+        # ``DataAugmenter._adversarial_variants`` injects a reserved marker into
+        # the utterance or a context row and then deliberately CLEARS
+        # ``target_spans`` while setting ``expected_abstain = "marker_injection"``.
+        # Such a row is negative training data: the correct behaviour is to
+        # abstain, so there is nothing to ground. Re-aligning it would happily
+        # match the UNTOUCHED GT arguments still sitting in
+        # ``ground_truth_calls`` and hand the model a positive supervised span for
+        # a prompt it must refuse -- measured: 25,189 fabricated labels across the
+        # adversarial split.
+        #
+        # Deliberately NOT keyed on ``expected_abstain`` alone: the distractor
+        # "ambiguous" variant ALSO sets ``expected_abstain`` but it WANTS the
+        # aligner's output (its ``h4_reasons[*] == "AMBIGUOUS"`` is the per-param
+        # negative signal, while the other params stay positive). Only the
+        # marker-injection contract forbids grounding.
+        expected_abstain = sample.metadata.get("expected_abstain")
+        if expected_abstain == "marker_injection":
+            sample.target_spans = {}
+            sample.metadata["abstain_reason"] = "marker_injection"
+            return sample
+
+        sample.target_spans = {}
         sample.stratum = Stratum.A
         sample.metadata.setdefault("h4_reasons", {})
         sample.metadata.setdefault("list_sizes", {})
+        sample.metadata.pop("abstain_reason", None)
 
         if not sample.ground_truth_calls:
             sample.metadata["abstain_reason"] = "no_gt_call"
@@ -547,12 +582,27 @@ class ReverseAligner(BaseAligner):
         tool_def: ToolDefinition,
         base: date,
     ) -> SpanTemplateOutput:
-        """Render the single-tool template for the target tool + recent context."""
+        """Render with the SAME grammar training and serving use.
+
+        v1 rendered ``build_input`` — the single-tool ``template.jinja``, which
+        deliberately omits the ``<|none|>`` anchor line. Every consumer
+        (``tensorize.tensorize_sample_lean``, ``LeanResolver``) renders
+        ``template_multi.jinja`` via ``build_input_multi``, which EMITS that
+        line. So every addressed target was shifted by the anchor's length
+        (9 chars) plus any template-revision drift — the measured +29..+43
+        offset rot (docs/lean_eval_diagnosis_walkthrough.md §3).
+
+        v2 renders the multi grammar for the target tool. That removes the
+        structural ``<|none|>`` bias and keeps this legend byte-comparable
+        with the resolver's, while the utterance-relative offsets written by
+        ``_align_value`` remain valid even when training packs extra
+        distractor tools around this block.
+        """
         tool = tooldef_to_template_tool(tool_def)
         recent = [RecentRow(key=r["key"], value=r["value"], source=r.get("source", "recent"))
                   for r in sample.recent_context]
-        return build_input(
-            tool=tool,
+        return build_input_multi(
+            tools=[tool],
             utterance=sample.utterance,
             recent_context=recent,
             now=base,
@@ -635,17 +685,11 @@ class ReverseAligner(BaseAligner):
             else:
                 occ = _word_bounded_matches(utt.value if isinstance(utt.value, str) else "", s_val)
             if occ:
-                targets = [
-                    SpanTarget(
-                        param_name=p.name,
-                        target_type="utterance_span",
-                        char_start=utt.char_start + rel_start,
-                        char_end=utt.char_start + rel_end,
-                        canonical_value=val,
-                    )
-                    for rel_start, rel_end in occ
-                ]
-                return targets, True, None
+                return (
+                    [self._utterance_target(p, utt, rs, re_, val) for rs, re_ in occ],
+                    True,
+                    None,
+                )
 
         # scalar params may also come from enum-less <|ctx_enum|>? No — Case C above.
         return self._fail(p, "OFF_WINDOW")
@@ -681,13 +725,7 @@ class ReverseAligner(BaseAligner):
             occ = _word_bounded_matches(utt.value, iso)
             for rel_start, rel_end in occ:
                 targets.append(
-                    SpanTarget(
-                        param_name=p.name,
-                        target_type="utterance_span",
-                        char_start=utt.char_start + rel_start,
-                        char_end=utt.char_start + rel_end,
-                        canonical_value=iso,
-                    )
+                    self._utterance_target(p, utt, rel_start, rel_end, iso)
                 )
         if targets:
             return targets, True, None
@@ -738,6 +776,40 @@ class ReverseAligner(BaseAligner):
         return out
 
     # -------------------------------------------------------------- helpers
+    def _utterance_target(
+        self,
+        p: ParameterSchema,
+        utt: Any,
+        rel_start: int,
+        rel_end: int,
+        canonical_value: Any,
+    ) -> SpanTarget:
+        """One utterance-span target carrying BOTH addressings.
+
+        ``char_start``/``char_end`` are absolute in THIS render (in v2 the
+        aligner packs the same tool set training/eval use, but a stored absolute
+        pair is still only valid for the one render that produced it).
+        ``utt_rel_*`` is the render-invariant form: the utterance entry's own
+        text is sanitize-stable, so a consumer that re-renders with a different
+        tool count can recover the span through
+        :func:`span_template.template.resolve_utterance_span`.
+
+        Every ``utterance_span`` target MUST go through this helper. It was
+        factored out after the date path (``_align_date``) built its targets
+        inline and silently omitted the rel pair, which left a residual 2% of
+        utterance labels permanently unrepaired -- invisible while only the
+        absolute pair was audited.
+        """
+        return SpanTarget(
+            param_name=p.name,
+            target_type="utterance_span",
+            char_start=utt.char_start + rel_start,
+            char_end=utt.char_start + rel_end,
+            canonical_value=canonical_value,
+            utt_rel_start=rel_start,
+            utt_rel_end=rel_end,
+        )
+
     def _target(
         self,
         p: ParameterSchema,
@@ -785,9 +857,17 @@ class ReverseAligner(BaseAligner):
         Multi-call samples key by ``f"{call_index}::{pname}"``; single-call
         samples keep the bare ``pname`` so every existing reader is untouched
         (R0.4, ``UnifiedSample.targets_for_call``).
+
+        IDEMPOTENT: the assignment REPLACES any targets already under this key.
+        The previous ``setdefault(key, []).extend(targets)`` made ``align()``
+        non-idempotent — re-aligning an already-aligned sample silently
+        duplicated every positive (12 -> 24 -> 36), which contaminated the v1
+        "the aligner reproduces the stored offsets" investigation and would
+        corrupt any re-alignment repair. Re-alignment is a normal v2 operation,
+        so it must be a pure function of the sample.
         """
         key = _reason_key(call_index, pname, multi_call)
-        sample.target_spans.setdefault(key, []).extend(targets)
+        sample.target_spans[key] = list(targets)
 
     def _fuzzy_occ(self, utt: Any, s_val: str) -> List[Tuple[int, int]]:
         """Case-insensitive fallback used when ``fuzzy_matching=True``."""

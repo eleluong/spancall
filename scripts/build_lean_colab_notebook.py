@@ -2182,6 +2182,76 @@ else:
             print(f"  gt  : {json.dumps(p.get('gt_args'), default=str)}")
             print(f"  pred: {json.dumps(p.get('payload_partial'), default=str)}")'''
 
+MARKDOWN_DIAGNOSTICS = """---
+## 5d. Why the Number Is Low — Validation Diagnostics
+
+The headline above is a *measurement*. Before treating it as a statement about model
+quality, this cell checks whether the measurement itself is sound. It runs
+[`spancall/lean/diagnostics.py`](../spancall/lean/diagnostics.py) and answers three
+questions the aggregates cannot:
+
+1. **Are the stored GT char offsets still valid?** Every `utterance_span` target carries a
+   `(char_start, char_end)` pair that is only meaningful against the render it was built
+   from. If the render changes afterwards, the pointer head is supervised — and
+   `candidate_parity` is measured — against the wrong characters. This audit re-renders
+   each sample with the grammar the **resolver** uses and reports what fraction of stored
+   spans still slice their own `canonical_value`, plus the per-sample drift in characters.
+2. **Where do predicted spans land?** `in_utterance` vs `before_utterance` (schema/anchor
+   block) vs `after_utterance` (recent rows). A pointer that collapses onto anchors is a
+   different defect from one that picks the wrong word.
+3. **Is precision uniform across `source_type`, target type, and confidence?** Precision is
+   restricted to *extractable* GT params so deterministic `null`/`bool`/`enum` slots are
+   never averaged into free-span `utterance` retrieval.
+
+Read the offset audit before the attribution: a stale-offset rate near 1.0 means the
+precision/recall numbers describe the labels, not the model."""
+
+CODE_DIAGNOSTICS = '''import glob, os
+from spancall.lean.diagnostics import run_diagnostics
+
+def _find_preds():
+    """Locate a preds_eval.jsonl, preferring THIS session's run.
+
+    RESULTS_DIR is where the notebook writes. A run archived under
+    results/lean/<date>/ from an earlier session is still a legitimate target
+    for diagnosis, so fall back to the newest one rather than silently
+    reporting "no predictions". The chosen path is printed either way — a
+    diagnostic that hides which artefact it read is not a diagnostic.
+    """
+    direct = os.path.join(RESULTS_DIR, "preds_eval.jsonl")
+    if os.path.exists(direct):
+        return direct, "this session"
+    archived = sorted(
+        glob.glob(os.path.join(LEGACY_RESULTS_DIR, "**", "preds_eval.jsonl"), recursive=True),
+        key=os.path.getmtime,
+    )
+    if archived:
+        return archived[-1], "archived run (RESULTS_DIR has none)"
+    return None, "none found"
+
+PREDS_PATH, PREDS_ORIGIN = _find_preds()
+print(f"preds source: {PREDS_PATH or '(none)'}  [{PREDS_ORIGIN}]")
+
+# The offset audit needs no model and no checkpoint — it only re-renders the
+# split. It therefore still produces a usable answer when the predict cell was
+# skipped, which is exactly when the reader most needs to know the labels are
+# stale. The prediction decomposition is skipped in that case.
+_diag = run_diagnostics(
+    EVAL_SPLIT,
+    DATA_DIR,
+    preds_path=PREDS_PATH,
+    limit=EVAL_LIMIT,
+    max_examples=5,
+)
+
+if "offsets" in _diag:
+    _stale = _diag["offsets"].get("span_stale_rate")
+    if isinstance(_stale, float) and _stale > 0.5:
+        print(f"\\n>>> HEADLINE INVALIDATION: {_stale:.1%} of stored utterance_span offsets "
+              f"address text other than their own canonical_value.")
+        print(">>> Re-run data preparation / re-alignment before attributing the "
+              "extraction precision to the model.")'''
+
 MARKDOWN_EVAL_INTRO = """---
 ## 6. General Function Calling Evaluation (Eval Part 3)
 
@@ -2544,6 +2614,8 @@ cells = [
     new_code_cell(CODE_PREDICT_SPLIT),
     new_markdown_cell(MARKDOWN_SAMPLES_INTRO),
     new_code_cell(CODE_SAMPLES_FORENSICS),
+    new_markdown_cell(MARKDOWN_DIAGNOSTICS),
+    new_code_cell(CODE_DIAGNOSTICS),
     new_markdown_cell(MARKDOWN_EVAL_INTRO),
     new_code_cell(CODE_EVAL_B1A),
     new_code_cell(CODE_EVAL_MODEL),
