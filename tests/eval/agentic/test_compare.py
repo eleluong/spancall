@@ -28,18 +28,26 @@ from spancall.eval.agentic.evaluator import MultiSeedAgentEvaluator
 from spancall.eval.agentic.metrics import AgentMetrics, aggregate_metrics
 from spancall.eval.compare import ComparativeEvaluator, ComparativeStudyResult
 from spancall.eval.cost import CostModel
-from spancall.infer.resolver import ResolveResult, SpanCallResolver
+from spancall.infer.base import BaseResolver, ResolveResult
 
 
 # --------------------------------------------------------------------------- #
 # Fixtures: traced runs over the mock booking environment
 # --------------------------------------------------------------------------- #
-class _StaticResolver(SpanCallResolver):
+class _StaticResolver(BaseResolver):
     """Resolver whose fast path always hits ``book_flight``."""
 
     def __init__(self, hits: bool = True) -> None:
         self._hits = hits
-        super().__init__()
+
+    def try_resolve(
+        self,
+        schema: ToolDefinition,
+        utterance: str,
+        recent_context: Dict[str, Any] | None = None,
+        now: Any = None,
+    ) -> ResolveResult:
+        return self.try_resolve_candidates([schema], utterance, recent_context=recent_context, now=now)
 
     def try_resolve_candidates(
         self,

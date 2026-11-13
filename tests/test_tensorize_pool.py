@@ -1,6 +1,6 @@
 """Tests for the tensorize pool in the generated Lean notebook.
 
-The tensorize cell is *string data* inside ``scripts/build_lean_colab_notebook.py``
+The tensorize cell is *string data* inside ``scripts/build_lean_v2_colab_notebook.py``
 and only becomes code once the notebook runs, so nothing in the normal test
 suite exercised its scheduling logic. That logic is where the interesting
 failure modes live:
@@ -32,7 +32,7 @@ import pytest
 NOTEBOOK = (
     Path(__file__).resolve().parents[1]
     / "notebooks"
-    / "spancall_lean_train_eval_test.ipynb"
+    / "spancall_lean_v2_train_eval.ipynb"
 )
 
 # Markers that bracket the pool machinery inside the tensorize cell.
@@ -386,7 +386,7 @@ def test_truncation_and_jitter_are_counted_not_swallowed() -> None:
     assert "[!]" in src and "DROPPED from the prompt" in src
 
 
-BUILDER = Path(__file__).resolve().parents[1] / "scripts" / "build_lean_colab_notebook.py"
+BUILDER = Path(__file__).resolve().parents[1] / "scripts" / "build_lean_v2_colab_notebook.py"
 
 
 def test_part3_forensics_surfaces_render_T_from_persisted_features() -> None:

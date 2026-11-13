@@ -1,6 +1,6 @@
-"""Tests for Q4 provenance mapping + Q5 strict casts and Q3/exclusivity decode.
+"""Tests for Q4 provenance mapping + Q5 strict casts + Q6 schema validation.
 
-Covers (docs/pipeline_io.md Q3/Q4/Q5/Q6, full_implementation_plan §4.1):
+Covers (docs/pipeline_io.md Q4/Q5/Q6):
 
 * ``StrictTypeCaster.extract_original`` — norm2orig mapping, word-boundary
   snapping (<=1 char partial expands, else ``bad_boundary``), boundary trim,
@@ -9,10 +9,6 @@ Covers (docs/pipeline_io.md Q3/Q4/Q5/Q6, full_implementation_plan §4.1):
   array/object casts over raw utterance text; ``cast_canonical`` over legend
   values; ``cast_choice`` combining Q4+Q5.
 * ``SchemaValidator`` Q6 — default materialization, required/type/enum checks.
-* ``ExclusivityJointDecoder`` — R4 equal-value mass aggregation, top-K
-  collapse, swap-margin (delta_joint) edges, strict-nesting vs partial
-  overlap, free-string overlap policy, ``overlap_allowed`` ablation, and the
-  ``max_nodes`` safety cap.
 """
 
 from __future__ import annotations
@@ -27,7 +23,6 @@ import pytest
 
 from spancall.data.schema import ParameterSchema, ToolDefinition
 from spancall.infer.cast import SchemaValidator, StrictTypeCaster
-from spancall.infer.decode import ExclusivityJointDecoder, ValueChoice, _Cand
 
 
 # --------------------------------------------------------------------------- #
@@ -357,165 +352,3 @@ def test_q6_bool_not_int() -> None:
     ok, _ = SchemaValidator().validate({"a": True}, tool)
     assert not ok  # bool is not a valid JSON integer
 
-
-# --------------------------------------------------------------------------- #
-# Q3 — ExclusivityJointDecoder
-# --------------------------------------------------------------------------- #
-
-
-@dataclass
-class Cand:
-    """Duck-typed model candidate for decoder (canon_value + char span)."""
-    canon_value: Any
-    char_start: int = -1
-    char_end: int = -1
-    region: str = "utterance"
-    entry_index: int = 0
-
-
-def _decoder(**kw) -> ExclusivityJointDecoder:
-    kw.setdefault("normalize_scores", False)
-    return ExclusivityJointDecoder(**kw)
-
-
-def test_r4_equal_value_mass_aggregation() -> None:
-    dec = _decoder()
-    best, delta, chosen, n = dec.decode_detailed(
-        {"city": [
-            (Cand("SF", 0, 2), 3.0),
-            (Cand("SF", 4, 6), 1.0),   # same canonical value -> mass merges
-            (Cand("NY", 10, 12), 2.0),
-            (Cand("LA", 14, 16), 1.0),
-        ]},
-        entity_classes={"city": "city"},
-    )
-    assert best == {"city": "SF"}
-    assert chosen["city"].prob == pytest.approx(4.0 / 7.0)
-    # span comes from the highest-scoring candidate in the group
-    assert chosen["city"].span == (0, 2)
-    # best vs runner-up: ln(4/7) - ln(2/7) = ln 2
-    assert delta == pytest.approx(math.log(2.0), abs=1e-9)
-    # single param -> n_valid equals the number of top-K choices explored (3)
-    assert n == 3
-
-
-def test_r4_numeric_merge_across_int_float() -> None:
-    dec = _decoder()
-    _, _, chosen, _ = dec.decode_detailed(
-        {"n": [(Cand(5, 0, 2), 2.0), (Cand(5.0, 4, 6), 1.0), (Cand(3, 10, 12), 1.0)]},
-        top_k=3,
-    )
-    assert chosen["n"].value == 5  # first-seen canonical kept
-    assert chosen["n"].prob == pytest.approx(3.0 / 4.0)
-
-
-def test_top_k_collapse_keeps_k_distinct_values() -> None:
-    dec = _decoder()
-    _, _, chosen, _ = dec.decode_detailed(
-        {"v": [(Cand(f"v{i}", i * 4, i * 4 + 2), float(10 - i)) for i in range(5)]},
-        top_k=2,
-    )
-    assert len(chosen) == 1
-    assert chosen["v"].value == "v0"
-    per_param = dec._collapse([
-        _Cand(value=f"v{i}", score=float(10 - i), char_start=i * 4, char_end=i * 4 + 2,
-              region="utterance", entry_index=i)
-        for i in range(5)
-    ], 2)
-    assert len(per_param) == 2
-    assert per_param[0].value == "v0" and per_param[1].value == "v1"
-
-
-def test_exclusivity_forbids_overlapping_same_entity() -> None:
-    dec = _decoder()
-    best, delta, chosen, n = dec.decode_detailed(
-        {
-            "from": [(Cand("SF", 0, 2), 3.0), (Cand("NY", 10, 12), 2.0), (Cand("LA", 5, 7), 1.0)],
-            "to": [(Cand("NY", 10, 12), 3.0), (Cand("SF", 0, 2), 2.0), (Cand("LA", 5, 7), 1.5)],
-        },
-        entity_classes={"from": "city", "to": "city"},
-    )
-    assert best == {"from": "SF", "to": "NY"}
-    assert chosen["from"].value == "SF" and chosen["to"].value == "NY"
-    assert n == 6  # 3x3 minus the three same-span conflicts
-    # delta_joint = S(best) - S(runner-up): ln(0.5) + ln(3/6.5) vs ln(0.5) + ln(1.5/6.5)
-    # -> ln(2.0)
-    assert delta == pytest.approx(math.log(2.0), abs=1e-6)
-
-
-def test_swap_margin_tie_yields_zero_delta() -> None:
-    dec = _decoder()
-    cands = {
-        "a": [(Cand("A", 0, 2), 1.0), (Cand("B", 4, 6), 0.5)],
-        "b": [(Cand("B", 4, 6), 0.5), (Cand("A", 0, 2), 1.0)],
-    }
-    # (a=A, b=B) and (a=B, b=A) both score ln(2/3) + ln(1/3) -> genuine tie.
-    _, delta, _, _ = dec.decode_detailed(cands, entity_classes={"a": "e", "b": "e"})
-    assert delta == 0.0
-
-
-def test_no_valid_assignment_returns_empty() -> None:
-    dec = _decoder()
-    # only one candidate per param, same span, same entity -> all combos conflict.
-    cands = {
-        "a": [(Cand("X", 0, 2), 1.0)],
-        "b": [(Cand("Y", 0, 2), 1.0)],
-    }
-    best, delta, chosen, n = dec.decode_detailed(cands, entity_classes={"a": "e", "b": "e"})
-    assert best == {} and delta == 0.0 and chosen == {} and n == 0
-    assert dec.decode(cands, entity_classes={"a": "e", "b": "e"}) == ({}, 0.0)
-
-
-def test_strictly_nested_may_be_allowed_but_partial_overlap_never() -> None:
-    v1 = ValueChoice("x", 0.5, span=(0, 10), region="utterance", entity="E")
-    v2 = ValueChoice("y", 0.5, span=(2, 5), region="utterance", entity="E")
-    v3 = ValueChoice("z", 0.5, span=(4, 12), region="utterance", entity="E")
-    assert _decoder(allow_nested=True)._conflict(v1, v2) is False   # strictly nested
-    assert _decoder(allow_nested=False)._conflict(v1, v2) is True
-    assert _decoder(allow_nested=True)._conflict(v1, v3) is True    # partial overlap
-    assert _decoder(allow_nested=True)._conflict(v2, v3) is True    # partial overlap
-
-
-def test_distinct_entity_classes_may_share_text() -> None:
-    a = ValueChoice("x", 0.5, span=(0, 10), region="utterance", entity="city")
-    b = ValueChoice("y", 0.5, span=(2, 7), region="utterance", entity="person")
-    assert _decoder()._conflict(a, b) is False
-
-
-def test_free_string_overlap_policy() -> None:
-    a = ValueChoice("x", 0.5, span=(0, 5), region="utterance", entity=None)
-    b = ValueChoice("y", 0.5, span=(2, 7), region="utterance", entity=None)
-    assert _decoder(free_string_overlap_allowed=False)._conflict(a, b) is True
-    assert _decoder(free_string_overlap_allowed=True)._conflict(a, b) is False
-
-
-def test_overlap_allowed_master_switch_ablation() -> None:
-    dec = _decoder(overlap_allowed=True)
-    best, _, _, n = dec.decode_detailed(
-        {"a": [(Cand("X", 0, 2), 1.0)], "b": [(Cand("Y", 0, 2), 1.0)]},
-        entity_classes={"a": "e", "b": "e"},
-    )
-    assert best == {"a": "X", "b": "Y"} and n == 1
-
-
-def test_non_utterance_regions_never_conflict() -> None:
-    dec = _decoder()
-    a = ValueChoice("x", 0.5, span=None, region="recent", entity="e")
-    b = ValueChoice("y", 0.5, span=None, region="recent", entity="e")
-    assert dec._conflict(a, b) is False
-
-
-def test_max_nodes_safety_cap_raises() -> None:
-    dec = _decoder(max_nodes=3)
-    cands = {
-        "a": [(Cand(f"a{i}", i * 4, i * 4 + 2), 1.0) for i in range(2)],
-        "b": [(Cand(f"b{i}", i * 4, i * 4 + 2), 1.0) for i in range(2)],
-    }
-    with pytest.raises(ValueError):
-        dec.decode(cands)
-
-
-def test_invalid_entry_type_raises_typeerror() -> None:
-    dec = _decoder()
-    with pytest.raises(TypeError):
-        dec.decode({"a": ["not", "a", "pair"]})

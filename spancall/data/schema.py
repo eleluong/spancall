@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Mapping, Optional, Set, Tuple, Type
+from typing import Any, Dict, List, Mapping, Optional, Type
 
 
 class Stratum(str, Enum):
@@ -42,9 +42,8 @@ class SpanTarget:
     produced. That render is only one of several legal renders of the same
     sample (single-tool vs packed multi-tool, template revisions, distractor
     packing), so absolute offsets go stale whenever the grammar or the packed
-    tool set changes — the defect measured in
-    ``docs/lean_eval_diagnosis_walkthrough.md`` (100% stale ``utterance_span``
-    offsets, drift +29..+43).
+    tool set changes — the defect the v2 re-alignment
+    fixed (100% stale ``utterance_span`` offsets, drift +29..+43).
 
     ``utt_rel_start``/``utt_rel_end`` are the RENDER-INVARIANT form: offsets
     relative to the start of the utterance entry. The utterance text itself is

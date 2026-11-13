@@ -72,7 +72,7 @@ The packed input holds up to `T=4` tools ([heads.md](heads.md) §2).
 
 All builders are pure functions of `(request, clock, session)` and are memoized per request.
 
-**Time window (R4).** Implemented in [`build_time_window`](../span_template/template.py): `today`, `+kd` offsets (k ∈ {1,2,3,7} by default), weekday entries with exact `this_<dow>` (0–6 days ahead; on its own weekday ⇒ today) vs `next_<dow>` (strictly future) semantics, and a **closed idiom map** (D1, remediation_plan.md): `tomorrow` (= `+1d`), `day_after_tomorrow` (= `+2d`), `tonight` (= today; date params only). Off-window phrases ("the 15th", "in 3 months", "Q1 2027") are **not targetable** ⇒ the param abstains to the LLM. Literal dates in the utterance (`2026-10-24`) still work through the strict caster (Q5). User-timezone anchoring: the caller resolves the user-local date and passes `now` (deterministic; per-session override allowed — D3).
+**Time window (R4).** Implemented in [`build_time_window`](../span_template/template.py): `today`, `+kd` offsets (k ∈ {1,2,3,7} by default), weekday entries with exact `this_<dow>` (0–6 days ahead; on its own weekday ⇒ today) vs `next_<dow>` (strictly future) semantics, and a **closed idiom map** (D1): `tomorrow` (= `+1d`), `day_after_tomorrow` (= `+2d`), `tonight` (= today; date params only). Off-window phrases ("the 15th", "in 3 months", "Q1 2027") are **not targetable** ⇒ the param abstains to the LLM. Literal dates in the utterance (`2026-10-24`) still work through the strict caster (Q5). User-timezone anchoring: the caller resolves the user-local date and passes `now` (deterministic; per-session override allowed — D3).
 
 **Enum pool (R5).** `sorted(unique(∪ enums over packed tools))`. Multi-word enum values (internal whitespace) are emitted quoted (D2) so they remain atomic entries that never fragment the pool; ` | ` inside a value is rejected at ingestion. Per-param allowed sets are kept separately in P4 (R9).
 
@@ -208,22 +208,21 @@ Input: the heads' raw outputs for one request + `meta`. Output: either `Hit(call
 
 ## Q0. Calibrated Probabilities
 
-Apply per-head **temperature scaling** (fit on the calibration split) to logits before softmax. All thresholds below refer to calibrated probabilities. Re-fit after any quantization or encoder change.
+Temperatures (optional post-hoc scaling, defaulting to `1.0` in [`LeanResolver`](../spancall/lean/resolver.py)) are applied to logits before softmax/sigmoid. All thresholds below refer to the resulting probabilities. Re-fit after any quantization or encoder change.
 
-## Q1. Tool and Call Count (H1, H2)
+## Q1. Tool Selection (`BinaryToolHead`)
 
-1. `n = argmax(H2)`. `n = 0` → abstain `no_call`; `n > J` → abstain `too_many_calls`. **(v1 scope:** `J=1`; any `n ≥ 2` outright abstains `too_many_calls`, per heads.md §H2 — the multi-slot decode below becomes active only when the v2 `J=3` slots ship.)
-2. For each slot `j ≤ n`: `t = argmax(H1)`; `t = NONE` → abstain `no_tool`; `P(t) − P(second) < M_tool` → abstain `tool_ambiguous`.
-3. Two slots selecting the same tool with identical arguments later in Q3 → collapse duplicates (or abstain `duplicate_call`).
+1. Each packed tool slot `t` outputs an independent tool-call probability `P(call_t)` via `BinaryToolHead` (see [`heads.md`](heads.md)).
+2. Tools with `P(call_t) < tool_call_threshold` are not fired. If no tool passes, return `no_tool` / abstain to the LLM.
+3. Duplicate tool+argument calls across slots are collapsed before emission.
 
-## Q2. Per-Parameter Decode (H3, H4)
+## Q2. Per-Parameter Decode (`LeanPointerHead`)
 
-For each `(t,k,j)`:
-1. Mask logits to `A_{t,k} ∪ {∅}` (P4 masks; `−∞` elsewhere). The mask is applied **before** softmax so invalid candidates cannot steal probability mass.
-2. Softmax over the valid set. Aggregate equal-valued candidates: `p(v) = Σ_{c: canon(c)=v} p(c)`.
-3. Abstain check from H4: `P(OK) < T_ok` → abstain with the argmax reason (`ABSENT`, `AMBIGUOUS`, `NEEDS_REASONING`, `OFF_WINDOW`).
-4. Keep the top-`K_cand`=3 distinct values with log-probs and margins for Q3.
-5. `array` params: `n_elem = argmax(H6)`; select the top-`n_elem` **non-overlapping** spans by score (greedy by score, tie-break left-to-right); if the number of spans above the list threshold ≠ `n_elem` → abstain `list_count_mismatch`.
+For each selected tool `t` and parameter `k`:
+1. Mask candidate logits to `A_{t,k} ∪ {<|null|>}` (P4 masks; `−∞` elsewhere). The mask is applied **before** softmax so invalid candidates cannot steal probability mass.
+2. Softmax over the valid candidate set. Aggregate equal-valued candidates: `p(v) = Σ_{c: canon(c)=v} p(c)`.
+3. Keep the top-`K_cand`=3 distinct values with log-probs and margins for Q3 joint decoding.
+4. `array` / `list` params select multiple non-overlapping span candidates above threshold where supported.
 
 ## Q3. Joint Assignment (exclusivity and swap safety)
 
@@ -282,18 +281,18 @@ Resolvers are **cheap, local, deterministic** (hash lookups). Snapping is applie
 
 ## Q8. Whole-Call Gate
 
-**v1 default (D4): single-τ gate.** The 8-feature conjunction is over-specified before its ablations exist; the mode switch lives in one place, [`spancall/infer/gate.py`](../spancall/infer/gate.py) (`build_gate`). `gate.mode: single_tau` is the default; `conjunction` is the ablation.
+Lean gating lives directly in [`LeanResolver`](../spancall/lean/resolver.py) via `call_min_prob`, `call_min_prob_ratio`, `tool_call_threshold`, and `min_joint_margin`:
 
 ```
 HIT ⇔ Q4–Q7 deterministic stages passed (validate())
-      ∧ min_k p_k ≥ τ_p     (lowest per-param top-1 pointer probability)
-      ∧ accept ≥ τ_a        (call-accept head)
+      ∧ P(call_t) ≥ tool_call_threshold
+      ∧ min_k p_k ≥ call_min_prob        (lowest per-param top-1 pointer probability)
+      ∧ min_k (p_k / p_k_2) ≥ call_min_prob_ratio
+      ∧ Δ_joint ≥ min_joint_margin
 ```
 
-- `τ_p` / `τ_a` are calibrated on a paraphrase-disjoint set (Clopper–Pearson lower bound at the Precision-at-Hit target, mechanism §7.4). The joint margin `Δ_joint` is recorded for telemetry but **dropped from the v1 decision**.
-- `gate.mode: conjunction` restores the 8-feature form (`∧ Δ_joint ≥ τ_Δ ∧ min P_consistent ≥ τ_swap ∧ P_tool ≥ τ_tool …`; exact condition in the gate module) — an ablation, not the default.
-- Multi-call turns (only when `data.pack_tools > 1` and H2/H6 are on, D5): **all** calls must pass or **all** abstain (no partial emission).
-- **Risk tiers only move the threshold, never remove the fast path.** Goal is to minimize LLM use: the LLM is called **only when confidence is low** (any gate condition fails). A `side_effecting` tool simply gets a stricter calibrated `τ` (because a wrong hit costs more, §1 cost model) — it is not an LLM-only category.
+- Multi-call turns: **all** selected calls must pass or **all** abstain (no partial emission).
+- **Risk tiers only move the threshold, never remove the fast path.** Goal is to minimize LLM use: the LLM is called **only when confidence is low** (any gate condition fails). A `side_effecting` tool simply gets a stricter threshold — it is not an LLM-only category.
 - **Confirmation step is optional, off by default**, and is a per-tool config. If enabled it is a templated user prompt ("Book VN123 for Anh Luong?"), not an LLM call, so it keeps the LLM out of the loop.
 
 ## Q9. Emit or Hand Off
@@ -338,7 +337,7 @@ Status legend: ✅ implemented+tested · 🚧 partial · ⬜ not started.
 | Schema defaults (Q6) | ✅ | `Param.default`/`has_default`; [`gate_tool_call`](../span_template/template.py) materializes defaults for absent optional params (Q6.2), omits optional-without-default | — |
 | Spec-diff test (§3.1.1) | 🚧 | `RENDERING_CONTRACT` constant added; tests assert segments/offsets | byte-exact render-vs-spec diff fixture |
 | Gemma template | ⬜ | [chat_template_gemma4.jinja](chat_template_gemma4.jinja) has header date only | pin upstream source/version; byte-exact emitter-vs-template test (Q9.1) |
-| Gate (Q8) | 🚧 | `gate_tool_call` handles `optional`, `default`, missing-required reporting | calibrated feature gate (τ from verification telemetry, mechanism §7.4) |
+| Gate (Q8) | ✅ | `gate_tool_call` in `span_template` + `LeanResolver` confidence thresholds (`call_min_prob`, `call_min_prob_ratio`, `tool_call_threshold`, `min_joint_margin`) | — |
 | Post-process (Q1–Q7) | ⬜ | none | whole module |
 
 ---

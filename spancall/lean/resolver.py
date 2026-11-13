@@ -21,10 +21,16 @@ import torch
 
 from spancall.agent.context import select_recent_context
 from spancall.data.align import tooldef_to_template_tool
-from spancall.data.schema import ParameterSchema, ToolDefinition
+from spancall.data.schema import ToolDefinition
+from spancall.infer.base import (
+    BaseResolveResult,
+    BaseResolver,
+    FakeTokenizer,
+    _backbone_max_seq_len,
+    _groupkey,
+)
 from spancall.infer.cast import SchemaValidator, StrictTypeCaster
-from spancall.infer.resolver import FakeTokenizer, _backbone_max_seq_len, _groupkey
-from spancall.lean.decode import LeanJointDecoder, LeanValueChoice
+from spancall.lean.decode import LeanJointDecoder
 from spancall.lean.model import LeanSpanCallModel
 from span_template.parser import Entry
 from span_template.sanitize import SanitizeError
@@ -87,23 +93,9 @@ class LeanCallResult:
 
 
 @dataclass
-class LeanResolveResult:
+class LeanResolveResult(BaseResolveResult):
     """End-to-end outcome of LeanResolver."""
 
-    hit: bool
-    tool_name: Optional[str] = None
-    payload: Optional[Dict[str, Any]] = None
-    parameters: Dict[str, LeanParameterResolution] = field(default_factory=dict)
-    joint_margin: float = 0.0
-    accept_score: float = 1.0
-    abstain_reason: Optional[str] = None
-    status: str = "abstain"  # "hit" | "partial" | "abstain"
-    payload_partial: Dict[str, Any] = field(default_factory=dict)
-    missing_required: List[str] = field(default_factory=list)
-    missing_optional: List[str] = field(default_factory=list)
-    confidence: float = 0.0
-    latency_ms: float = 0.0
-    features: Dict[str, Any] = field(default_factory=dict)
     error_reason: Optional[str] = None
     # R0.4: one entry per decoded call. Always non-empty once a tool was chosen,
     # with ``calls[0]`` mirrored by the scalar fields above.
@@ -272,7 +264,7 @@ def _absolutize_parity_spans(
     return absolutes, unresolvable, counters
 
 
-class LeanResolver:
+class LeanResolver(BaseResolver):
     """Streamlined one-pass inference pipeline without abstain machinery."""
 
     # Capability flag, not a try/except: eval code that wants to pass
@@ -435,6 +427,80 @@ class LeanResolver:
             self.model.eval()
         if self.encoder is not None and hasattr(self.encoder, "eval"):
             self.encoder.eval()
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        checkpoint_dir: str,
+        config_path: str = "configs/default.yaml",
+        calib_thresholds_path: Optional[str] = None,
+        device: Optional[str] = None,
+        **kwargs: Any,
+    ) -> "LeanResolver":
+        """Build encoder + model + tokenizer from a YAML config and load weights.
+
+        ``checkpoint_dir`` is a :meth:`LeanTrainer.save_checkpoint` directory.
+        Its ``provenance.json`` (when present) selects the H1 objective
+        (``tool_objective`` / ``use_binary_tool_head``) so binary weights are
+        never scored with a softmax. ``calib_thresholds_path`` is an optional
+        JSON object with a top-level ``min_joint_margin`` key (the W2 floor).
+        Explicit ``kwargs`` always win over config / provenance / calibration.
+        """
+        import json
+
+        from transformers import AutoTokenizer
+
+        from span_template.sanitize import SPECIAL_MARKER_TOKENS
+        from spancall.model.encoder import SpanCallTransformerEncoder
+        from spancall.train.config import TrainingConfig
+
+        cfg = TrainingConfig.from_yaml(config_path)
+        tokenizer = AutoTokenizer.from_pretrained(cfg.model.backbone_name, use_fast=True)
+        encoder = SpanCallTransformerEncoder(
+            model_name_or_path=cfg.model.backbone_name,
+            hidden_dropout_prob=cfg.model.dropout,
+            tokenizer=tokenizer,
+        )
+        encoder.add_marker_tokens(list(SPECIAL_MARKER_TOKENS))
+        model = LeanSpanCallModel(
+            encoder=encoder,
+            head_dim=cfg.model.head_dim,
+            max_span_width=cfg.model.max_span_width,
+            hidden_dim=encoder.hidden_dim,
+        )
+
+        opts: Dict[str, Any] = {
+            "max_seq_len": cfg.model.max_seq_len,
+            "max_span_width": cfg.model.max_span_width,
+            "max_calls": cfg.data.max_calls,
+            "call_min_prob": cfg.data.call_min_prob,
+            "call_min_prob_ratio": cfg.data.call_min_prob_ratio,
+            "k_recent": cfg.data.recent.k_recent,
+            "context_budget_tokens": cfg.data.recent.context_budget_tokens,
+            "tool_call_threshold": cfg.optimization.tool_call_threshold,
+        }
+        prov_path = Path(checkpoint_dir) / "provenance.json"
+        if prov_path.exists():
+            prov = json.loads(prov_path.read_text(encoding="utf-8"))
+            if prov.get("tool_objective") in ("ce", "binary"):
+                opts["tool_objective"] = prov["tool_objective"]
+        if calib_thresholds_path:
+            calib = json.loads(Path(calib_thresholds_path).read_text(encoding="utf-8"))
+            floor = calib.get("min_joint_margin") if isinstance(calib, dict) else None
+            if floor is not None:
+                opts["min_joint_margin"] = float(floor)
+        opts.update(kwargs)
+
+        resolver = cls(
+            model=model,
+            encoder=encoder,
+            model_path=checkpoint_dir,
+            tokenizer=tokenizer,
+            **opts,
+        )
+        if device:
+            model.to(device)
+        return resolver
 
     def load_checkpoint(self, model_path: str) -> None:
         p = Path(model_path)

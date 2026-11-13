@@ -1,4 +1,4 @@
-"""User-local clock resolution (docs/remediation_plan.md §3 D3).
+"""User-local clock resolution (D3).
 
 The template API stays deterministic: ``build_input(..., now: date)`` takes the
 place-holder date and never reads a wall clock or config. The *caller* (router /

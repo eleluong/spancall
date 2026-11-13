@@ -480,3 +480,23 @@ def test_provenance_names_the_objective_so_weights_cannot_be_mis_scored(tmp_path
         meta = json.loads((out / "provenance.json").read_text())
         assert meta["use_binary_tool_head"] is flag
         assert meta["tool_objective"] == ("binary" if flag else "ce")
+
+
+
+def test_tool_head_shape() -> None:
+    from spancall.model.heads import ToolHead
+
+    torch.manual_seed(0)
+    tool_emb = torch.randn(3, 4, 16)
+    cls_emb = torch.randn(3, 16)
+    out = ToolHead(16)(tool_emb, cls_emb)
+    assert out.shape == (3, 4)
+
+
+def test_tool_head_no_cls_fallback() -> None:
+    from spancall.model.heads import ToolHead
+
+    torch.manual_seed(1)
+    tool_emb = torch.randn(3, 4, 16)
+    out = ToolHead(16)(tool_emb, None)
+    assert out.shape == (3, 4)

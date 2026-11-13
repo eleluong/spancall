@@ -2,8 +2,7 @@
 """E0 traffic probe — measure F-share and scope-cut deltas before training (D7).
 
 Runs the *existing* template over hand-labeled call samples, with no model and no
-gate (``spancall.infer.gate`` is deliberately NOT imported — that module is still
-``NotImplementedError``; this probe's only dependency is ``span_template`` + the
+model or gate (this probe's only dependency is ``span_template`` + the
 sanitizer).
 
 Outputs (per workload, never aggregated across classes):
@@ -44,8 +43,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-# E0 depends ONLY on span_template + the sanitizer (D7); spancall.infer.gate is
-# deliberately out of scope (still NotImplementedError as of this writing).
+# E0 depends ONLY on span_template + the sanitizer (D7).
 from span_template import (
     SanitizeError,
     SpanTemplateOutput,
@@ -55,7 +53,7 @@ from span_template import (
     build_input,
 )
 
-# H4 abstain-reason classes (docs/remediation_plan.md §3 D7, heads.md H4).
+# Abstain-reason classes (taxonomy shared with spancall.data.align).
 ABSENT, AMBIGUOUS, NEEDS_REASONING, OFF_WINDOW = (
     "ABSENT", "AMBIGUOUS", "NEEDS_REASONING", "OFF_WINDOW",
 )

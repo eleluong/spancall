@@ -50,12 +50,9 @@ from spancall.lean.loss import LeanLossContainer
 from spancall.lean.model import LeanSpanCallModel
 from spancall.lean.tensorize import (
     LeanBatchCollate,
-    convert_legacy_batch_to_lean,
-    convert_legacy_row_to_lean,
     has_positive_targets,
-    is_legacy_batch,
 )
-from spancall.train.trainer import CosineWarmupSchedule
+from spancall.train.base import BaseTrainer, CosineWarmupSchedule
 
 
 def _log_loss(value: Any) -> float:
@@ -281,7 +278,7 @@ def build_lean_optimizer_groups(
     return out
 
 
-class LeanTrainer:
+class LeanTrainer(BaseTrainer):
     """Streamlined Trainer for Lean SpanCall (ToolHead + LeanPointerHead)."""
 
     def __init__(
@@ -516,8 +513,6 @@ class LeanTrainer:
     def train_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
         """Execute one micro-batch forward/backward and step optimizer on accumulation boundary."""
         self.model.train()
-        if is_legacy_batch(batch):
-            batch = convert_legacy_batch_to_lean(batch)
         b = {k: v.to(self.device, non_blocking=True) for k, v in batch.items() if isinstance(v, torch.Tensor)}
 
         # Derived from `optimization.effective_batch_size` when set, so the
@@ -765,8 +760,7 @@ class LeanTrainer:
         n_exact = 0
 
         with torch.no_grad():
-            for raw_batch in batches:
-                batch = convert_legacy_batch_to_lean(raw_batch) if is_legacy_batch(raw_batch) else raw_batch
+            for batch in batches:
                 b = {k: v.to(self.device, non_blocking=True) for k, v in batch.items() if isinstance(v, torch.Tensor)}
 
                 with self._amp():
@@ -857,7 +851,7 @@ class LeanTrainer:
                     row_ok = row_ok & ((pred_tools == tt) | ~valid_tool)
                     # Diagnostic: mean number of real candidate tools per row.
                     # 1.0 => H1 is a singleton softmax, so tool_acc is vacuous
-                    # (see docs/param_recall_diagnosis.md §7b). Rows without a
+                    # Rows without a
                     # live anchor are excluded rather than counted as 0.
                     n_cand_b = self._live_candidate_counts(b)
                     if n_cand_b is not None:
@@ -983,7 +977,7 @@ class LeanTrainer:
         return res
 
     # ------------------------------------------------------------------ #
-    # Dataset / Stage Helpers (compatible with SpanCallTrainer workflow)
+    # Dataset / Stage Helpers
     # ------------------------------------------------------------------ #
     def load_rows(self, split: str, filter_empty_positives: bool = True) -> List[Dict[str, Any]]:
         data_dir = getattr(self.config, "data_dir", None) or "data/processed"
@@ -1006,8 +1000,6 @@ class LeanTrainer:
             rng = random.Random(int(getattr(self.config, "seed", 42) or 42))
             n = max(int(len(rows) * frac), 1)
             rows = [rows[i] for i in sorted(rng.sample(range(len(rows)), min(n, len(rows))))]
-
-        rows = [convert_legacy_row_to_lean(r) if is_legacy_batch(r) else r for r in rows]
 
         if filter_empty_positives and rows and "pos_indices" in rows[0]:
             groundable = [r for r in rows if has_positive_targets(r)]
@@ -1036,8 +1028,7 @@ class LeanTrainer:
         return out
 
     def collate(self, batch: Sequence[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        collated = self.collator(batch)
-        return convert_legacy_batch_to_lean(collated) if is_legacy_batch(collated) else collated
+        return self.collator(batch)
 
     def make_batches(
         self,
@@ -1453,3 +1444,12 @@ class LeanTrainer:
             json.dump(meta, f, indent=2)
 
         return str(model_path)
+
+    def load_checkpoint(self, path: str) -> None:
+        """Restore model weights from a checkpoint directory or ``.pt`` file."""
+        p = Path(path)
+        state_path = (p / "model.pt") if p.is_dir() else p
+        if not state_path.exists():
+            raise FileNotFoundError(f"checkpoint weights not found: {state_path}")
+        state = torch.load(state_path, map_location=self.device, weights_only=False)
+        self.model.load_state_dict(state)

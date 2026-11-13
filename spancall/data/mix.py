@@ -1,6 +1,6 @@
 """Dataset mixing and partition strategies.
 
-Ref: docs/mechanism.md §8.3 and docs/full_implementation_plan.md §2.3.
+Ref: docs/mechanism.md §8.3.
 
 `DatasetMixer` assembles the final training mix (55% natural F, 20% paraphrase F,
 10% swap/distractor F, 15% abstention A) and the 7 canonical evaluation splits:
@@ -16,17 +16,11 @@ Data flow (`scripts/prepare_data.py`):
 from __future__ import annotations
 
 import random
-from dataclasses import replace
-from typing import Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from spancall.data.augment import DataAugmenter
 from spancall.data.partition import partition_schema_groups
 from spancall.data.schema import Split, Stratum, UnifiedSample
-
-# Same-tool ambiguity slice beyond which multi-tool packing must be flipped
-# (docs/remediation_plan.md D5): the default pipeline packs ONE tool per input.
-_AMBIGUITY_TRIGGER = 0.10
-
 
 class DatasetMixer:
     """Manages sampling ratios across data strata and augmentation categories.
@@ -234,19 +228,6 @@ class DatasetMixer:
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
-
-_AUGTYPES = {
-    "natural": {"", "None", None},
-    "paraphrase": {"paraphrase_f"},
-    "swap_distractor": {
-        "swap_f",
-        "distractor_f",
-        "ambiguous_a",
-        "swap_distractor_f",
-    },
-    "abstention": {"adversarial_r7"},
-}
-
 
 def _bucket_samples(samples: Sequence[UnifiedSample]) -> Dict[str, List[UnifiedSample]]:
     """Bucket samples by augmentation category for the 55/20/10/15 mix."""

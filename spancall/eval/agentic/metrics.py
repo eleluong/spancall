@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import List
 
 from spancall.agent.trace import ExecutionTrace, RoutingDecision
 

@@ -2109,7 +2109,7 @@ if CHECKPOINT_DIR:
 MARKDOWN_PREDICT_INTRO = """---
 ## 5. Inference & Evaluation (`LeanResolver`)
 
-Loads `LeanSpanCallModel` + `LeanResolver` and evaluates across the same 3 decoupled parts as the legacy notebook:
+Loads `LeanSpanCallModel` + `LeanResolver` and evaluates across 3 decoupled parts:
 1. **Eval Part 1 — Parameter Extraction Evaluation (Oracle / Given GT Tool)**: `resolver.try_resolve(gt_tool, ...)`
 2. **Eval Part 2 — Function (Tool) Prediction Evaluation**: `resolver.predict_tool(candidates, ...)`
 3. **Eval Part 3 — End-to-End Function Calling Evaluation**: `resolver.try_resolve_candidates(s.tools, ...)` vs `B1a` (and vs Legacy SpanCall if present).

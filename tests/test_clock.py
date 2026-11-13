@@ -1,6 +1,6 @@
 """Day-boundary and DST tests for the D3 user-local clock (spancall/infer/clock.py).
 
-Contract under test (docs/remediation_plan.md §3 D3):
+Contract under test (D3):
 - The template API stays deterministic: ``build_input(..., now: date)`` never reads
   a wall clock or config. The *caller* resolves the user-local date via
   ``local_today(zone, utc_now)`` and passes it as ``now``.

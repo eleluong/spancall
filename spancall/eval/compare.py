@@ -5,7 +5,7 @@ Rigorous paired statistical comparison:
 - Paired bootstrap confidence intervals
 - Empirical cost model validation vs docs/mechanism.md §1
 
-Protocol (docs/architecture.md §8.3, full_implementation_plan.md §4.3):
+Protocol (docs/architecture.md §8):
 same LLM, tools and tasks; only the router differs. ``normal_agent_traces``
 (S) and ``spancall_agent_traces`` (B0) must be **paired** 1-to-1 per task
 (identical ``task_id`` ordering), aggregated over >= 3 seeds.

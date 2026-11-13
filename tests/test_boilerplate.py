@@ -35,28 +35,42 @@ class TestBoilerplateIntegrity(unittest.TestCase):
 
     def test_imports_model_subpackage(self):
         from spancall.model import (
-            AbstainHead,
             BaseEncoder,
             BaseHead,
-            CallAcceptHead,
-            CallCountHead,
+            BinaryToolHead,
             CandidateMaskBuilder,
-            PointerHead,
-            SpanCallLossContainer,
             SpanCallTransformerEncoder,
             ToolHead,
         )
         encoder = SpanCallTransformerEncoder()
         self.assertEqual(encoder.model_name_or_path, "Qwen/Qwen3-Embedding-0.6B")
-        loss_fn = SpanCallLossContainer()
+        self.assertTrue(issubclass(ToolHead, BaseHead))
+        self.assertTrue(issubclass(BinaryToolHead, BaseHead))
+
+    def test_imports_lean_subpackage(self):
+        from spancall.lean import (
+            LeanJointDecoder,
+            LeanLossContainer,
+            LeanPointerHead,
+            LeanResolver,
+            LeanSpanCallModel,
+            LeanTrainer,
+        )
+        from spancall.infer import BaseJointDecoder, BaseResolver
+        from spancall.train import BaseTrainer
+
+        self.assertTrue(issubclass(LeanJointDecoder, BaseJointDecoder))
+        self.assertTrue(issubclass(LeanResolver, BaseResolver))
+        self.assertTrue(issubclass(LeanTrainer, BaseTrainer))
+        loss_fn = LeanLossContainer()
         self.assertEqual(loss_fn.lambda_tool, 1.0)
+        self.assertEqual(loss_fn.lambda_pointer, 1.0)
 
     def test_imports_train_subpackage(self):
         from spancall.train import (
             BaseCalibrator,
             BaseTrainer,
-            CalibrationConfig,
-            GateConfig,
+            CosineWarmupSchedule,
             ModelConfig,
             OptimizationConfig,
             TrainingConfig,
@@ -64,22 +78,12 @@ class TestBoilerplateIntegrity(unittest.TestCase):
         config = TrainingConfig()
         self.assertEqual(config.optimization.batch_size, 64)
         self.assertEqual(config.optimization.num_epochs, 4)
-        calib_config = CalibrationConfig()
-        self.assertEqual(calib_config.target_precision, 0.95)
-        gate_config = GateConfig()
-        self.assertEqual(gate_config.tau_p, 0.90)
-        self.assertEqual(gate_config.tau_delta, 2.0)
-        self.assertEqual(gate_config.tau_a, 0.85)
 
     def test_training_config_from_yaml_roundtrip(self):
-        # design rule 4: an experiment = YAML + seed — the dataclasses must load
-        # straight from configs/default.yaml (unknown keys tolerated).
         from spancall.train import TrainingConfig
         cfg = TrainingConfig.from_yaml("configs/default.yaml")
         self.assertEqual(cfg.model.backbone_name, "Qwen/Qwen3-Embedding-0.6B")
         self.assertEqual(cfg.optimization.learning_rate_encoder, 3e-5)
-        # Refined recipe: `batch_size` is the MICRO batch and
-        # `effective_batch_size` (micro x accum) is what the optimizer sees.
         self.assertEqual(cfg.optimization.batch_size, 32)
         self.assertEqual(cfg.optimization.effective_batch_size, 128)
         self.assertEqual(cfg.optimization.optimizer, "adamw")
@@ -88,23 +92,26 @@ class TestBoilerplateIntegrity(unittest.TestCase):
         self.assertEqual(cfg.optimization.num_epochs, 4)
         self.assertEqual(cfg.output_dir, "results")
         self.assertEqual(cfg.seed, 42)
-        self.assertEqual(cfg.calibration.target_precision, 0.95)
-        self.assertEqual(cfg.gate.tau_p, 0.90)
 
     def test_imports_infer_subpackage(self):
         from spancall.infer import (
             BaseExporter,
-            BaseGate,
             BaseJointDecoder,
+            BaseResolveResult,
+            BaseResolver,
             BaseTypeCaster,
-            ConjunctionGate,
+            FakeTokenizer,
+            NoOpResolver,
             ParameterResolution,
             ResolveResult,
             SchemaValidator,
-            SpanCallResolver,
+            ScriptedResolver,
+            StrictTypeCaster,
         )
         res = ResolveResult(hit=False, abstain_reason="test")
         self.assertFalse(res.hit)
+        self.assertIsInstance(res, BaseResolveResult)
+        self.assertFalse(NoOpResolver().try_resolve_candidates([], "hi").hit)
 
     def test_imports_agent_subpackage(self):
         from spancall.agent import (
@@ -132,13 +139,13 @@ class TestBoilerplateIntegrity(unittest.TestCase):
         )
         cm = CostModel(cost_spancall_call=0.07, cost_llm_call=1.0)
         break_even_h = cm.compute_break_even_hit_rate(precision_at_hit=0.95)
-        # Expected break-even around 7-8% per docs/mechanism.md §1
         self.assertAlmostEqual(break_even_h, 0.07 / (1.0 - 0.05 * 2.0), delta=0.01)
 
     def test_imports_data_sources(self):
         from spancall.data.sources import (
             BFCLLoader,
             GlaiveLoader,
+            HermesLoader,
             TauBenchLoader,
             ToolBenchLoader,
             XLAMLoader,
@@ -150,12 +157,12 @@ class TestBoilerplateIntegrity(unittest.TestCase):
 
     def test_router_defaults(self):
         from spancall.agent.router import ToolCallRouter, RouterMode, IntegrationVariant
-        from spancall.infer.resolver import SpanCallResolver
+        from spancall.infer import BaseResolver
         from spancall.agent.backends.base import BaseLLMBackend
         from unittest.mock import MagicMock
 
         router = ToolCallRouter(
-            resolver=MagicMock(spec=SpanCallResolver),
+            resolver=MagicMock(spec=BaseResolver),
             llm_backend=MagicMock(spec=BaseLLMBackend),
         )
         self.assertEqual(router.mode, RouterMode.ROUTER)

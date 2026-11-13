@@ -61,7 +61,6 @@ HERMES_CONFIGS = [
 
 _JSON_MODE_CONFIGS = frozenset({"json_mode_agentic", "json_mode_singleturn"})
 
-_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL | re.IGNORECASE)
 _TOOLS_BLOCK_RE = re.compile(r"<tools>\s*(.*?)\s*</tools>", re.DOTALL | re.IGNORECASE)
 _SCHEMA_BLOCK_RE = re.compile(r"<schema>\s*(.*?)\s*</schema>", re.DOTALL | re.IGNORECASE)
 _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)

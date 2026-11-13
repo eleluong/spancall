@@ -6,7 +6,7 @@ Ref: docs/mechanism.md §14, docs/proposal.md §6.2.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 
 @dataclass

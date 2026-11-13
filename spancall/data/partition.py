@@ -190,7 +190,7 @@ def partition_schema_groups(
     """Generalized schema-disjoint partition over *arbitrary* target splits.
 
     The default 3-way :func:`partition_schema_disjoint` is hardcoded to
-    train/dev/eval; the full pipeline (docs/full_implementation_plan.md §2.3)
+    train/dev/eval; the full pipeline
     needs 4 schema-held-out buckets — ``train`` 80%, ``dev`` 5%, ``calib`` 5%,
     ``test_ood_schema`` 10% — so dev/calib and OOD-schema evaluation stay
     schema-disjoint from training. This function shares the largest-first

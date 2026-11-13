@@ -8,7 +8,6 @@ from datetime import date
 
 from span_template import (
     Entry,
-    GateResult,
     Param,
     RecentRow,
     SanitizeError,

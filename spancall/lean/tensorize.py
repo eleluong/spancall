@@ -1,9 +1,6 @@
-"""Lean Tensorization and Batch Adapters.
+"""Lean Tensorization and Batch Collator.
 
 Provides:
-- convert_legacy_batch_to_lean: translates legacy batch tensors (where 0=abstain,
-  v>0 = candidate v-1) into 0-indexed candidate positives in [0, C) with -1 pad.
-- convert_legacy_row_to_lean: translates a single serialized dict row.
 - tensorize_sample_lean: direct tensorization for UnifiedSample without abstain targets.
 - LeanBatchCollate: collates a list of sample tensor dicts into a padded batch.
 """
@@ -20,7 +17,6 @@ import torch
 from spancall.data.align import tooldef_to_template_tool
 from spancall.data.schema import (
     GroundTruthCall,
-    ParameterSchema,
     SpanTarget,
     Stratum,
     ToolDefinition,
@@ -58,64 +54,16 @@ PAD_INDEX_KEYS = frozenset(
 )
 
 
-def is_legacy_batch(batch_or_row: Dict[str, Any]) -> bool:
-    """Return True if batch/row carries legacy 1-indexed pos_indices (0=abstain)."""
-    if batch_or_row.get("_lean_converted"):
-        return False
-    return any(
-        k in batch_or_row
-        for k in ("accept_targets", "reason_targets", "abstain_flags", "cue_mask")
-    )
-
-
-def convert_legacy_batch_to_lean(batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    """Convert a legacy batch dict (with 0=abstain, v>0=cand_v-1) into Lean format.
-
-    - pos_indices: maps v > 0 to v - 1, and 0 (abstain) / -1 (pad) to -1.
-    - idempotent: marks converted dict with ``_lean_converted = True``.
-    """
-    if batch.get("_lean_converted"):
-        return batch
-    lean_batch = dict(batch)
-    if "pos_indices" in batch:
-        pos = batch["pos_indices"]
-        lean_batch["pos_indices"] = torch.where(pos > 0, pos - 1, -1)
-        if "pointer_positives" in lean_batch:
-            lean_batch["pointer_positives"] = lean_batch["pos_indices"]
-    lean_batch["_lean_converted"] = True  # type: ignore[assignment]
-    return lean_batch
-
-
-def convert_legacy_row_to_lean(row: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert a single uncollated dict row from legacy format to Lean format."""
-    if row.get("_lean_converted"):
-        return row
-    out = dict(row)
-    if "pos_indices" in row:
-        pos = row["pos_indices"]
-        if isinstance(pos, torch.Tensor):
-            out["pos_indices"] = torch.where(pos > 0, pos - 1, -1)
-        elif isinstance(pos, list):
-            out["pos_indices"] = [
-                [val - 1 if val > 0 else -1 for val in k_row]
-                for k_row in pos
-            ]
-    out["_lean_converted"] = True
-    return out
-
-
 def has_positive_targets(row: Dict[str, Any]) -> bool:
     """Return True if a row has at least one valid positive candidate index."""
     pos = row.get("pos_indices")
     if pos is None:
         return False
-    is_legacy = is_legacy_batch(row)
-    thr = 0 if is_legacy else -1
     if isinstance(pos, torch.Tensor):
-        return bool((pos > thr).any().item())
+        return bool((pos > -1).any().item())
     if isinstance(pos, list):
         return any(
-            (val > thr)
+            (val > -1)
             for k_row in pos
             for val in (k_row if isinstance(k_row, list) else [k_row])
         )
@@ -237,7 +185,7 @@ class ToolPool:
     ``tool_logits`` has shape ``(B, 1)`` and ``argmax(-1)`` is identically 0 —
     while ``tool_targets`` is also identically 0. H1 accuracy is then 1.0 for
     *any* weights and ``L_tool = CE over one class = 0``, i.e. H1 receives no
-    gradient at all. ``docs/param_recall_diagnosis.md`` calls this the
+    gradient at all. This is the
     "vacuous 1.0, single-tool" baseline.
 
     This pool supplies the missing distractors: for each row we keep the GT tool

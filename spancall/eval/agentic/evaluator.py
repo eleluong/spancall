@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import random
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Iterator, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 from spancall.agent.loop import BaseAgentLoop
 from spancall.agent.trace import ExecutionTrace

@@ -6,65 +6,73 @@ Describes the repository structure, module contracts, data flow, evaluation meth
 | --- | --- |
 | [proposal.md](proposal.md) | What we claim and why |
 | [mechanism.md](mechanism.md) | How one-pass resolution works, cost model, experiments E1-E8 |
-| [heads.md](heads.md) | Prediction heads H1-H4 |
+| [heads.md](heads.md) | Prediction heads (H1 Tool + H3 Lean Pointer, plus optional/spec heads) |
 | [pipeline_io.md](pipeline_io.md) | Pre/post-process spec |
+| [param_extraction_eval_coverage.md](param_extraction_eval_coverage.md) | Retrieval-first contract & honest Part-1/Part-3 metrics |
 | [experiments.md](experiments.md) | Experiment ledger E1-E15 |
-| **this doc** | Codebase layout, module contracts, workflows |
+| **this doc** | Codebase layout, shareable boilerplate contracts, Lean workflows |
 
 > [!NOTE]
-> Status: **boilerplate only**. `span_template/` is implemented and tested. Everything in `spancall/` is interfaces (ABCs, dataclasses, config) whose logic methods raise `NotImplementedError`. Nothing is hardcoded to a dataset or domain.
+> **Architecture Principle — Lean Core + Pluggable Boilerplate:**
+> `span_template/`, `spancall/data/`, `spancall/model/{encoder,masks,heads}.py`, `spancall/infer/{base,cast,clock,export}.py`, `spancall/train/{base,config}.py`, `spancall/eval/`, and `spancall/agent/` provide **version-agnostic ABCs and shared utilities**. Concrete model/training/decoding/resolution versions (such as `spancall/lean/` and future v2.x / v3 iterations) implement these contracts (`BaseResolver`, `BaseTrainer`, `BaseJointDecoder`, `BaseHead`) so new versions drop into the agent router and evaluation harnesses with zero friction.
 
 ---
 
 ## 1. Research Framing
 
-**Claim:** a ~150M bidirectional encoder with a pointer head resolves fully-specified tool calls (stratum **F**, ~80%) in one pass, gated for >=95% precision. Stratum **A** (absent/unresolvable params) abstains to the normal LLM.
+**Claim:** a compact bidirectional encoder with a boundary-factorized pointer head (`LeanPointerHead`, H3) and tool selection head (`ToolHead` / `BinaryToolHead`, H1) resolves context-ready tool calls (stratum **F**) in a single forward pass, gated by tool probability / joint margin for high precision. Stratum **A** (absent/unresolvable params) or low-margin predictions abstain to the normal LLM.
 
 **Systems compared everywhere:**
 
 | ID | System | Role |
 | --- | --- | --- |
 | **B0** | Normal agent: LLM generates every tool call | Reference quality and cost |
-| **B1** | Cheap baselines: 0.5B constrained generator, regex/rules | Fair small-model baseline (E6) |
-| **S** | Agent + SpanCall router (fast path, LLM fallback) | The proposal |
+| **B1** | Cheap baselines: 0.5B constrained generator, regex/rules (`B1aBaseline`) | Fair small-model baseline (E6) |
+| **S** | Agent + SpanCall router (fast path via `BaseResolver`, LLM fallback) | The proposal |
 
-**Layered questions:** does the model work (offline tool-call eval) -> is the gate safe (calibration) -> does the agent still succeed, cheaper (agentic eval).
+**Layered questions:** does the model extract & select tools accurately (`eval_p1` + `diagnostics`) -> does end-to-end resolution beat the precision gate (`ToolCallEvaluator`) -> does the agent succeed cheaper (`ComparativeEvaluator`).
 
 ---
 
 ## 2. Repository Layout
 
-```
+```text
 multi_span_tool_calling/
 ├── pyproject.toml
-├── configs/default.yaml           # data / model / optimization / training / calibration / agent / gate
-├── docs/                          # design docs + this file + experiments.md
-├── span_template/                 # IMPLEMENTED: render, parse, sanitize (R7)
-│   ├── template.py                #   build_input / build_input_multi / gate_tool_call
+├── PROJECT_STATE.md
+├── configs/default.yaml           # data / model / optimization / training / agent
+├── data/
+│   ├── processed/                 # Canonical 7-split UnifiedSample JSONL
+│   ├── processed_v2/              # Re-aligned v2 splits (build_input_multi + utt_rel_* + template_stamp.json)
+│   └── tensorized_lean/           # Pre-tensorized Lean split caches
+├── docs/                          # Design docs + this file + experiments.md
+├── plans/                         # Active Lean v2 / v2.1 design plans
+├── span_template/                 # Shared grammar: render, parse, sanitize (R7), template stamp
+│   ├── template.py                #   build_input / build_input_multi / resolve_utterance_span / gate_tool_call
 │   ├── parser.py                  #   marker grammar → extraction legend
 │   ├── sanitize.py                #   P0/P1 normalization + R7 marker rejection
+│   ├── stamp.py                   #   Template-hash stamp verification (S6)
 │   ├── template.jinja / template_multi.jinja
-│   └── test_template.py           #   golden render/parse + R7 fixtures (implemented tests)
+│   └── test_template.py           #   Golden render/parse + R7 fixtures
 ├── spancall/
-│   ├── data/                      # §4
-│   ├── model/                     # §5
-│   ├── train/                     # §5
-│   ├── infer/                     # §6
-│   ├── agent/                     # §7
-│   └── eval/                      # §8
-├── scripts/                       # thin CLIs (no logic)
-└── tests/
-    ├── test_boilerplate.py        # imports/exports contract canary
-    └── (pending: alignment, caster, gate, chat-template round trip, shuffle-invariance)
+│   ├── data/                      # §4 Shared ingestion, alignment, augmentation, splits, loader stubs
+│   ├── model/                     # §5.1 Shared encoder, candidate masks, BaseHead, ToolHead, BinaryToolHead
+│   ├── train/                     # §5.2 Shared TrainingConfig + BaseTrainer / BaseCalibrator / CosineWarmupSchedule
+│   ├── infer/                     # §6.1 Shared BaseResolver / BaseResolveResult / BaseJointDecoder, StrictTypeCaster, clock
+│   ├── lean/                      # §5.3 & §6.2 Lean model, loss, tensorizer, trainer, decoder, resolver, eval_p1, diagnostics
+│   ├── agent/                     # §7 Pluggable ToolCallRouter + ReActAgentLoop (accepts any BaseResolver)
+│   └── eval/                      # §8 Offline ToolCallEvaluator + Agentic ComparativeEvaluator & CostModel
+├── scripts/                       # Thin CLIs (prepare_data, realign_v2, probe, train_lean, eval_toolcall, eval_agent)
+├── notebooks/
+│   └── spancall_lean_v2_train_eval.ipynb
+└── tests/                         # Unit & integration tests across template, data, lean, infer, agent, eval
 ```
 
-`docs/chat_template_gemma4.jinja` is the optional, *unused by default* Gemma 4 chat template for the local backend's fallback path (§7) — the fallback always uses the LLM's unchanged native template.
-
 Design rules:
-1. **One code path for train and serve** for render -> parse -> tokenize (`span_template` is the single source).
+1. **One code path for train and serve** for render -> parse -> tokenize (`span_template` `build_input_multi` is the single source of truth, guarded by `span_template/stamp.py`).
 2. **Scripts hold no logic**: they parse args and call library code.
-3. **Interfaces first**: each stage is an ABC so alternatives (backbones, gates, backends) are swappable for ablations.
-4. **Config-driven**: every experiment is reproducible from a YAML + seed.
+3. **Interfaces first**: each stage exposes a lightweight ABC (`BaseResolver`, `BaseTrainer`, `BaseJointDecoder`, `BaseHead`, `BaseEncoder`, `BaseDatasetLoader`, `BaseLLMBackend`) so new model versions plug into `ToolCallRouter` and evaluators without glue rewrites.
+4. **Config-driven**: every experiment is reproducible from a YAML + seed + template stamp.
 
 ---
 
@@ -72,27 +80,25 @@ Design rules:
 
 ```mermaid
 flowchart LR
-  subgraph Offline
+  subgraph Offline["Offline Data & Lean Training"]
     R[Raw datasets] --> L[Loaders]
     L --> U[UnifiedSample]
-    U --> AL[ReverseAligner<br/>F or A + targets]
-    AL --> AU[DataAugmenter]
-    AU --> MX[DatasetMixer<br/>schema-disjoint splits]
-    MX --> TR[Trainer]
+    U --> AL[ReverseAligner v2<br/>build_input_multi + utt_rel_*]
+    AL --> ST[Template Stamp<br/>data/processed_v2]
+    ST --> TZ[tensorize_sample_lean<br/>ToolPool + CandidateMaskBuilder]
+    TZ --> TR[LeanTrainer]
     TR --> CK[Checkpoint]
-    CK --> CA[Calibrator<br/>temperature + tau sweep]
   end
-  subgraph Online
-    Q[Utterance + session] --> RS[SpanCallResolver]
+  subgraph Online["Online Resolution & Agent Routing"]
+    Q[Utterance + session] --> RS[BaseResolver<br/>e.g. LeanResolver]
     CK --> RS
-    CA --> RS
     RS --> RT{ToolCallRouter}
     RT -- hit --> EM[Emit call]
     RT -- abstain --> LLM[LLM backend<br/>native chat template]
   end
   EM --> ENV[ToolEnvironment]
   LLM --> ENV
-  ENV --> EV[Evaluators]
+  ENV --> EV[Evaluators<br/>eval_p1 / ToolCallEvaluator / ComparativeEvaluator]
 ```
 
 ---
@@ -107,230 +113,107 @@ flowchart LR
 | `ToolDefinition` | Tool spec: `name`, `description`, `parameters`, `risk_tier` (per tool) |
 | `ParameterSchema` | Per-param spec: `param_type`, `enum`, `default`, `required`, `entity_class` (exclusivity group) |
 | `GroundTruthCall` | Reference call (tool + arguments) |
-| `SpanTarget` | Per-param target: utterance span, recent ctx, time/enum/bool ctx, or unresolved |
+| `SpanTarget` | Per-param target: utterance span (`char_start`/`char_end` + render-invariant `utt_rel_start`/`utt_rel_end`), recent ctx, time/enum/bool ctx, or unresolved |
 | `Stratum` | `F` (fully groundable) / `A` (abstention negative) |
 | `Split` | `train, dev, calib, test_id, test_ood_schema, test_ood_para, test_adversarial` |
 
-### 4.2 Components
+### 4.2 Components (All Kept & Shareable)
 
 | Module | Contract |
 | --- | --- |
 | [base.py](../spancall/data/base.py) | `BaseDatasetLoader.load()`, `BaseAligner.align()`, `BaseAugmenter.augment()` |
-| [sources/](../spancall/data/sources) | Loaders: xLAM, Glaive, ToolBench (train); BFCL, tau-bench (eval); **Hermes** (`HermesLoader`, all 5 configs of `NousResearch/hermes-function-calling-v1`) |
-| [align.py](../spancall/data/align.py) | `ReverseAligner`: GT args -> spans / CTX entries; ungrounded => stratum A (mechanism §8.1) |
-| [augment.py](../spancall/data/augment.py) | `DataAugmenter`: shuffles, clock randomization, entity swaps, distractors, adversarial markers (§8.4) |
-| [mix.py](../spancall/data/mix.py) | `DatasetMixer`: mix 55/20/10/15 (natural F / paraphrase F / swap+distractor F / A), `partition_by_schema` (§8.3) |
-| [partition.py](../spancall/data/partition.py) | `partition_schema_disjoint` (schema-group → train/dev/eval, zero-shot OOD-schema eval), `write_splits_jsonl` (JSONL + report) |
-
-### 4.3 Pipeline
-
-1. Ingest sources into `UnifiedSample` (`HermesLoader` covers all 5 hermes configs; `JSONL`/hub via optional `datasets`).
-2. Assign a synthetic clock (never the GT date); render via `span_template`.
-3. Reverse-align; log the **F/A share per source** (this measures the real "80%" assumption).
-4. Augment; mix.
-5. **Split by schema**, not only utterance (`partition_schema_disjoint` → `hermes_{train,dev,eval}.jsonl` + `partition_report.json`): held-out schemas for zero-shot eval, paraphrase-disjoint calibration set.
-6. QA: leakage check (schema and near-duplicate utterances across splits), dataset card.
-
-Evaluation-only data: BFCL (call-level), tau-bench-style tasks (agentic), stratum-A probes (false hits), adversarial suite.
+| [sources/](../spancall/data/sources) | **Hermes** (`HermesLoader`, all 5 configs of `NousResearch/hermes-function-calling-v1`) + shareable loader boilerplate shells (`xLAM`, `Glaive`, `ToolBench`, `BFCL`, `tau-bench`) |
+| [align.py](../spancall/data/align.py) | `ReverseAligner`: renders with `build_input_multi`, aligns GT args to utterance (`utt_rel_*`) + CTX entries, idempotent `target_spans` emission |
+| [augment.py](../spancall/data/augment.py) | `DataAugmenter`: shuffles, clock randomization, entity swaps, distractors, adversarial markers |
+| [mix.py](../spancall/data/mix.py) | `DatasetMixer`: 55/20/10/15 stratified mix, `partition_by_schema`, 7-way `finalize_splits` |
+| [partition.py](../spancall/data/partition.py) | `partition_schema_disjoint` (zero-shot OOD-schema split), `write_splits_jsonl` |
 
 ---
 
-## 5. Model and Training
+## 5. Model and Training (`spancall/model/`, `spancall/train/`, `spancall/lean/`)
 
-### 5.1 Model (`spancall/model/`)
+### 5.1 Shared Model Primitives (`spancall/model/`)
 
 | Module | Contract | Spec |
 | --- | --- | --- |
 | [encoder.py](../spancall/model/encoder.py) | `BaseEncoder`, `SpanCallTransformerEncoder`; registers marker special tokens | mechanism §3.2, §4 |
-| [heads.py](../spancall/model/heads.py) | `ToolHead` (H1), `CallCountHead` (H2), `PointerHead` (H3), `AbstainHead` (H4), `CallAcceptHead` | heads.md, mechanism §5. Heads H5-H8 (Source, List-Size, Swap/Exclusivity, Correctness) are **spec-only** in heads.md — not yet implemented, available to H1-H4/CallAcceptHead |
-| [masks.py](../spancall/model/masks.py) | `CandidateMaskBuilder`: type pre-filter, R8 snapping, R9 enum masks | mechanism §3.4 |
-| [loss.py](../spancall/model/loss.py) | `SpanCallLossContainer`: multi-positive softmax CE over `A_k + {abstain}` + accept BCE | mechanism §8.2 |
+| [heads.py](../spancall/model/heads.py) | `BaseHead` (ABC), `ToolHead` (H1 softmax over `<|tool|>`/`<|none|>`), `BinaryToolHead` (H1 independent per-anchor sigmoid BCE) | heads.md §3 |
+| [masks.py](../spancall/model/masks.py) | `CandidateMaskBuilder`: P4 type pre-filter, R8 entry snapping, R9 enum masks, stratified candidate packing | mechanism §3.4, pipeline_io P4 |
 
-Pointer scoring: `M(k,i,j) = s_{k,i} + e_{k,j} + r(j-i)`, restricted to valid candidates.
-
-### 5.2 Training (`spancall/train/`)
+### 5.2 Shared Training Config & Boilerplate (`spancall/train/`)
 
 | Module | Contract |
 | --- | --- |
-| [config.py](../spancall/train/config.py) | `ModelConfig`, `OptimizationConfig`, `TrainingConfig`, `CalibrationConfig` |
-| [trainer.py](../spancall/train/trainer.py) | `BaseTrainer`: `train`, `evaluate`, `save_checkpoint`, `load_checkpoint` |
-| [calibrate.py](../spancall/train/calibrate.py) | `BaseCalibrator`: temperature scaling, threshold sweep, Clopper-Pearson lower bound |
+| [config.py](../spancall/train/config.py) | `TrainingConfig`, `ModelConfig`, `OptimizationConfig`, `DataConfig`, `AgentConfig` |
+| `base.py` | `BaseTrainer` (`train`, `evaluate`, `save_checkpoint`, `load_checkpoint`), `BaseCalibrator`, `CosineWarmupSchedule` |
 
-### 5.3 Staged methodology
+### 5.3 Lean Model & Training Stack (`spancall/lean/`)
 
-| Stage | What | Gate |
-| --- | --- | --- |
-| T0 | Overfit ~1k examples | loss ~0, offsets decode exactly |
-| T1 | Pointer head only on F slice | **E1: exact payload >= 90%** |
-| T2 | + abstain/accept head + A negatives | precision-at-coverage curve |
-| T3 | + tool head + count head (multi-tool packing) | wrong-tool <= 1% |
-| T4 | + swap/distractor slices | E3 swap ablation |
-| T5 | Calibration | E2 (>= 95% precision) |
+| Module | Contract |
+| --- | --- |
+| [model.py](../spancall/lean/model.py) | `LeanPointerHead` (0-indexed candidate span scorer over `(B, K, C)`, no abstain logit collapse), `LeanSpanCallModel` (`encoder` + `tool_head` / `binary_tool_head` + `pointer_head`) |
+| [loss.py](../spancall/lean/loss.py) | `LeanLossContainer`: multi-positive pointer cross-entropy (`PAD_INDEX = -1` ignored) + multi-call/single-call softmax or binary BCE tool loss |
+| [tensorize.py](../spancall/lean/tensorize.py) | `tensorize_sample_lean`, `ToolPool` (`jitter_pack_tools`), `LeanBatchCollate` |
+| [trainer.py](../spancall/lean/trainer.py) | `LeanTrainer(BaseTrainer)`: length-bucketed micro-batching, slot-weighted `_MicroLossAccumulator`, differential LR + layerwise decay, optional LoRA, early stopping |
 
 ---
 
-## 6. Inference / "Use" (`spancall/infer/`)
+## 6. Inference & Pluggable Resolver Contract (`spancall/infer/`, `spancall/lean/`)
+
+### 6.1 Shared Inference Boilerplate (`spancall/infer/`)
 
 | Module | Contract | Spec |
 | --- | --- | --- |
-| [resolver.py](../spancall/infer/resolver.py) | `SpanCallResolver.try_resolve(schema, utterance, recent_context, now) -> ResolveResult`; `try_resolve_candidates` for multi-schema | mechanism §2, §9 |
-| [decode.py](../spancall/infer/decode.py) | `BaseJointDecoder`: exclusivity-constrained assignment + `Delta_joint` | mechanism §6 |
-| [cast.py](../spancall/infer/cast.py) | `BaseTypeCaster` (strict typed cast from char offsets), `SchemaValidator` | mechanism §7.1-7.2 |
-| [gate.py](../spancall/infer/gate.py) | `BaseGate`, `ConjunctionGate` | mechanism §7.3 |
-| [export.py](../spancall/infer/export.py) | `BaseExporter`: ONNX / int8 | mechanism §10 |
+| `base.py` | `BaseResolver` (ABC: `try_resolve`, `try_resolve_candidates`, `from_checkpoint`), `BaseResolveResult`, `BaseJointDecoder`, `NoOpResolver`, `ScriptedResolver`, `FakeTokenizer` | Pluggable contract for `spancall/agent/` and future versions |
+| [cast.py](../spancall/infer/cast.py) | `BaseTypeCaster`, `StrictTypeCaster` (Q4/Q5 strict typed cast from char offsets), `SchemaValidator` (Q6) | pipeline_io Q4–Q6 |
+| [clock.py](../spancall/infer/clock.py) | `local_today`, `tz_offset_minutes` | pipeline_io P2 |
+| [export.py](../spancall/infer/export.py) | `BaseExporter` (ONNX / quantization interface) | mechanism §10 |
 
-Hit rule (baseline):
-`hit <=> min_k p_k >= tau_p AND Delta_joint >= tau_Delta AND accept >= tau_a AND validate()`
-
-`ResolveResult` carries `hit, tool_name, payload, per-param confidence/margin/char_span, joint_margin, accept_score, abstain_reason, latency_ms, features`.
-
-Default gating thresholds (same values as [`ConjunctionGate.__init__`](../spancall/infer/gate.py:37)); must be overridden from calibration (§8.1, `configs/default.yaml` section `gate`):
-`tau_p = 0.90`, `tau_delta = 2.0`, `tau_a = 0.85`.
-
-> [!IMPORTANT]
-> After quantization/export, thresholds must be recalibrated (scores shift).
-
----
-
-## 7. Agentic Use (`spancall/agent/`)
+### 6.2 Lean Inference & Evaluation (`spancall/lean/`)
 
 | Module | Contract |
 | --- | --- |
-| [router.py](../spancall/agent/router.py) | `ToolCallRouter.route_turn(...)`; `RouterMode`, `IntegrationVariant` |
-| [loop.py](../spancall/agent/loop.py) | `BaseAgentLoop.run_task(...) -> ExecutionTrace` |
-| [trace.py](../spancall/agent/trace.py) | `StepTrace`, `ExecutionTrace`, `RoutingDecision` (telemetry shared by eval and shadow calibration) |
-| [backends/](../spancall/agent/backends) | `BaseLLMBackend`; `UniversalAPIBackend` (hosted), `LocalVLLMBackend` (local, native chat template) |
-| [tools/](../spancall/agent/tools) | `BaseToolEnvironment`: `execute`, `reset`, `evaluate_task_success`; `ToolExecutionResult` |
+| [decode.py](../spancall/lean/decode.py) | `LeanJointDecoder(BaseJointDecoder)`: equal-value probability aggregation (R4), top-K collapse, exclusivity-constrained DFS assignment + `joint_margin` |
+| [resolver.py](../spancall/lean/resolver.py) | `LeanResolver(BaseResolver)` + `LeanResolveResult(BaseResolveResult)`: single-pass multi-tool encoding reuse, softmax/sigmoid H1 gating (`call_min_prob`, `call_min_prob_ratio`, `tool_call_threshold`), `min_joint_margin` W2 gate, strict casting & schema validation |
+| [eval_p1.py](../spancall/lean/eval_p1.py) | `eval_param_extraction_lean`: Part-1 retrieval-first metrics (`extraction_recall`, `extraction_precision`, `candidate_parity`, `exact_payload_match_F`, `tool_acc`) |
+| [diagnostics.py](../spancall/lean/diagnostics.py) | `run_diagnostics`, `analyze_predictions`, `audit_gt_offsets` |
 
-**Modes (`RouterMode`)**
+---
 
-| Mode | Behavior |
+## 7. Agentic Use (`spancall/agent/`) — Version-Agnostic Boilerplate
+
+`spancall/agent/` depends **only** on `BaseResolver` and `BaseResolveResult` (`spancall/infer/base.py`), never on a specific version's model internals. Any new resolver version fits in by subclassing `BaseResolver`.
+
+| Module | Contract |
 | --- | --- |
-| `llm_only` | B0, normal agent |
-| `spancall_only` | Diagnostic fast path only |
-| `router` | System S: SpanCall first, LLM fallback |
-| `shadow` | LLM answers; SpanCall runs and is logged for comparison/calibration |
-
-**Integration variants (`IntegrationVariant`)**
-
-| Variant | Behavior |
-| --- | --- |
-| `s_skip` | Hit replaces the LLM call (default) |
-| `s_inject` | Hit call and tool result inserted into history as if the LLM made it (keeps history format consistent) |
-| `s_hint` | On abstain, pass partial spans to the LLM (optional, beyond the all-or-nothing scope) |
-
-The fallback path always uses the LLM's **unchanged** native chat template.
+| [router.py](../spancall/agent/router.py) | `ToolCallRouter(resolver: BaseResolver, llm_backend: BaseLLMBackend, mode, variant)` |
+| [loop.py](../spancall/agent/loop.py) | `BaseAgentLoop`, `ReActAgentLoop.run_task(...) -> ExecutionTrace` |
+| [context.py](../spancall/agent/context.py) | `select_recent_context` (token-budgeted recent history selection shared with `tensorize.py` and `resolver.py`) |
+| [trace.py](../spancall/agent/trace.py) | `StepTrace`, `ExecutionTrace`, `RoutingDecision` |
+| [backends/](../spancall/agent/backends) | `BaseLLMBackend`; `UniversalAPIBackend` (LiteLLM/OpenAI), `LocalVLLMBackend` (local, native chat template) |
+| [tools/](../spancall/agent/tools) | `BaseToolEnvironment`: `execute`, `reset`, `evaluate_task_success`; `MockBookingEnvironment` |
 
 ---
 
 ## 8. Evaluation (`spancall/eval/`)
 
-### 8.1 Offline tool-call eval (`eval/toolcall/`)
-
-`BaseToolCallEvaluator.evaluate(...) -> ToolCallMetrics`, plus `compute_risk_coverage_curve`.
-
-Reported on **stratum F**, **A**, and **all**:
-- Tool accuracy, per-param accuracy, exact payload match.
-- **Hit rate**, **precision-at-hit**, **false-hit rate on A**, abstain-reason breakdown.
-- Error taxonomy: wrong tool / wrong value / entity swap / duplicate span / date misparse / extra or missing call.
-- Risk-coverage curves, calibration (ECE), slices: ID vs OOD-schema vs OOD-paraphrase vs adversarial.
-- Baselines B0/B1 on the **same records**, plus "LLM on only the SpanCall-hit subset".
-
-### 8.2 Agent eval (`eval/agentic/`)
-
-`BaseAgentEvaluator.evaluate_agent(loop, tasks, num_seeds) -> (AgentMetrics, traces)`.
-
-| Axis | Metrics |
-| --- | --- |
-| Task quality | task success (end-state check), per-step call accuracy, turns/task, recovery after bad call |
-| Efficiency | LLM calls saved, tokens, latency p50/p95, FLOPs, cost |
-| Safety | wrong-hit rate, side-effecting errors |
-| Routing | fast-path share, hit rate by tool/turn |
-
-### 8.3 Agent + tool span vs normal agent ([compare.py](../spancall/eval/compare.py))
-
-`ComparativeEvaluator.compare(normal_traces, spancall_traces) -> ComparativeStudyResult`
-
-Protocol: same LLM, tools and tasks; only the router differs. >= 3 seeds, **paired** per-task comparison, bootstrap CIs, **non-inferiority test** on task success (default margin 2 pts) while reporting cost reduction.
-
-### 8.4 Cost model ([cost.py](../spancall/eval/cost.py))
-
-`E[cost] = c_s + (1-h)·c_L + h(1-p)(c_w + c_L)`; `CostModel.theoretical_expected_cost` and `compute_break_even_hit_rate`. Measured savings are validated against this formula.
+1. **Part 1 — Lean retrieval & tool metrics ([`spancall/lean/eval_p1.py`](../spancall/lean/eval_p1.py) + [`diagnostics.py`](../spancall/lean/diagnostics.py)):**
+   - Separates model quality on offered candidates from serve-time candidate parity (`candidate_parity`, `extraction_recall`, `extraction_precision`, `exact_payload_match_F`).
+2. **Part 3 — Offline end-to-end tool-call eval ([`spancall/eval/toolcall/`](../spancall/eval/toolcall/evaluator.py)):**
+   - `BaseToolCallEvaluator` / `ToolCallEvaluator`: stratified metrics (`F`, `A`, `all`), 7-bucket error taxonomy, risk-coverage curve, ECE, and `B1aBaseline`.
+3. **Comparative agent eval ([`spancall/eval/agentic/`](../spancall/eval/agentic/evaluator.py), [`compare.py`](../spancall/eval/compare.py), [`cost.py`](../spancall/eval/cost.py)):**
+   - `MultiSeedAgentEvaluator`, `ComparativeEvaluator` (paired bootstrap CIs, non-inferiority test), and `CostModel`.
 
 ---
 
-## 9. Experiments
-
-Full ledger with hypotheses and gates: [experiments.md](experiments.md).
-
-| Group | IDs | Focus |
-| --- | --- | --- |
-| Model ceiling and gate | E1-E5 | Pointer accuracy, precision gating, swap negatives, `Delta_joint`, OOD generalization |
-| Cost and safety | E6-E8 | Latency/FLOPs, stratum-A false hits, multi-schema selection |
-| Agent | E9-E11 | Non-inferiority, history consistency, context length |
-| Engineering | E12-E15 | Backbone, quantization, shadow-mode transfer, head ablations |
-
-**Kill criteria (floors — deliberately below the success gates of §5.3/experiments.md, so a "passed gate" result and a "killed" result can never overlap):**
-
-| Experiment | Success gate (proceed) | Kill floor (stop) |
-| --- | --- | --- |
-| E1 (pointer ceiling on F) | exact payload >= 90% | E1 < 80% |
-| E2 (precision gating) | >= 95% precision-at-hit at coverage >= 60% of F | cannot reach >= 95% precision at **any** coverage >= 40% of F |
-
-Behavior: a result between the gate and the floor is a **stalled experiment** — investigate before continuing. At or below the kill floor, stop and write up the negative result.
-
----
-
-## 10. CLI and Config
+## 9. CLI Entrypoints (`scripts/`)
 
 | Script | Purpose | Backing modules |
 | --- | --- | --- |
-| `scripts/prepare_data.py` | ingest, align, augment, split | `data/*` |
-| `scripts/train.py` | train model | `train/trainer.py`, `model/*` |
-| `scripts/calibrate.py` | temperature + threshold sweep | `train/calibrate.py` |
-| `scripts/eval_toolcall.py` | offline call-level eval | `eval/toolcall` |
-| `scripts/eval_agent.py` | agent vs normal agent | `eval/agentic`, `eval/compare.py`, `agent/*` |
-
-`configs/default.yaml` sections: `experiment`, `data`, `model`, `optimization`, `training`, `calibration`, `gate`, `agent`. Section → config-dataclass mapping (single source of truth is [`config.py`](../spancall/train/config.py) plus a YAML loader there):
-
-| YAML section | Config dataclass | Notes |
-| --- | --- | --- |
-| `experiment` | `TrainingConfig` (name/seed/output_dir) | `seed` → `TrainingConfig.seed` |
-| `data` | `DatasetMixer` / `DataAugmenter` / schema split | digested by `data/*` |
-| `model` | `ModelConfig` | `backbone_name`, `head_dim`, `max_seq_len`, `max_span_width`, `dropout` |
-| `optimization` | `OptimizationConfig` | includes `batch_size`, `num_epochs`, `mixed_precision` owned here (they are training-loop params), plus `learning_rate_encoder`, `learning_rate_head`, `weight_decay`, `warmup_ratio` |
-| `training` | `TrainingConfig` | `gradient_accumulation_steps`, `checkpoint_every_n_steps`, `output_dir`, `seed` |
-| `calibration` | `CalibrationConfig` | `target_precision`, `confidence_level`, `temperature_scaling` |
-| `gate` | `ConjunctionGate` | `tau_p`, `tau_delta`, `tau_a` |
-| `agent` | `ToolCallRouter` / `BaseAgentLoop` | `mode`, `integration`, `llm_model`, `max_turns` |
-
-Install/run: `pip install -e .[dev]`; tests: `PYTHONPATH=. python -m unittest discover -s tests`.
-
----
-
-## 11. Implementation Roadmap
-
-| Phase | Deliverable | Est. |
-| --- | --- | --- |
-| P0 | Boilerplate, configs, record schema (**done**) → **Phase-0 promotion:** E0 traffic probe ([`scripts/probe.py`](../scripts/probe.py), D7) + template fixes D1–D3 + config defaults D4–D5 | - |
-| P1 | Loaders + aligner + F/A stats | 1 wk |
-| P2 | Train T0-T2; E1; B0/B1 offline harness | 1-1.5 wk |
-| P3 | Decode/cast/validate/gate + calibration; E2-E5 | 1 wk |
-| P4 | Agent loop, router, shadow mode, mock tool envs | 1 wk |
-| P5 | Agentic eval E7, E9-E11; cost E6 | 1 wk |
-| P6 | Ablations, quantization, write-up | 1 wk |
-
-## 12. Research Hygiene
-
-- Frozen test sets; calibration set never trains; schemas disjoint across splits.
-- Every number traces to `results/<run_id>/` (config + seed + checkpoint hash).
-- >= 3 seeds for reported results.
-- Tests implemented: golden render/parse (``span_template/test_template.py``), imports/exports canary (``tests/test_boilerplate.py``).
-- Tests pending (boilerplate status): alignment, caster, gate invariants, chat-template round trip, shuffle-invariance — tracked in §2 layout tree.
-
-## 13. Open Decisions
-
-1. Base LLM(s) for the agent comparison (e.g. Gemma 4 plus a hosted model).
-2. Agentic benchmark: tau-bench, BFCL multi-turn, ToolSandbox, or custom mock environments.
-3. Compute budget (GPUs; vLLM serving).
-4. Whether to explore `s_hint`, or stay strictly all-or-nothing.
+| `scripts/prepare_data.py` | Ingest, align, augment, schema-disjoint split | `spancall/data/*` |
+| `scripts/realign_v2.py` | Re-align splits with `build_input_multi` + `utt_rel_*` + template stamp & gate | `spancall/data/align.py`, `span_template/stamp.py` |
+| `scripts/probe.py` | E0 traffic & groundability probe | `span_template/*` |
+| `scripts/train_lean.py` | Train `LeanSpanCallModel` with `LeanTrainer` | `spancall/lean/*`, `spancall/model/*` |
+| `scripts/eval_toolcall.py` | Offline Part-3 tool-call evaluation & B1a baseline | `spancall/eval/toolcall/*` |
+| `scripts/eval_agent.py` | Comparative agent evaluation (B0 vs S via `BaseResolver` / `LeanResolver`) | `spancall/eval/agentic/*`, `spancall/agent/*` |
+| `scripts/build_lean_v2_colab_notebook.py` | Generate `notebooks/spancall_lean_v2_train_eval.ipynb` with AST cell-scope guard | `notebooks/` |

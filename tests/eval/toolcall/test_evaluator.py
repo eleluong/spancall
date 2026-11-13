@@ -1,6 +1,6 @@
 """Tests for the offline tool-call evaluator (plan §4.2).
 
-Covers (docs/full_implementation_plan.md §4.2, docs/pipeline_io.md Q3–Q9):
+Covers (docs/pipeline_io.md Q3–Q9):
 
 * ``payload_equal`` — numeric normalization (5 == 5.0), optional-default
   materialization from schema, key-set mismatch, nested lists/dicts.

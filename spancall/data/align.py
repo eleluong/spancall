@@ -1,6 +1,6 @@
 """Reverse alignment of ground-truth call arguments against candidate spans and contexts.
 
-Ref: docs/mechanism.md §8.1, docs/full_implementation_plan.md §2.1.
+Ref: docs/mechanism.md §8.1.
 Identifies whether all arguments can be grounded (Stratum F) or requires
 abstention (Stratum A), and emits **multi-positive** :class:`SpanTarget` labels
 per parameter (R4: every equal-valued candidate — e.g. a `<|ctx_time|>` date entry
@@ -146,38 +146,6 @@ def _resolve_base_date(sample: UnifiedSample, gt_dates: Sequence[date]) -> Tuple
     return base, base.isoformat()
 
 
-def _candidate_weekday_delta(utterance: str, base: date) -> Optional[int]:
-    """If the utterance contains ``this_<dow>`` / ``next_<dow>`` resolve the
-    delta applied to ``base`` that the time window would emit, else None.
-
-    ``this_<dow>`` maps to ``(target - base.isoweekday()) % 7``; ``next_<dow>``
-    is strictly future (1..7 days), mirroring ``span_template.template._weekday``.
-    Returns None when no weekday idiom is present.
-    """
-    m = _WEEKDAY_TOKEN_RE.search(utterance.lower())
-    if not m:
-        return None
-    prefix, _, name = m.group(0).partition("_")
-    target = _WEEKDAY_NAMES[name]
-    delta = (target - base.isoweekday()) % 7
-    if prefix == "next" and delta == 0:
-        delta = 7
-    return delta
-
-
-def _is_colliding_gt_date(gt: Any, base: date, idiom_delta: Optional[int]) -> bool:
-    """Whether a GT value is plausibly a relative idiom anchored to ``base``.
-
-    Used only to choose the priority order of the time-window collision search:
-    when the utterance says ``tomorrow`` and the GT date equals ``base + 1`` we
-    prefer the idiom entry even though it collides with the ``+1d`` offset entry.
-    """
-    day = _parse_iso_datetime(gt)
-    if day is None or idiom_delta is None:
-        return False
-    return (day - base).days == idiom_delta
-
-
 def _resolve_gt_dates(gt_call: GroundTruthCall) -> List[date]:
     out: List[date] = []
     for v in (gt_call.arguments or {}).values():
@@ -216,9 +184,6 @@ def _date_from_relative(entry: Any, base: date) -> Optional[int]:
 # ---------------------------------------------------------------------------
 # Utility: utterance word-boundary matching (Case E)
 # ---------------------------------------------------------------------------
-
-_UNBOUNDED_RE = re.compile(r"[^\s,.;:!?\"'()\[\]{}<>]+$")
-
 
 def _word_bounded_matches(text: str, needle: str) -> List[Tuple[int, int]]:
     """All non-overlapping, word-bounded occurrences of ``needle`` in ``text``.
@@ -590,7 +555,7 @@ class ReverseAligner(BaseAligner):
         ``template_multi.jinja`` via ``build_input_multi``, which EMITS that
         line. So every addressed target was shifted by the anchor's length
         (9 chars) plus any template-revision drift — the measured +29..+43
-        offset rot (docs/lean_eval_diagnosis_walkthrough.md §3).
+        offset rot (the stale-offset defect fixed by the v2 aligner).
 
         v2 renders the multi grammar for the target tool. That removes the
         structural ``<|none|>`` bias and keeps this legend byte-comparable

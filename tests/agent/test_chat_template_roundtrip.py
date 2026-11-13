@@ -166,7 +166,7 @@ def test_q9_1_loop_s_inject_history_round_trips_through_template() -> None:
 
     class StubResolver:
         def try_resolve_candidates(self, *a: Any, **k: Any) -> Any:
-            from spancall.infer.resolver import ResolveResult
+            from spancall.infer.base import ResolveResult
 
             return ResolveResult(
                 hit=True,

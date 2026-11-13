@@ -1,6 +1,6 @@
 """Validation diagnostics for the Lean retrieval-first fast path.
 
-Ref: ``docs/param_extraction_eval_coverage.md``, ``docs/param_recall_diagnosis.md``
+Ref: ``docs/param_extraction_eval_coverage.md``
 
 Part 1 (:mod:`spancall.lean.eval_p1`) reports *headline* numbers. This module
 answers the follow-up question a low headline always raises — **why** — with
@@ -59,11 +59,10 @@ import json
 import math
 import os
 from collections import Counter, defaultdict
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from spancall.data.schema import UnifiedSample
 from spancall.lean.eval_p1 import (
-    EXTRACTABLE_TARGET_TYPES,
     _gt_params,
     norm_value,
     param_is_groundable,

@@ -1,31 +1,25 @@
-"""Training and calibration subpackage."""
+"""Training config and shareable trainer/calibrator boilerplate."""
 
+from spancall.train.base import BaseCalibrator, BaseTrainer, CosineWarmupSchedule
 from spancall.train.config import (
+    AgentConfig,
     CalibrationConfig,
     DataConfig,
-    GateConfig,
     ModelConfig,
     OptimizationConfig,
+    RecentConfig,
     TrainingConfig,
 )
-from spancall.train.trainer import (
-    BaseTrainer,
-    CosineWarmupSchedule,
-    SpanCallTrainer,
-    build_parameter_groups,
-)
-from spancall.train.calibrate import BaseCalibrator
 
 __all__ = [
+    "AgentConfig",
     "BaseCalibrator",
     "BaseTrainer",
     "CalibrationConfig",
     "CosineWarmupSchedule",
     "DataConfig",
-    "GateConfig",
     "ModelConfig",
     "OptimizationConfig",
-    "SpanCallTrainer",
+    "RecentConfig",
     "TrainingConfig",
-    "build_parameter_groups",
 ]

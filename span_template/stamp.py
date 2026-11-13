@@ -1,4 +1,4 @@
-"""Template provenance stamping (Treatise S6 of docs/lean_eval_diagnosis_walkthrough.md).
+"""Template provenance stamping (S6: template-hash stamp).
 
 Why this exists
 ---------------

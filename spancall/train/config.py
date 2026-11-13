@@ -2,9 +2,9 @@
 
 Design rule 4: an experiment = YAML + seed. ``TrainingConfig.from_yaml`` loads
 the YAML sections (``model``, ``data``, ``optimization``, ``training``,
-``experiment``, ``calibration``, ``gate``) into the dataclasses below; unknown
+``experiment``, ``calibration``) into the dataclasses below; unknown
 keys anywhere are tolerated so configs stay forward-compatible. See
-docs/experiments.md and docs/architecture.md for the section mapping.
+docs/architecture.md for the section mapping.
 """
 
 from __future__ import annotations
@@ -23,54 +23,20 @@ def _known_kwargs(cls: Type[_T], d: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 @dataclass
-class HeadsConfig:
-    """Which prediction heads are constructed (docs/remediation_plan.md D4).
-
-    v1 minim head set: H1 (tool) + H3 (pointer) + H4 (abstain_reason) + H8
-    (correctness) + the call-accept head. H2/H5/H6/H7 stay **spec-only** and are
-    constructed only when the flag is true (and the code path exists).
-    """
-
-    tool: bool = True            # H1 — candidate tool scoring (no-op if 1 tool)
-    count: bool = False          # H2 — call-count (spec-only; gates multi-call)
-    pointer: bool = True         # H3 — boundary-factorized span pointer
-    abstain_reason: bool = True  # H4 — abstain-reason classes
-    source: bool = False         # H5 — source head (spec-only)
-    list_size: bool = False      # H6 — list-size head (spec-only)
-    swap: bool = False           # H7 — swap/exclusivity head (spec-only)
-    correctness: bool = True     # H8 — learned confidence
-
-    def enabled(self) -> Tuple[str, ...]:
-        """Return names of heads enabled by this config (H flags)."""
-        return tuple(k for k, v in vars(self).items() if v)
-
-    @classmethod
-    def from_mapping(cls, d: Mapping[str, Any]) -> "HeadsConfig":
-        """Build from the YAML ``model.heads`` section; missing keys keep defaults."""
-        return cls(**{k: bool(v) for k, v in _known_kwargs(cls, d).items()})
-
-
-@dataclass
 class ModelConfig:
-    # Phase 2 backbone (long_context_fix.md): Qwen3-0.6B embedding model with a
-    # 32k window, run bidirectional (encoder is_causal=False). max_seq_len is the
+    # Qwen3-0.6B embedding model with a 32k window, run bidirectional
+    # (encoder is_causal=False). max_seq_len is the
     # resolver/trainer guard derived from the backbone — no hardcoded 512 cap.
     backbone_name: str = "Qwen/Qwen3-Embedding-0.6B"
     head_dim: int = 256
     max_seq_len: int = 32768
     max_span_width: int = 16
     dropout: float = 0.1
-    heads: HeadsConfig = field(default_factory=HeadsConfig)
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> "ModelConfig":
         """Build from the YAML ``model`` section; missing keys keep defaults."""
-        known = _known_kwargs(cls, d)
-        heads = known.pop("heads", None)
-        cfg = cls(**known) if known else cls()
-        if isinstance(heads, dict):
-            cfg.heads = HeadsConfig.from_mapping(heads)
-        return cfg
+        return cls(**_known_kwargs(cls, d))
 
 
 @dataclass
@@ -84,7 +50,6 @@ class OptimizationConfig:
     batch_size: int = 64
     num_epochs: int = 4
     mixed_precision: str = "bf16"
-    abstain_weight: float = 1.0   # B2/H-T2: abstain column loss weight (0.5 de-collapses)
     max_pos: int = 3              # T3: positive slots per param (1 = top-1 only)
 
     # ---- Optimizer / schedule / batching (measured on the 0.2-fraction runs) --
@@ -141,34 +106,10 @@ class CalibrationConfig:
     temperature_scaling: bool = True
     param_margin_min: float = 0.0
     joint_margin_min: float = 0.0
-    mode: str = "single_tau"  # single_tau | conjunction — mirrors GateConfig
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> "CalibrationConfig":
         """Build from the YAML ``calibration`` section; missing keys keep defaults."""
-        return cls(**_known_kwargs(cls, d))
-
-
-@dataclass
-class GateConfig:
-    """Whole-call gate thresholds and mode (docs/remediation_plan.md D4).
-
-    ``mode`` selects the gate implementation in infer/gate.py:
-      - ``single_tau`` (v1 default): hit <=> min_k p_k >= tau_p AND accept >= tau_a
-        AND validate(). The joint-margin (tau_delta) is dropped from the v1
-        decision — it becomes a calibration signal, and the 8-feature conjunction
-        is kept as an ablation (``conjunction``).
-      - ``conjunction``: the calibrated conjunction baseline (8-feature).
-    """
-
-    mode: str = "single_tau"     # single_tau | conjunction
-    tau_p: float = 0.90
-    tau_delta: float = 2.0       # joint margin — used only in conjunction mode
-    tau_a: float = 0.85
-
-    @classmethod
-    def from_dict(cls, d: Mapping[str, Any]) -> "GateConfig":
-        """Build from the YAML ``gate`` section; missing keys keep defaults."""
         return cls(**_known_kwargs(cls, d))
 
 
@@ -184,7 +125,7 @@ class RecentConfig:
 
 @dataclass
 class DataConfig:
-    """Data-pipeline knobs (docs/remediation_plan.md D5).
+    """Data-pipeline knobs.
 
     ``pack_tools`` is the FLOOR on the number of candidate tools rendered into
     one input (``build_input_multi``, T anchor blocks). The Lean pipeline always
@@ -207,10 +148,9 @@ class DataConfig:
 
     ``fraction`` (default 1.0): the fraction of each tensorized split used by
     the trainer. Applied deterministically (seeded by ``experiment.seed``) in
-    :meth:`spancall.train.trainer.SpanCallTrainer.load_rows`, so it scales
+    :meth:`spancall.lean.trainer.LeanTrainer.load_rows`, so it scales
     **training and dev/calib evaluation together** — set ``data.fraction: 0.2``
-    to smoke-test the whole pipeline end-to-end on 20% of the data (see
-    ``configs/verify20.yaml``).
+    to smoke-test the whole pipeline end-to-end on 20% of the data.
 
     ``max_calls`` / ``call_min_prob`` / ``call_min_prob_ratio`` (Phase J5 /
     R0.4) are forwarded to :class:`spancall.lean.resolver.LeanResolver`. They
@@ -224,8 +164,6 @@ class DataConfig:
 
     pack_tools: int = 1
     fraction: float = 1.0
-    train_f_ratio: float = 0.0   # H-T2: target F:(A) ratio in trainer subsample
-                                 # (0 = old pure-random fraction subsample)
     # R1c: per-row floor drawn uniformly from [jitter_min_tools, pack_tools]
     # inclusive; pack_tools is the CEILING of that draw (see class docstring).
     jitter_pack_tools: bool = True
@@ -268,24 +206,17 @@ class TrainingConfig:
     agent: AgentConfig = field(default_factory=AgentConfig)
     optimization: OptimizationConfig = field(default_factory=OptimizationConfig)
     calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
-    gate: GateConfig = field(default_factory=GateConfig)
     gradient_accumulation_steps: int = 1
     seed: int = 42
     output_dir: str = "results"
-    checkpoint_every_n_steps: int = 500
     experiment_name: str = "span_call"
     data_dir: str = "data/processed"
     # ---- VRAM levers (notebook-friendly; all default OFF so existing
     # ---- configs/behavior are unchanged unless explicitly enabled) ----------
     gradient_checkpointing: bool = False   # backbone.gradient_checkpointing_enable
     freeze_encoder_stages: List[str] = field(default_factory=list)  # e.g. ["T0", "T1"]
-    use_8bit_optimizer: bool = False       # bitsandbytes PagedAdamW8bit (falls back if absent)
-    stop_on_gate_kill: bool = False        # abort the curriculum after T1 when the E1 gate says KILL (<0.80)
     eval_splits: List[str] = field(default_factory=list)  # A6: per-epoch held-out evaluation splits
     eval_limit: int = 500                  # row cap per eval split to keep epoch wall-time bounded
-    resolver_eval_split: str = ""          # E2E-hook: raw-mode resolver eval split ("" = disabled)
-    resolver_eval_limit: int = 40          # row cap for the resolver e2e hook
-    resolver_factory: Any = None           # callable(out_ckpt_dir) -> SpanCallResolver (injected)
     # ---- LoRA ablation (T10; default OFF so nothing changes unless asked) -----
     # Motivation (investigation §10.3): at the 0.2 data fraction only the two
     # heads were effectively being trained and the frozen encoder could never
@@ -309,14 +240,13 @@ class TrainingConfig:
         """Load a full training config from YAML (design rule 4:  experiment = YAML + seed).
 
         Section mapping:
-          - ``model``        -> ModelConfig (heads via ``model.heads``)
+          - ``model``        -> ModelConfig
           - ``data``         -> DataConfig (pack_tools via ``data.pack_tools``)
           - ``agent``        -> AgentConfig
           - ``optimization`` -> OptimizationConfig
-          - ``training``     -> gradient_accumulation_steps / checkpoint_every_n_steps
+          - ``training``     -> gradient_accumulation_steps / VRAM + LoRA + eval knobs
           - ``experiment``   -> seed / output_dir
           - ``calibration``  -> CalibrationConfig
-          - ``gate``         -> GateConfig (mode via ``gate.mode``)
 
         Unknown keys anywhere are ignored; missing keys keep the dataclass
         defaults. Uses ``dataclasses.replace`` over a default instance so a
@@ -337,24 +267,14 @@ class TrainingConfig:
             agent=AgentConfig.from_dict(data.get("agent") or {}),
             optimization=OptimizationConfig.from_dict(data.get("optimization") or {}),
             calibration=CalibrationConfig.from_dict(data.get("calibration") or {}),
-            gate=GateConfig.from_dict(data.get("gate") or {}),
             gradient_accumulation_steps=training.get(
                 "gradient_accumulation_steps", cfg.gradient_accumulation_steps
-            ),
-            checkpoint_every_n_steps=training.get(
-                "checkpoint_every_n_steps", cfg.checkpoint_every_n_steps
             ),
             gradient_checkpointing=bool(
                 training.get("gradient_checkpointing", cfg.gradient_checkpointing)
             ),
             freeze_encoder_stages=list(
                 training.get("freeze_encoder_stages", cfg.freeze_encoder_stages) or []
-            ),
-            use_8bit_optimizer=bool(
-                training.get("use_8bit_optimizer", cfg.use_8bit_optimizer)
-            ),
-            stop_on_gate_kill=bool(
-                training.get("stop_on_gate_kill", cfg.stop_on_gate_kill)
             ),
             eval_splits=list(
                 training.get("eval_splits")
@@ -363,13 +283,6 @@ class TrainingConfig:
                 or cfg.eval_splits
             ),
             eval_limit=int(training.get("eval_limit", cfg.eval_limit)),
-            resolver_eval_split=str(
-                training.get("resolver_eval_split", cfg.resolver_eval_split) or ""
-            ),
-            resolver_eval_limit=int(
-                training.get("resolver_eval_limit", cfg.resolver_eval_limit)
-            ),
-            resolver_factory=cfg.resolver_factory,
             use_lora=bool(training.get("use_lora", cfg.use_lora)),
             lora_r=int(training.get("lora_r", cfg.lora_r)),
             lora_alpha=int(training.get("lora_alpha", cfg.lora_alpha)),

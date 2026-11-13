@@ -1,6 +1,6 @@
 """Data augmentation strategies for SpanCall training robustness.
 
-Ref: docs/mechanism.md §8.3, §8.4; docs/full_implementation_plan.md §2.2.
+Ref: docs/mechanism.md §8.3, §8.4.
 Generates controlled `UnifiedSample` variants from an *aligned* sample:
 
 1. **Structural order shuffling** (`shuffle_f`): permute ``tool.parameters``,
@@ -28,15 +28,11 @@ from __future__ import annotations
 import hashlib
 import random
 from dataclasses import replace
-from datetime import date
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
-from span_template.template import RecentRow, build_input
 from spancall.data.align import (
     ReverseAligner,
-    _find_utterance_entry,
     _word_bounded_matches,
-    tooldef_to_template_tool,
 )
 from spancall.data.base import BaseAugmenter
 from spancall.data.schema import (

@@ -14,6 +14,8 @@ import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from spancall.infer.base import BaseJointDecoder
+
 
 @dataclass
 class LeanValueChoice:
@@ -103,7 +105,7 @@ def _coerce_entry(entry: Any) -> _Cand:
     return _Cand(value=obj, score=score)
 
 
-class LeanJointDecoder:
+class LeanJointDecoder(BaseJointDecoder):
     """Lean joint decoder with R4 aggregation and resilient greedy fallback."""
 
     def __init__(

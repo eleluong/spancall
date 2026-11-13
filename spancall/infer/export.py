@@ -6,7 +6,6 @@ Ref: docs/mechanism.md §10.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Optional
 
 
 class BaseExporter(ABC):

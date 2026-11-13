@@ -45,7 +45,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import shutil
 import sys
 from pathlib import Path
@@ -57,7 +56,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from spancall.data.align import ReverseAligner
 from spancall.data.partition import _enum_aware_default, sample_to_dict
 from spancall.data.schema import UnifiedSample
-from span_template.stamp import STAMP_FILENAME, check_stamp, write_stamp
+from span_template.stamp import check_stamp, write_stamp
 
 #: Splits the Lean flow reads. ``prepare_report.json`` is copied verbatim so the
 #: v2 directory is self-describing (same pack_tools/seed provenance as v1).

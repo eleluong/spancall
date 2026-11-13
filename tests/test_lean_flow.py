@@ -16,7 +16,7 @@ from spancall.data.schema import (
     ToolDefinition,
     UnifiedSample,
 )
-from spancall.infer.resolver import FakeTokenizer
+from spancall.infer.base import FakeTokenizer
 from spancall.lean.decode import LeanJointDecoder
 from spancall.data.align import tooldef_to_template_tool
 from spancall.lean.eval_p1 import (
@@ -43,7 +43,6 @@ from spancall.lean.tensorize import (
     LeanBatchCollate,
     ToolPool,
     _snap_token_range,
-    convert_legacy_batch_to_lean,
     jitter_pack_tools,
     tensorize_sample_lean,
 )
@@ -202,24 +201,6 @@ def test_decode_calls_single_call_matches_decode_detailed() -> None:
     assert calls[0].values == values
     assert calls[0].delta == delta
     assert calls[0].n_nodes == n_nodes
-
-
-def test_convert_legacy_batch_to_lean_and_idempotency() -> None:
-    # Legacy batch: 0 = abstain, 1 = cand 0, 2 = cand 1, -1 = pad
-    legacy_pos = torch.tensor([
-        [[0, -1], [1, 2]],
-        [[-1, -1], [3, -1]],
-    ])
-    batch = {"pos_indices": legacy_pos}
-    lean_batch = convert_legacy_batch_to_lean(batch)
-    expected = torch.tensor([
-        [[-1, -1], [0, 1]],
-        [[-1, -1], [2, -1]],
-    ])
-    assert torch.equal(lean_batch["pos_indices"], expected)
-    # Calling convert_legacy_batch_to_lean a second time must be a no-op (not subtract 1 again!)
-    lean_batch_2 = convert_legacy_batch_to_lean(lean_batch)
-    assert torch.equal(lean_batch_2["pos_indices"], expected)
 
 
 def test_tensorize_sample_lean() -> None:
@@ -447,25 +428,23 @@ def test_lean_trainer_load_rows_filters_empty_abstain(tmp_path) -> None:
     import json
 
     t2_path = tmp_path / "t2.jsonl"
-    # Row 1: legacy Stratum-F row (pos_indices has 2 -> becomes 1 in Lean)
+    # Row 1: Lean Stratum-F row (0-indexed pos_indices [[1, -1]])
     r_f = {
         "input_ids": [1, 2, 3, 4],
         "attention_mask": [1, 1, 1, 1],
         "param_positions": [1],
         "cand_starts": [[2, 3]],
         "cand_ends": [[2, 3]],
-        "pos_indices": [[2, -1]],
-        "accept_targets": 1.0,
+        "pos_indices": [[1, -1]],
     }
-    # Row 2: legacy Stratum-A row (pos_indices has only 0=abstain -> becomes -1 in Lean)
+    # Row 2: Lean unaligned row (pos_indices has only -1)
     r_a = {
         "input_ids": [1, 2, 3, 4],
         "attention_mask": [1, 1, 1, 1],
         "param_positions": [1],
         "cand_starts": [[2, 3]],
         "cand_ends": [[2, 3]],
-        "pos_indices": [[0, -1]],
-        "accept_targets": 0.0,
+        "pos_indices": [[-1, -1]],
     }
     with open(t2_path, "w", encoding="utf-8") as f:
         f.write(json.dumps(r_f) + "\n")
@@ -492,10 +471,9 @@ def test_lean_trainer_load_rows_filters_empty_abstain(tmp_path) -> None:
     trainer = LeanTrainer(model=model, config=cfg, device="cpu", use_amp=False)
 
     loaded = trainer.load_rows("t2")
-    # Only the Stratum-F groundable row should be retained, converted to 0-indexed pos_indices [[1, -1]]
+    # Only the Stratum-F groundable row should be retained
     assert len(loaded) == 1
     assert loaded[0]["pos_indices"] == [[1, -1]]
-    assert loaded[0]["_lean_converted"] is True
 
     # Full train(stages=("T2",)) over tmp_path
     summary = trainer.train(stages=("T2",))

@@ -2,7 +2,7 @@
 """CLI entrypoint for dataset ingestion, alignment, augmentation, mixing, and
 JSONL emission into the 7 canonical SpanCall splits.
 
-Pipeline (docs/full_implementation_plan.md §2 and docs/architecture.md §4.3):
+Pipeline (docs/architecture.md §4):
 
 1. Read ``data.sources`` from the YAML config — one entry per data source.
 2. For each ``hermes`` source entry, instantiate :class:`HermesLoader` per

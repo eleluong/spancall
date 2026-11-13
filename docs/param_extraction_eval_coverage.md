@@ -1,8 +1,8 @@
 # Param-Extraction: Retrieval-First Design Contract & Honest Metrics
 
 **Status:** ✅ **Implemented in the Lean flow** (L1, L2, E1, E2, E3) — tests green in [`tests/test_lean_flow.py`](../tests/test_lean_flow.py)
-**Scope:** Lean flow primarily ([`spancall/lean/`](../spancall/lean/)); eval issues still apply to the legacy notebook
-**Notebooks affected:** [`notebooks/spancall_train_eval_test.ipynb`](../notebooks/spancall_train_eval_test.ipynb), [`notebooks/spancall_lean_train_eval_test.ipynb`](../notebooks/spancall_lean_train_eval_test.ipynb)
+**Scope:** Lean flow ([`spancall/lean/`](../spancall/lean/))
+**Notebook:** [`notebooks/spancall_lean_v2_train_eval.ipynb`](../notebooks/spancall_lean_v2_train_eval.ipynb)
 
 ---
 
@@ -74,7 +74,7 @@ Current eval reports none of these cleanly: it blends (1) and (3) into one recal
 | E1 + E2 | [`eval_p1.py`](../spancall/lean/eval_p1.py) (`extraction_*`, `fast_path_*`, `refused_unextractable` / `missed_extractable`) |
 | E3 aligner tripwire | [`e3_aligner_violation()`](../spancall/lean/eval_p1.py) — surfaced as `e3_aligner_drift` / `e3_examples` in the eval metrics and printed by §5a |
 | Shared GT-param predicate (nulls included) | [`_gt_params()`](../spancall/lean/eval_p1.py) used by both coverage classification and the E3 tripwire |
-| Notebook surfacing | §3 tensorize summary + dev sanity audit + §5a cell in [`scripts/build_lean_colab_notebook.py`](../scripts/build_lean_colab_notebook.py) |
+| Notebook surfacing | §3 tensorize summary + dev sanity audit + §5a cell in [`scripts/build_lean_v2_colab_notebook.py`](../scripts/build_lean_v2_colab_notebook.py) |
 
 ### Fix L1 (loss): classify drop reasons, audit (b)/(c)
 

@@ -30,7 +30,7 @@ from spancall.agent.router import IntegrationVariant, RouterMode, ToolCallRouter
 from spancall.agent.tools.base import BaseToolEnvironment, ToolExecutionResult
 from spancall.agent.trace import ExecutionTrace, RoutingDecision
 from spancall.data.schema import ParameterSchema, ToolDefinition
-from spancall.infer.resolver import ResolveResult
+from spancall.infer.base import ResolveResult
 
 
 # --------------------------------------------------------------------------- #
@@ -478,14 +478,15 @@ def test_strict_type_caster_non_utterance_string_values() -> None:
 
 
 def test_resolver_10k_token_transcript_hit_or_abstain_never_crash() -> None:
-    """End-to-end SpanCallResolver with a >10k-token recent transcript budgets cleanly and never crashes."""
+    """End-to-end LeanResolver with a >10k-token recent transcript budgets cleanly and never crashes."""
     import torch
     import torch.nn as nn
-    from spancall.infer.resolver import SpanCallResolver
+    from spancall.lean.resolver import LeanResolver
 
     class TinyEncoder(nn.Module):
         def __init__(self) -> None:
             super().__init__()
+            self.hidden_dim = 8
             self.dummy = nn.Parameter(torch.zeros(1))
 
         def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
@@ -502,7 +503,7 @@ def test_resolver_10k_token_transcript_hit_or_abstain_never_crash() -> None:
         {"key": f"turn_{i}_tool", "value": f"Flight option FL-{i:04d} with detailed itinerary notes " + ("x" * 200)}
         for i in range(200)
     ]
-    resolver = SpanCallResolver(
+    resolver = LeanResolver(
         encoder=TinyEncoder(),
         max_seq_len=8192,
         context_budget_tokens=2048,

@@ -23,14 +23,14 @@ from spancall.agent.tools.base import BaseToolEnvironment
 from spancall.agent.tools.mock import MockBookingEnvironment
 from spancall.agent.trace import ExecutionTrace, RoutingDecision, StepTrace
 from spancall.data.schema import ToolDefinition
-from spancall.infer.resolver import ResolveResult
+from spancall.infer.base import ResolveResult
 
 
 # --------------------------------------------------------------------------- #
 # Fakes
 # --------------------------------------------------------------------------- #
 class FakeResolver:
-    """Stand-in for SpanCallResolver with a scripted sequence of outcomes."""
+    """Stand-in for a BaseResolver with a scripted sequence of outcomes."""
 
     def __init__(self, outcomes: List[ResolveResult]) -> None:
         self.outcomes = list(outcomes)

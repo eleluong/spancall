@@ -32,12 +32,11 @@ selectable target (or the optional <|null|> / <|unresolved|> handles it) — see
 
 from __future__ import annotations
 
-import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from jinja2 import Environment, FileSystemLoader
 
@@ -202,8 +201,7 @@ def build_time_window(
 ) -> List[TimeEntry]:
     """Deterministic <|ctx_time|> window (bounded, configurable — §3.1 R4).
 
-    `today`, `+kd` offsets, weekday entries, and a **closed idiom map** (D1,
-    docs/remediation_plan.md §3 D1): `tomorrow` (= `+1d`),
+    `today`, `+kd` offsets, weekday entries, and a **closed idiom map** (D1): `tomorrow` (= `+1d`),
     `day_after_tomorrow` (= `+2d`), `tonight` (= today's date, date-params only
     — a time-of-day value cannot be satisfied by any <|ctx_time|> date entry, so a
     datetime param abstains at the caster for it). Weekday tokens are
@@ -510,7 +508,7 @@ def tokenize_legend(
 
     ``max_len`` is the *optional* overflow cap. When ``None`` (the default) no
     tokenize-time cap is applied: the authoritative overflow guard is the
-    resolver's backbone-driven ``L_max`` (``SpanCallResolver._encode``), so the
+    resolver's backbone-driven ``L_max`` (``LeanResolver``), so the
     template layer never hardcodes a window (pipeline_io P6.6, long-context fix).
     """
     enc = tokenizer(output.text, return_offsets_mapping=True, add_special_tokens=False)
@@ -640,22 +638,3 @@ def gate_tool_call(
     if missing:
         return GateResult(hit=False, payload=payload, missing_required=missing, abstained=True)
     return GateResult(hit=True, payload=payload, abstained=False)
-
-
-# ---------------------------------------------------------------------------
-# Render-vs-spec consistency (proposal §3.1.1)
-# ---------------------------------------------------------------------------
-
-# The documented rendering contract (proposal §3.1.1) for the single-tool form.
-# Used by the spec-diff test to guarantee doc <> code never drift.
-RENDERING_CONTRACT: str = """<|cls|>
-<|tool|> {{ tool.name }} ({{ tool.description }})
-<|param|> {{ p.name }} ({{ p.description }})
-<|sep|>
-<|ctx_meta|> <|null|> | true | false | <|unresolved|>
-<|ctx_time|> today={{ iso }} | +1d={{ iso }} | ...
-<|sep|>
-{{ utterance }}
-<|sep|>
-<|ctx_recent|> key="quoted value" | ...
-<|eos|>"""

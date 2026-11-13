@@ -1,6 +1,6 @@
 """Offline tool-call evaluator.
 
-Ref: docs/full_implementation_plan.md §4.2, docs/pipeline_io.md Q3–Q9.
+Ref: docs/pipeline_io.md Q3–Q9.
 
 Implements ``ToolCallEvaluator(BaseToolCallEvaluator)``:
 
@@ -23,7 +23,7 @@ from __future__ import annotations
 from datetime import date, datetime
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from spancall.data.schema import GroundTruthCall, Stratum, UnifiedSample
 from spancall.eval.toolcall.metrics import ToolCallMetrics
@@ -630,10 +630,6 @@ class ToolCallEvaluator(BaseToolCallEvaluator):
             total += (len(members) / n) * abs(bin_conf - bin_acc)
         return float(total)
 
-    @staticmethod
-    def _sample_stratum(sample: UnifiedSample) -> Stratum:
-        return sample.stratum
-
 
 # --------------------------------------------------------------------------- #
 # B1a baseline: deterministic regex extraction over the identical legend
@@ -703,12 +699,3 @@ class B1aBaseline:
         if len(cands) == 1:
             return cands[0]
         return None
-
-
-# --------------------------------------------------------------------------- #
-# CLIs / iteration helpers
-# --------------------------------------------------------------------------- #
-
-
-def _iter_samples(samples: Sequence[UnifiedSample]) -> Iterator[UnifiedSample]:
-    yield from samples

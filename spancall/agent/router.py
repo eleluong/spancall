@@ -19,7 +19,7 @@ from spancall.agent.trace import RoutingDecision, StepTrace
 from spancall.data.schema import ToolDefinition
 
 if TYPE_CHECKING:
-    from spancall.infer.resolver import ResolveResult, SpanCallResolver
+    from spancall.infer.base import BaseResolver
 
 
 class RouterMode(str, Enum):
@@ -48,7 +48,7 @@ class ToolCallRouter:
 
     def __init__(
         self,
-        resolver: SpanCallResolver,
+        resolver: BaseResolver,
         llm_backend: BaseLLMBackend,
         mode: RouterMode = RouterMode.ROUTER,
         variant: IntegrationVariant = IntegrationVariant.S_SKIP,

@@ -1,6 +1,6 @@
 """Tests for the notebook build-time cell guard.
 
-``scripts/build_lean_colab_notebook.py`` emits each cell as its own Jupyter
+``scripts/build_lean_v2_colab_notebook.py`` emits each cell as its own Jupyter
 scope. ``nbformat.validate()`` only checks the JSON envelope, so a cell that
 *uses* a name it never imports ships to Colab and raises ``NameError`` on the
 first run — which is exactly how the ``cand_hist: Dict[int, int]`` bug reached
@@ -21,7 +21,7 @@ from typing import Any, Dict, List
 
 import pytest
 
-BUILD_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "build_lean_colab_notebook.py"
+BUILD_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "build_lean_v2_colab_notebook.py"
 
 
 def _load_guard():
@@ -146,9 +146,9 @@ def _ablation_cell_source() -> str:
     """Load the T10 ablation cell out of the generated notebook, if present."""
     import json
 
-    nb_path = Path(BUILD_SCRIPT).resolve().parents[1] / "notebooks" / "spancall_lean_train_eval_test.ipynb"
+    nb_path = Path(BUILD_SCRIPT).resolve().parents[1] / "notebooks" / "spancall_lean_v2_train_eval.ipynb"
     if not nb_path.exists():
-        pytest.skip("generated notebook missing; run scripts/build_lean_colab_notebook.py")
+        pytest.skip("generated notebook missing; run scripts/build_lean_v2_colab_notebook.py")
     nb = json.loads(nb_path.read_text(encoding="utf-8"))
     for c in nb.get("cells", []):
         src = c.get("source", "")

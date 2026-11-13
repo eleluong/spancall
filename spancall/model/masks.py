@@ -1,6 +1,6 @@
 """Candidate masks and constraint filtering (P4) for SpanCall.
 
-Ref: docs/mechanism.md §3.4, §5.2; docs/pipeline_io.md P4; full_implementation_plan §3.1.
+Ref: docs/mechanism.md §3.4, §5.2; docs/pipeline_io.md P4.
 Rules:
 - R8: Context token snapping (pointers only to valid entry bounds)
 - R9: Parameter-specific enum boundaries (prevent cross-enum bleeding)
@@ -64,18 +64,6 @@ class Candidate:
     region: str  # utterance | recent | time | enum | bool | null
     canon_value: Any
     entry_index: int = -1  # index into legend_entries, or -1 for regex-derived spans
-
-
-# ---------------------------------------------------------------------------
-# Legend entry shape (duck-typed: any object with these attrs is accepted)
-# ---------------------------------------------------------------------------
-
-_ENTRY_ATTRS = ("kind", "segment", "value", "char_start", "char_end",
-                "selectable", "key", "text", "tool")
-
-
-def _entry_like(e: Any) -> bool:
-    return all(hasattr(e, a) for a in _ENTRY_ATTRS)
 
 
 class TokenIndex:

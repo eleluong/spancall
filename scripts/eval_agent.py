@@ -32,13 +32,14 @@ from spancall.agent.backends.base import BaseLLMBackend
 from spancall.agent.backends.litellm_adapter import UniversalAPIBackend
 from spancall.agent.loop import ReActAgentLoop
 from spancall.agent.router import IntegrationVariant, RouterMode, ToolCallRouter
-from spancall.agent.tools.mock import MockBookingEnvironment, make_booking_tools
+from spancall.agent.tools.mock import MockBookingEnvironment
 from spancall.agent.trace import RoutingDecision
 from spancall.data.schema import ToolDefinition
 from spancall.eval.agentic.evaluator import MultiSeedAgentEvaluator
 from spancall.eval.compare import ComparativeEvaluator, ComparativeStudyResult
 from spancall.eval.cost import CostModel
-from spancall.infer.resolver import ResolveResult, SpanCallResolver
+from spancall.infer.base import BaseResolveResult, BaseResolver, NoOpResolver, ResolveResult
+from spancall.lean.resolver import LeanResolver
 
 
 # --------------------------------------------------------------------------- #
@@ -194,7 +195,7 @@ class DeterministicBackend(BaseLLMBackend):
 # --------------------------------------------------------------------------- #
 # Resolver construction
 # --------------------------------------------------------------------------- #
-class _ScriptedResolver(SpanCallResolver):
+class _ScriptedResolver(BaseResolver):
     """Checkpoint-free resolver that exercises the fast path on trajectory context.
 
     Hits ``search_flights`` from the utterance route on turn 0, and ``book_flight``
@@ -203,8 +204,14 @@ class _ScriptedResolver(SpanCallResolver):
     measurement of the learned model's hit-rate.
     """
 
-    def __init__(self) -> None:  # no model/encoder needed
-        super().__init__()
+    def try_resolve(
+        self,
+        schema: ToolDefinition,
+        utterance: str,
+        recent_context: Optional[List[Dict[str, Any]]] = None,
+        now: Optional[Any] = None,
+    ) -> BaseResolveResult:
+        return self.try_resolve_candidates([schema], utterance, recent_context=recent_context, now=now)
 
     def try_resolve_candidates(
         self,
@@ -239,27 +246,17 @@ def build_resolver(
     checkpoint: Optional[str],
     calib_thresholds: Optional[str],
     scripted: bool = False,
-) -> SpanCallResolver:
+) -> BaseResolver:
     if scripted:
         return _ScriptedResolver()
     if checkpoint:
-        return SpanCallResolver(
-            model_path=checkpoint,
+        return LeanResolver.from_checkpoint(
+            checkpoint_dir=checkpoint,
             calib_thresholds_path=calib_thresholds,
         )
     # No checkpoint: SpanCall abstains on everything, so the ROUTER behaves
     # exactly like the LLM baseline (a fully honest fast path that never hits).
-    class _EmptyResolver(SpanCallResolver):
-        def try_resolve_candidates(
-            self,
-            candidate_schemas: List[ToolDefinition],
-            utterance: str,
-            recent_context: Optional[List[Dict[str, Any]]] = None,
-            now: Optional[Any] = None,
-        ) -> ResolveResult:
-            return ResolveResult(hit=False, abstain_reason="no_checkpoint")
-
-    return _EmptyResolver()  # type: ignore[abstract]
+    return NoOpResolver(abstain_reason="no_checkpoint")
 
 
 # --------------------------------------------------------------------------- #
@@ -283,7 +280,7 @@ def _make_llm_backend(args: argparse.Namespace) -> BaseLLMBackend:
 
 def _make_router(
     backend: BaseLLMBackend,
-    resolver: SpanCallResolver,
+    resolver: BaseResolver,
     mode: str,
     variant: str,
 ) -> ToolCallRouter:

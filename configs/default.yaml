@@ -1,4 +1,4 @@
-# Default SpanCall Configuration Boilerplate
+# Default SpanCall (Lean flow) configuration
 
 experiment:
   name: "spancall_baseline"
@@ -6,12 +6,6 @@ experiment:
   output_dir: "results"
 
 data:
-  # H-T2 upgrade (validated in notebooks/spancall_experiment_verify.ipynb,
-  # spancall_verify_1k): the pointer collapsed to abstain because the default
-  # pipeline was ~85% Stratum-A and abstain_weight was 1.0. The F-heavy recipe
-  # (train_f_ratio > 0 and abstain_weight <= 0.5) de-collapses H3: trainer-dev
-  # exact_payload_match went 0.164 -> 0.761 and F-only param_recall 0.083 -> 0.150.
-  #
   # Multi-tool packing (build_input_multi, H1 over <|tool|> anchors) is now the
   # DEFAULT so H1 is actually trained against distractor candidate sets instead
   # of the old single-tool (pack_tools=1) path where tool_acc=1.0 was vacuous.
@@ -23,11 +17,6 @@ data:
   max_calls: 4
   call_min_prob: 0.25
   call_min_prob_ratio: 0.5
-  # F:Abstain mixing ratio for the trainer subsample. >0 forces F-heavy rows so
-  # H3 sees positive targets (train/fraction subsampling in
-  # SpanCallTrainer.load_rows keeps F rows first, then samples A to the ratio).
-  # 0 == old behavior (pure random fraction subsample).
-  train_f_ratio: 0.7
   recent:
     k_recent: 32
     context_budget_tokens: 4096
@@ -62,22 +51,15 @@ data:
     id_holdout_ratio: 0.10
 
 model:
-  # Phase 2 backbone: Qwen3-0.6B embedding model, 32k context window, run with
-  # bidirectional unmasked attention (encoder.is_causal=False, long_context_fix.md
-  # Phase 2). max_seq_len is now backbone-driven — this config value is the
-  # resolver/trainer's guard, NOT a hardcoded 512 cap. 32768 = the model's
-  # full window; the R6 recent-context budget (model.data.recent.*) manages
-  # what actually fills it.
+  # Qwen3-0.6B embedding model, 32k context window, run with bidirectional
+  # unmasked attention (encoder.is_causal=False). max_seq_len is the
+  # resolver/trainer's guard, NOT a hardcoded 512 cap; the recent-context
+  # budget (data.recent.*) manages what actually fills the window.
   backbone_name: "Qwen/Qwen3-Embedding-0.6B"
   head_dim: 256
   max_seq_len: 4096
   max_span_width: 16
   dropout: 0.1
-  # v1 minimal head set (D4): H1 (tool) + H3 (pointer) + H4 (abstain_reason) +
-  # H8 (correctness) + call-accept head. H2/H5/H6/H7 are spec-only and are
-  # constructed only when flipped on (docs/remediation_plan.md D4, heads.md).
-  heads: { tool: true, count: false, pointer: true, abstain_reason: true,
-           source: false, list_size: false, swap: false, correctness: true }
 
 optimization:
   learning_rate_encoder: 3.0e-5
@@ -110,22 +92,12 @@ optimization:
   early_stopping_patience: 1
   early_stopping_min_delta: 1.0e-4
   restore_best_on_exit: true
-  # H-T2: 0.5 (half the old 1.0) de-collapses the pointer — the single biggest
-  # measured lever (5.33->2.87 loss at 74 rows; F-only recall 0.083 baseline)
-  abstain_weight: 0.5
   # T3: keep only the top positive slot per param. Multi-positive (MAX_POS=3)
   # suppresses top-1 probability; MAX_POS=1 is the cheap ablation.
   max_pos: 1
 
 training:
   gradient_accumulation_steps: 1
-  checkpoint_every_n_steps: 500
-  # E2E-hook: run the raw-mode SpanCallResolver over a text split after each
-  # epoch to surface the train/serve skew (trainer-dev exact_payload_match ~0.76
-  # vs resolver e2e ~0.15). Path points at a UnifiedSample .jsonl (dev split);
-  # empty disables the hook.
-  resolver_eval_split: ""        # e.g. "dev" to enable
-  resolver_eval_limit: 40        # row cap (the 1K experiment used 40 dev rows)
 
 calibration:
   target_precision: 0.95
@@ -142,12 +114,6 @@ clock:
                                # guess: a caller with no known timezone must
                                # abstain on date params instead of calling
                                # local_today at all.
-
-gate:
-  mode: "single_tau"   # single_tau (v1 default, D4) | conjunction (ablation)
-  tau_p: 0.90
-  tau_delta: 2.0       # joint margin — used only in conjunction mode
-  tau_a: 0.85
 
 probe:                        # E0 traffic probe (D7)
   f_floor: 0.5                # provisional; derived from cost model: h_min / 0.6
