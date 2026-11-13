@@ -35,6 +35,8 @@ class ToolCallMetrics:
     hit_rate: float = 0.0
     precision_at_hit: float = 0.0
     false_hit_rate_on_a: float = 0.0  # Crucial safety check on stratum A
+    collapse_hits: int = 0
+    collapse_hit_rate: float = 0.0
 
     # Error taxonomy
     error_wrong_tool: int = 0

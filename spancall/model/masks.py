@@ -1046,6 +1046,40 @@ def _char_range_to_tokens(
     return (first, last)
 
 
+def classify_parity_miss(
+    param_schema: ParameterSchema,
+    cs: int,
+    ce: int,
+    ctx: _RowCtx,
+    max_span_width: int,
+) -> str:
+    """Attribute why an extractable GT char span ``(cs, ce)`` is absent from ``cand_masks``.
+
+    Returns one of:
+    - ``never_generated_entrysnap``: ``(cs, ce)`` does not snap onto valid token bounds.
+    - ``never_generated_width``: snapped span exceeds ``max_span_width`` on a free-string param.
+    - ``never_generated_typefilter``: param uses a restricted P4 type/regex/enum/bool filter.
+    - ``truncated``: span was eligible for generation but dropped by ``max_cands`` packing.
+    """
+    snapped = ctx.snap_char_range(int(cs), int(ce))
+    if snapped is None:
+        return "never_generated_entrysnap"
+    ts, te = int(snapped[0]), int(snapped[1])
+    ptype, _ = _normalize_param_type(param_schema.param_type)
+    enum_vals = set(param_schema.enum) if param_schema.enum else None
+    is_restricted = (
+        ptype == "boolean"
+        or (enum_vals is not None and ptype in ("string", "integer", "number"))
+        or ptype in ("date", "datetime", "time", "integer", "number",
+                     "email", "url", "phone", "id", "identifier", "uuid")
+    )
+    if is_restricted:
+        return "never_generated_typefilter"
+    if (te - ts + 1) > int(max_span_width):
+        return "never_generated_width"
+    return "truncated"
+
+
 # NOTE: the old module-level ``_entry_index`` (``legend_entries.index(entry)``,
 # O(E) whole-dataclass equality per candidate) and ``_entry_index_for_char``
 # (O(E) linear scan) were removed deliberately. Both are superseded by

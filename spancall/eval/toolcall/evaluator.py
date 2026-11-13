@@ -373,12 +373,37 @@ class ToolCallEvaluator(BaseToolCallEvaluator):
             gt_calls, pred_calls, sample
         )
 
+        # W0.2: pointer-collapse audit (strictly scoped to non-null utterance spans)
+        collapse_hit = False
+        if hit:
+            feats = pred.get("features") or {}
+            if feats.get("pointer_collapsed"):
+                collapse_hit = True
+            else:
+                params_dict = pred.get("parameters") or {}
+                span_counts: Dict[Tuple[int, int], int] = {}
+                for _pn, _pr in params_dict.items():
+                    if not isinstance(_pr, dict):
+                        continue
+                    if (
+                        _pr.get("source_type") == "utterance"
+                        and _pr.get("char_span") is not None
+                        and _pr.get("value") is not None
+                    ):
+                        _sp = _pr["char_span"]
+                        if isinstance(_sp, (list, tuple)) and len(_sp) >= 2:
+                            _key = (int(_sp[0]), int(_sp[1]))
+                            span_counts[_key] = span_counts.get(_key, 0) + 1
+                if any(c >= 2 for c in span_counts.values()):
+                    collapse_hit = True
+
         # gates (only meaningful when hit)
         gate_correct = bool(hit and correct)
         row = {
             "sample_id": sample.sample_id,
             "stratum": sample.stratum.value,
             "hit": hit,
+            "collapse_hit": collapse_hit,
             "status": status,
             "tool_name": tool_name,
             "gt_tool": gt_tool,
@@ -492,6 +517,8 @@ class ToolCallEvaluator(BaseToolCallEvaluator):
                 "hit_rate": 0.0,
                 "precision_at_hit": 0.0,
                 "false_hit_rate_on_a": 0.0,
+                "collapse_hits": 0.0,
+                "collapse_hit_rate": 0.0,
                 "partial_extraction_rate": 0.0,
                 "param_precision": 0.0,
                 "param_recall": 0.0,
@@ -507,12 +534,15 @@ class ToolCallEvaluator(BaseToolCallEvaluator):
         p_prec = (tot_corr / tot_pred) if tot_pred else 0.0
         p_rec = (tot_corr / tot_gt) if tot_gt else 0.0
         p_f1 = (2 * p_prec * p_rec / (p_prec + p_rec)) if (p_prec + p_rec) > 0 else 0.0
+        n_collapse = sum(1 for r in sel if r.get("collapse_hit"))
         return {
             "n": float(n),
             "exact_payload_match": sum(1.0 for r in sel if r["payload_equal"]) / n,
             "hit_rate": n_hits / n,
             "precision_at_hit": (sum(1.0 for r in hits if r["gate_correct"]) / n_hits) if n_hits else 0.0,
             "false_hit_rate_on_a": (n_hits / n) if (stratum == Stratum.A) else 0.0,
+            "collapse_hits": float(n_collapse),
+            "collapse_hit_rate": n_collapse / n,
             "partial_extraction_rate": sum(1.0 for r in sel if r.get("has_partial")) / n,
             "param_precision": p_prec,
             "param_recall": p_rec,
@@ -539,6 +569,8 @@ class ToolCallEvaluator(BaseToolCallEvaluator):
         m.false_hit_rate_on_a = (
             sum(1 for r in sel if r["stratum"] == "A" and r["hit"]) / a_count
         ) if a_count else 0.0
+        m.collapse_hits = sum(1 for r in sel if r.get("collapse_hit"))
+        m.collapse_hit_rate = m.collapse_hits / n
 
         tot_gt = sum(r.get("n_gt_params", 0) for r in sel)
         tot_pred = sum(r.get("n_pred_params", 0) for r in sel)

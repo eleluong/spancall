@@ -821,6 +821,7 @@ class LeanTrainer(BaseTrainer):
                 # promises; it used to be aliased to span_acc, which silently
                 # reported a param-level number as a call-level one.
                 row_ok = torch.ones(int(H.size(0)), dtype=torch.bool, device=H.device)
+                exact_eligible = torch.ones(int(H.size(0)), dtype=torch.bool, device=H.device)
 
                 if "span_logits" in fp32_preds and "pos_indices" in b:
                     _, acc_t, valid = self.exact_span_match(fp32_preds["span_logits"], b["pos_indices"])
@@ -829,6 +830,9 @@ class LeanTrainer(BaseTrainer):
                     n_span_batches += 1
                     # vacuous / unsupervised params (valid == False) do not
                     # block an exact call match; supervised ones must all hit.
+                    # W0.3: rows with ZERO supervised parameters (e.g. Stratum-A)
+                    # must not be counted as exact_call hits.
+                    exact_eligible = exact_eligible & valid.any(-1)
                     row_ok = row_ok & ((acc_t >= 0.5) | ~valid).all(-1)
 
                 if "tool_logits" in fp32_preds and "tool_targets" in b:
@@ -858,8 +862,8 @@ class LeanTrainer(BaseTrainer):
                         tool_cand_sum += float(n_cand_b.sum().item())
                         tool_cand_rows += int(n_cand_b.numel())
 
-                exact_hits += float(row_ok.sum().item())
-                n_exact += int(row_ok.numel())
+                exact_hits += float((row_ok & exact_eligible).sum().item())
+                n_exact += int(exact_eligible.sum().item())
                 n_batches += 1
 
         if n_batches == 0:

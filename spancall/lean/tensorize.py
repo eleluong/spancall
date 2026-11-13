@@ -336,6 +336,7 @@ def tensorize_sample_lean(
     jitter: bool = True,
     jitter_seed: int = 42,
     jitter_min_tools: int = 1,
+    force_single_tool: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Direct tensorization of UnifiedSample into Lean training format.
 
@@ -399,7 +400,10 @@ def tensorize_sample_lean(
             # later dropped (over-length, dead anchor). ``jitter_draw_hist`` is
             # recorded at the kept-row return instead — see the T12a note there.
             stats["jittered_rows"] = int(stats.get("jittered_rows", 0)) + 1
-    if tool_pool is not None:
+    if force_single_tool:
+        tool_candidates = [gt_tool]
+        gt_idx = 0
+    elif tool_pool is not None:
         tool_candidates, gt_idx = tool_pool.candidates_for(
             sample, gt_tool, row_pack_tools, max_tools=max_tools,
         )

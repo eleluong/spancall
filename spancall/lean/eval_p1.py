@@ -453,6 +453,7 @@ def eval_param_extraction_lean(
     parity_rel_resolved = 0
     parity_rel_fallback = 0
     parity_unresolvable = 0
+    parity_miss_reasons: Counter = Counter()
     cands_per_param_hist: Counter = Counter()
     cands_per_param_rows = 0
     cand_cap_seen: Counter = Counter()
@@ -530,6 +531,8 @@ def eval_param_extraction_lean(
                         parity_rel_resolved += int(_f.get("parity_rel_resolved", 0))
                         parity_rel_fallback += int(_f.get("parity_rel_fallback", 0))
                         parity_unresolvable += int(_f.get("parity_unresolvable", 0))
+                        for _mr, _mc in (_f.get("parity_miss_reasons") or {}).items():
+                            parity_miss_reasons[str(_mr)] += int(_mc)
                     else:
                         parity_undetermined += sum(len(v) for v in _p_spans.values())
                 per_call.append((ci, gt_call, gt_tool, res))
@@ -900,6 +903,7 @@ def eval_param_extraction_lean(
         "parity_rel_resolved": parity_rel_resolved,
         "parity_rel_fallback": parity_rel_fallback,
         "parity_unresolvable": parity_unresolvable,
+        "parity_miss_reasons": dict(parity_miss_reasons),
         # T2: which arm of the experiment produced the numbers above. Without
         # this a protected run and a diagnosis run are indistinguishable in the
         # metrics dict, and the "did the fix work" comparison is unfalsifiable.
@@ -1036,6 +1040,9 @@ def _print_report(
             if _fb:
                 print("     WARNING: fallback spans present -- the split lacks "
                       "utt_rel_* pairs, so parity is a LOWER BOUND, not the real rate")
+        _pmr = metrics.get("parity_miss_reasons") or {}
+        if _pmr:
+            print(f"  -> miss_reasons: {dict(sorted(_pmr.items(), key=lambda kv: -kv[1]))}")
         print("  -> parity low  = serve-time defect (GT span never offerable): fix candidate packing")
         print("  -> parity high = model picked the wrong candidate: fix training/signal")
     else:

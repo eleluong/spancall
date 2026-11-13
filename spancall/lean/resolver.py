@@ -302,6 +302,8 @@ class LeanResolver(BaseResolver):
         min_joint_margin: Optional[float] = None,
         tool_objective: str = "ce",
         tool_call_threshold: float = 0.5,
+        resolve_mode: str = "single_pass",
+        collapse_guard: bool = False,
         **kwargs: Any,
     ) -> None:
         if model is None and encoder is not None:
@@ -405,6 +407,11 @@ class LeanResolver(BaseResolver):
             raise ValueError(f"tool_objective must be 'ce' or 'binary', got {tool_objective!r}")
         self.tool_objective = obj
         self.tool_call_threshold = float(tool_call_threshold)
+        rmode = str(resolve_mode or "single_pass").lower()
+        if rmode not in ("single_pass", "two_step"):
+            raise ValueError(f"resolve_mode must be 'single_pass' or 'two_step', got {resolve_mode!r}")
+        self.resolve_mode = rmode
+        self.collapse_guard = bool(collapse_guard)
         if self.tool_objective == "binary":
             # Fail loudly at construction, not silently at serve time: a binary
             # resolver with no binary head would fall back to the CE head and
@@ -677,18 +684,33 @@ class LeanResolver(BaseResolver):
         recent_context: Optional[List[Dict[str, Any]]] = None,
         now: Optional[Any] = None,
         raw_mode: Optional[bool] = None,
+        parity_spans: Optional[Dict[str, Sequence[Any]]] = None,
+        protect_parity_spans: bool = False,
+        resolve_mode: Optional[str] = None,
     ) -> LeanResolveResult:
         """Score candidate tools via H1 and resolve the top tool."""
+        mode = str(resolve_mode or getattr(self, "resolve_mode", "single_pass") or "single_pass").lower()
+        if mode not in ("single_pass", "two_step"):
+            raise ValueError(f"resolve_mode must be 'single_pass' or 'two_step', got {mode!r}")
         if not candidate_schemas:
             return LeanResolveResult(
                 hit=False,
                 status="abstain",
                 abstain_reason="no_candidates",
                 error_reason="no_candidates",
-                features={"n_candidates": 0, "empty_candidates": True},
+                features={"n_candidates": 0, "empty_candidates": True, "resolve_mode": mode},
             )
         if len(candidate_schemas) == 1:
-            return self.try_resolve(candidate_schemas[0], utterance, recent_context, now)
+            res = self.try_resolve(
+                candidate_schemas[0],
+                utterance,
+                recent_context,
+                now,
+                parity_spans=parity_spans,
+                protect_parity_spans=protect_parity_spans,
+            )
+            res.features["resolve_mode"] = mode
+            return res
 
         if self.model is None or self.tokenizer is None:
             return LeanResolveResult(
@@ -811,6 +833,11 @@ class LeanResolver(BaseResolver):
                 break
             admitted.append((name, float(p)))
 
+        step1_render_T = int(sum(
+            1 for e in output.entries
+            if getattr(e, "kind", None) == "bridge_text"
+            and getattr(e, "tool", None) is not None
+        ))
         encoded_bundle = (output, H, per_token, ctx_features)
         calls: List[LeanCallResult] = []
         first_res: Optional[LeanResolveResult] = None
@@ -818,16 +845,52 @@ class LeanResolver(BaseResolver):
             schema_i = next((s for s in candidate_schemas if s.name == name), None)
             if schema_i is None:
                 continue
-            part = self._resolve(
-                schema_i, utterance, selected_recent, now, encoded_bundle=encoded_bundle
-            )
+            if mode == "two_step":
+                part = self._resolve(
+                    schema_i,
+                    utterance,
+                    selected_recent,
+                    now,
+                    encoded_bundle=None,
+                    context_schemas=[schema_i],
+                    parity_spans=parity_spans,
+                    protect_parity_spans=protect_parity_spans,
+                )
+            else:
+                part = self._resolve(
+                    schema_i,
+                    utterance,
+                    selected_recent,
+                    now,
+                    encoded_bundle=encoded_bundle,
+                    parity_spans=parity_spans,
+                    protect_parity_spans=protect_parity_spans,
+                )
             if first_res is None:
                 first_res = part
             calls.append(_call_from_result(part, call_index, tool_prob=p))
         if first_res is None:  # every admitted tool vanished -- impossible, but loud
-            first_res = self._resolve(
-                winner, utterance, selected_recent, now, encoded_bundle=encoded_bundle
-            )
+            if mode == "two_step":
+                first_res = self._resolve(
+                    winner,
+                    utterance,
+                    selected_recent,
+                    now,
+                    encoded_bundle=None,
+                    context_schemas=[winner],
+                    parity_spans=parity_spans,
+                    protect_parity_spans=protect_parity_spans,
+                )
+            else:
+                first_res = self._resolve(
+                    winner,
+                    utterance,
+                    selected_recent,
+                    now,
+                    encoded_bundle=encoded_bundle,
+                    parity_spans=parity_spans,
+                    protect_parity_spans=protect_parity_spans,
+                )
             calls = [_call_from_result(first_res, 0, tool_prob=float(winner_p))]
         res = first_res
 
@@ -837,7 +900,20 @@ class LeanResolver(BaseResolver):
         # sub-stages keep their own meaning: pre/enc belong to this frame.
         total_ms = (time.perf_counter() - t0) * 1000
         res.latency_ms = float(res.latency_ms or 0.0) + total_ms
+        step2_pre_ms = float(res.features.get("pre_ms", 0.0) or 0.0)
+        step2_enc_ms = float(res.features.get("enc_ms", 0.0) or 0.0)
+        step2_render_T = res.features.get("render_T")
         res.features.update(features)
+        res.features["resolve_mode"] = mode
+        if mode == "two_step":
+            res.features["step1_pre_ms"] = float(features["pre_ms"])
+            res.features["step1_enc_ms"] = float(features["enc_ms"])
+            res.features["step1_render_T"] = step1_render_T
+            res.features["step2_pre_ms"] = step2_pre_ms
+            res.features["step2_enc_ms"] = step2_enc_ms
+            res.features["step2_render_T"] = step2_render_T
+            res.features["pre_ms"] = float(features["pre_ms"]) + step2_pre_ms
+            res.features["enc_ms"] = float(features["enc_ms"]) + step2_enc_ms
         # Not every stage name exists in both frames; report the uncovered
         # remainder explicitly rather than letting it vanish into the total.
         res.features["stage_sum_ms"] = float(
@@ -1216,6 +1292,26 @@ class LeanResolver(BaseResolver):
             margin_gated = True
             is_hit = False
 
+        # W0.2 / W2.3: detect pointer collapse strictly across non-null
+        # utterance-span parameters (ignoring legitimate shared <|null|>,
+        # boolean, or enum slots).
+        utterance_span_owners: Dict[Tuple[int, int], List[str]] = {}
+        for pname, pr in parameters.items():
+            if (
+                pr.source_type == "utterance"
+                and pr.char_span is not None
+                and pr.value is not None
+            ):
+                sp = (int(pr.char_span[0]), int(pr.char_span[1]))
+                utterance_span_owners.setdefault(sp, []).append(pname)
+        collapsed_groups = [names for names in utterance_span_owners.values() if len(names) >= 2]
+        collapsed_params = [n for grp in collapsed_groups for n in grp]
+        pointer_collapsed = bool(collapsed_params)
+        collapse_gated = False
+        if self.collapse_guard and is_hit and pointer_collapsed:
+            collapse_gated = True
+            is_hit = False
+
         status = "hit" if is_hit else ("partial" if payload_partial else "abstain")
 
         if not valid:
@@ -1224,6 +1320,8 @@ class LeanResolver(BaseResolver):
             fail_reason = f"cast_failed:{','.join(cast_failures)}"
         elif margin_gated:
             fail_reason = f"low_joint_margin:{float(delta):.4f}<{self.min_joint_margin:.4f}"
+        elif collapse_gated:
+            fail_reason = f"pointer_collapse:{','.join(collapsed_params)}"
         else:
             fail_reason = None
 
@@ -1251,14 +1349,34 @@ class LeanResolver(BaseResolver):
         #     mistake, repeated on the eval side).
         #   * a fallback (absolute) pair is counted and checked exactly like a
         #     resolved one; only the provenance counter distinguishes them.
+        from spancall.model.masks import classify_parity_miss
+
         parity_checked = 0
         parity_hit = 0
+        parity_wrong_tool = 0
+        parity_miss_reasons: Dict[str, int] = {}
+        param_by_name = {p.name: p for p in schema.parameters}
         for p_name in set(parity_absolutes) | set(parity_unresolvable):
-            key = self._mask_key(schema.name, p_name)
+            if "::" in p_name:
+                target_tool, bare_name = p_name.split("::", 1)
+                if target_tool != schema.name:
+                    parity_wrong_tool += int(parity_unresolvable.get(p_name, 0)) + len(
+                        parity_absolutes.get(p_name) or ()
+                    )
+                    continue
+                key = p_name
+            else:
+                bare_name = p_name
+                key = self._mask_key(schema.name, p_name)
             m = cand_masks.get(key)
             if m is None:
                 continue
-            parity_checked += int(parity_unresolvable.get(p_name, 0))
+            n_unres = int(parity_unresolvable.get(p_name, 0))
+            if n_unres:
+                parity_checked += n_unres
+                parity_miss_reasons["fallback_address_unresolved"] = (
+                    parity_miss_reasons.get("fallback_address_unresolved", 0) + n_unres
+                )
             spans = parity_absolutes.get(p_name) or ()
             if not spans:
                 continue
@@ -1266,10 +1384,16 @@ class LeanResolver(BaseResolver):
                 (int(getattr(c, "char_start", -1)), int(getattr(c, "char_end", -1)))
                 for c in m["candidates"]
             }
+            p_schema = param_by_name.get(bare_name)
             for cs, ce in spans:
                 parity_checked += 1
                 if (int(cs), int(ce)) in have:
                     parity_hit += 1
+                elif p_schema is not None and _ctx is not None:
+                    miss_r = classify_parity_miss(
+                        p_schema, int(cs), int(ce), _ctx, self.max_span_width
+                    )
+                    parity_miss_reasons[miss_r] = parity_miss_reasons.get(miss_r, 0) + 1
         features = {
             **ctx_features,
             "pre_ms": (t_pre - t0) * 1000,
@@ -1300,6 +1424,11 @@ class LeanResolver(BaseResolver):
             "parity_rel_resolved": int(parity_counters.get("rel_resolved", 0)),
             "parity_rel_fallback": int(parity_counters.get("rel_fallback", 0)),
             "parity_unresolvable": int(parity_counters.get("rel_unresolvable", 0)),
+            "parity_wrong_tool": int(parity_wrong_tool),
+            "parity_miss_reasons": parity_miss_reasons,
+            "pointer_collapsed": bool(pointer_collapsed),
+            "collapsed_params": collapsed_params,
+            "collapse_gated": bool(collapse_gated),
             "decode_refusals": decode_refusals,
             "n_decode_refusals": len(decode_refusals),
             "min_confidence": self.min_confidence,
