@@ -526,21 +526,26 @@ class CandidateMaskBuilder:
 
         # --- free string (windowed utterance spans ∪ recent interiors & sub-spans) ---
         recent_cands: List[Candidate] = []
-        for e in recent_vals:
+        for e in reversed(recent_vals):
             r = tok_by_entry.get(id(e))
             if r is None:
                 continue
             recent_cands.append(Candidate(
                 r[0], r[1], e.char_start, e.char_end, "recent", e.value, eidx.of(e)))
         free_recent = self._free_recent_spans(
-            recent_vals, token_offsets, eidx, utterance_text, existing=recent_cands,
+            list(reversed(recent_vals)), token_offsets, eidx, utterance_text, existing=recent_cands,
             max_tok=max_tok, tindex=ctx.tindex)
         null_cands = self._null_candidates(ctx_null, eidx, tok_by_entry, param_schema)
 
-        # Reserved tail for structured context entries (recent + null) so that
-        # capping free utterance spans never evicts these high-priority candidates.
-        reserved_tail = len(recent_cands) + len(free_recent) + len(null_cands)
-        remain = None if max_cands is None else max(0, int(max_cands) - len(cands) - reserved_tail)
+        # Reserve tail for structured null + a bounded recent budget so long
+        # <|recent|> blocks never starve <|utt|> spans out of max_cands.
+        if max_cands is None:
+            remain = None
+        else:
+            cap_int = int(max_cands)
+            recent_budget = min(len(recent_cands) + len(free_recent), max(cap_int // 4, 32))
+            reserved_tail = len(null_cands) + recent_budget
+            remain = max(0, cap_int - len(cands) - reserved_tail)
         # Protected start tokens must survive the GENERATION-time cap. ``_pack``
         # only sees what this generator emits, so protecting downstream alone
         # cannot rescue a span that was never materialised (T2/T4 hole).
@@ -595,19 +600,36 @@ class CandidateMaskBuilder:
                     seen.add(id(c))
                     ordered.append(c)
 
-            # 1. Structured context slots first (they carry supervision).
+            # 1. Structured context slots first (null/bool/enum/time always; recent
+            #    capped at 1/4 of budget when utterance candidates are present so
+            #    long <|recent|> histories cannot starve <|utt|> spans).
+            has_utt = any(getattr(c, "region", "") == "utterance" for c in cands)
+            recent_cap = max(cap // 4, 32) if has_utt else cap
+            recent_taken = 0
             for c in cands:
-                if getattr(c, "region", "") != "utterance":
-                    _take(c)
+                reg = getattr(c, "region", "")
+                if reg != "utterance":
+                    if reg == "recent":
+                        if recent_taken < recent_cap:
+                            _take(c)
+                            recent_taken += 1
+                    else:
+                        _take(c)
             # 2. Protected spans next.
             if protected:
                 for c in cands:
                     if (c.tok_start, c.tok_end) in protected:
                         _take(c)
-            # 3. Fill the rest under the configured policy.
-            pool = [c for c in cands if id(c) not in seen]
-            rem = cap - len(ordered)
-            if rem > 0:
+            # 3. Fill the rest under the configured policy (utterance first, then
+            #    any remaining recent if utterance didn't fill the cap).
+            utt_pool = [c for c in cands if id(c) not in seen and getattr(c, "region", "") == "utterance"]
+            other_pool = [c for c in cands if id(c) not in seen and getattr(c, "region", "") != "utterance"]
+            for pool in (utt_pool, other_pool):
+                rem = cap - len(ordered)
+                if rem <= 0:
+                    break
+                if not pool:
+                    continue
                 if fill == "head" or len(pool) <= rem:
                     for c in pool[:rem]:
                         _take(c)
@@ -973,6 +995,10 @@ class CandidateMaskBuilder:
                         else:
                             sub_val = entry_slice[cs_i - e.char_start:ce_j - e.char_start].strip()
                         if not sub_val:
+                            continue
+                        # Skip JSON structural fragments (e.g. 'jazz\"}}', 'cuisine\": \"')
+                        # that leak from serialized tool-call history in <|recent|>.
+                        if any(ch in sub_val for ch in ('"', "{", "}", "[", "]", "\\")):
                             continue
                         seen.add(key)
                         out.append(Candidate(

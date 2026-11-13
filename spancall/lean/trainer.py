@@ -573,6 +573,8 @@ class LeanTrainer(BaseTrainer):
                 # ``tool_acc`` below reads it.
                 if "call_tool_targets" in b:
                     targs["call_tool_targets"] = b["call_tool_targets"]
+                if "is_abstain" in b:
+                    targs["abstain_mask"] = b["is_abstain"].bool()
 
         # Compute loss in fp32 for numerical stability
         fp32_preds = {k: (v.float() if isinstance(v, torch.Tensor) else v) for k, v in preds.items()}
@@ -814,6 +816,8 @@ class LeanTrainer(BaseTrainer):
                             preds["tool_binary_logits"] = bl.masked_fill(
                                 b["tool_positions"] < 0, -1e4
                             )
+                        if "is_abstain" in b:
+                            targs["abstain_mask"] = b["is_abstain"].bool()
 
                 fp32_preds = {k: (v.float() if isinstance(v, torch.Tensor) else v) for k, v in preds.items()}
                 loss_out = self.loss_container(fp32_preds, targs)
@@ -1044,7 +1048,13 @@ class LeanTrainer(BaseTrainer):
             rows = [rows[i] for i in sorted(rng.sample(range(len(rows)), min(n, len(rows))))]
 
         if filter_empty_positives and rows and "pos_indices" in rows[0]:
-            groundable = [r for r in rows if has_positive_targets(r)]
+            if self.use_binary_tool_head:
+                groundable = [
+                    r for r in rows
+                    if has_positive_targets(r) or bool(r.get("is_abstain", 0))
+                ]
+            else:
+                groundable = [r for r in rows if has_positive_targets(r)]
             if not groundable and rows:
                 print(f"[!] WARNING: filter_empty_positives=True but 0/{len(rows)} rows had positive targets!")
             rows = groundable

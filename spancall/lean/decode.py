@@ -367,7 +367,7 @@ class LeanJointDecoder(BaseJointDecoder):
     def _conflict(self, v1: LeanValueChoice, v2: LeanValueChoice) -> bool:
         if self.overlap_allowed:
             return False
-        if v1.region != "utterance" or v2.region != "utterance":
+        if v1.region not in ("utterance", "recent") or v2.region not in ("utterance", "recent"):
             return False
         if v1.span is None or v2.span is None:
             return False
@@ -375,6 +375,11 @@ class LeanJointDecoder(BaseJointDecoder):
         s2, e2 = v2.span
         if not (s1 < e2 and s2 < e1):
             return False
+        # Identical span within the same call is always a conflict when
+        # exclusivity is active (prevents e.g. title="2010", year=2010 or
+        # side1=4.0, side2=4.0).
+        if not self.free_string_overlap_allowed and (s1, e1) == (s2, e2):
+            return True
         if v1.entity != v2.entity:
             return False
         if v1.entity is None:

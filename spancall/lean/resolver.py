@@ -304,6 +304,7 @@ class LeanResolver(BaseResolver):
         tool_call_threshold: float = 0.5,
         resolve_mode: str = "single_pass",
         collapse_guard: bool = False,
+        prevent_param_collapse: bool = False,
         **kwargs: Any,
     ) -> None:
         if model is None and encoder is not None:
@@ -325,8 +326,10 @@ class LeanResolver(BaseResolver):
         # stale threshold from a previous experiment.
         self.min_confidence = float(min_confidence) if min_confidence is not None else None
         self.min_posterior = float(min_posterior) if min_posterior is not None else None
+        self.prevent_param_collapse = bool(prevent_param_collapse)
         self.decoder = decoder or LeanJointDecoder(
-            top_k=3,
+            top_k=5,
+            free_string_overlap_allowed=not self.prevent_param_collapse,
             normalize_scores=False,
             min_confidence=self.min_confidence,
             min_posterior=self.min_posterior,
@@ -1176,7 +1179,7 @@ class LeanResolver(BaseResolver):
         param_names = [p.name for p in schema.parameters]
         entity_classes = {p.name: p.entity_class for p in schema.parameters if p.entity_class}
         assignment, delta, chosen, n_valid = self.decoder.decode_detailed(
-            per_param_scores, entity_classes=entity_classes, top_k=3
+            per_param_scores, entity_classes=entity_classes, top_k=self.decoder.top_k
         )
         t_post = time.perf_counter()
         # T6: a param the decoder explicitly refused. Surfaced separately from

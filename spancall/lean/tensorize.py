@@ -319,6 +319,103 @@ class ToolPool:
         return shuffled, gt_index
 
 
+def _tensorize_abstain_sample(
+    sample: UnifiedSample,
+    tokenizer: Any,
+    max_seq_len: int,
+    max_tools: Optional[int],
+    k_recent: int,
+    context_budget_tokens: int,
+    stats: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Tensorize a Stratum-A (no-call) row for BinaryToolHead negative supervision."""
+    tool_candidates = list(sample.tools or [])
+    if not tool_candidates:
+        return None
+    if max_tools is not None and len(tool_candidates) > max(1, int(max_tools)):
+        tool_candidates = tool_candidates[: max(1, int(max_tools))]
+
+    base_date = date(2026, 1, 1)
+    if sample.current_time_iso:
+        try:
+            base_date = date.fromisoformat(str(sample.current_time_iso)[:10])
+        except ValueError:
+            pass
+
+    recent_rows = _recent_rows(
+        sample,
+        tools=tool_candidates,
+        k_recent=k_recent,
+        context_budget_tokens=context_budget_tokens,
+        tokenizer=tokenizer,
+        stats=stats,
+    )
+    try:
+        out = build_input_multi(
+            [tooldef_to_template_tool(t) for t in tool_candidates],
+            sample.utterance,
+            recent_context=recent_rows,
+            now=base_date,
+        )
+    except Exception:
+        return None
+
+    enc = tokenizer(out.text, return_offsets_mapping=True, add_special_tokens=False)
+    ids: List[int] = enc["input_ids"]
+    offsets: List[Tuple[int, int]] = enc["offset_mapping"]
+    if len(ids) > max_seq_len:
+        if stats is not None:
+            stats["dropped_over_length"] = int(stats.get("dropped_over_length", 0)) + 1
+        return None
+
+    utt_entries = [e for e in out.entries if getattr(e, "segment", None) == "utterance"]
+    if not utt_entries:
+        return None
+    usnap = _snap_token_range(
+        min(e.char_start for e in utt_entries),
+        max(e.char_end for e in utt_entries),
+        offsets,
+        max_seq_len,
+    )
+    if usnap is None:
+        return None
+    utt_starts, utt_ends = usnap
+
+    t_entries = [
+        e for e in out.entries
+        if getattr(e, "kind", None) == "bridge_text" and getattr(e, "tool", None) is not None
+    ]
+    tool_positions: List[int] = []
+    for e in t_entries:
+        tsnap = _snap_token_range(e.char_start, e.char_end, offsets, max_seq_len)
+        tool_positions.append(PAD_INDEX if tsnap is None else tsnap[0])
+
+    if not any(p >= 0 for p in tool_positions):
+        return None
+
+    if stats is not None:
+        stats["abstain_rows"] = int(stats.get("abstain_rows", 0)) + 1
+
+    return {
+        "input_ids": torch.tensor(ids, dtype=torch.long),
+        "attention_mask": torch.ones(len(ids), dtype=torch.long),
+        "param_positions": torch.tensor([PAD_INDEX], dtype=torch.long),
+        "call_param_index": torch.tensor([PAD_INDEX], dtype=torch.long),
+        "n_calls": torch.tensor(0, dtype=torch.long),
+        "utt_starts": torch.tensor([utt_starts], dtype=torch.long),
+        "utt_ends": torch.tensor([utt_ends], dtype=torch.long),
+        "cand_starts": torch.tensor([[PAD_INDEX]], dtype=torch.long),
+        "cand_ends": torch.tensor([[PAD_INDEX]], dtype=torch.long),
+        "pos_indices": torch.tensor([[PAD_INDEX]], dtype=torch.long),
+        "tool_positions": torch.tensor(tool_positions, dtype=torch.long),
+        "tool_targets": torch.tensor(PAD_INDEX, dtype=torch.long),
+        "call_tool_targets": torch.tensor([PAD_INDEX], dtype=torch.long),
+        "is_abstain": torch.tensor(1, dtype=torch.long),
+        "_n_tool_candidates": int(sum(1 for p in tool_positions if p >= 0)),
+        "_lean_converted": True,
+    }
+
+
 def tensorize_sample_lean(
     sample: UnifiedSample,
     tokenizer: Any,
@@ -337,6 +434,7 @@ def tensorize_sample_lean(
     jitter_seed: int = 42,
     jitter_min_tools: int = 1,
     force_single_tool: bool = False,
+    include_abstain: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Direct tensorization of UnifiedSample into Lean training format.
 
@@ -363,7 +461,19 @@ def tensorize_sample_lean(
     accepted-but-ignored so pre-existing call sites keep working; training and
     inference must never disagree about which template produced the anchors.
     """
-    if not sample.tools or not sample.ground_truth_calls:
+    if not sample.tools:
+        return None
+    if not sample.ground_truth_calls:
+        if include_abstain:
+            return _tensorize_abstain_sample(
+                sample=sample,
+                tokenizer=tokenizer,
+                max_seq_len=max_seq_len,
+                max_tools=max_tools,
+                k_recent=k_recent,
+                context_budget_tokens=context_budget_tokens,
+                stats=stats,
+            )
         return None
 
     # R0.4/J2: the FIRST call still drives the row's grammar -- it supplies the

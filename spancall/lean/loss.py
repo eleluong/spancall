@@ -114,6 +114,7 @@ def compute_lean_tool_loss_binary(
     tool_logits: torch.Tensor,
     tool_targets: torch.Tensor,
     pos_weight: Optional[torch.Tensor] = None,
+    abstain_mask: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
     """Binary H1 loss: each rendered anchor is scored as called / not-called.
 
@@ -178,6 +179,12 @@ def compute_lean_tool_loss_binary(
     # Live anchors only: the caller signals "dead" by filling the logit with
     # -1e4, so this threshold identifies exactly the anchors that carry signal.
     live = tool_logits > _DEAD_ANCHOR_LOGIT
+    # Stratum-A (abstain) rows carry all-zero binary targets: every live tool
+    # anchor is a negative example so BinaryToolHead learns to stay below tau.
+    if abstain_mask is not None and isinstance(abstain_mask, torch.Tensor):
+        am = abstain_mask.reshape(-1).bool().to(has_row.device)
+        if int(am.size(0)) == int(has_row.size(0)):
+            has_row = has_row | am
     # A row whose every anchor is dead is NOT scoreable: it would otherwise be
     # averaged as a diluted 0.0, i.e. reported as a suspiciously good loss. It is
     # excluded exactly like an unsupervised row (``has_row`` also filters the
@@ -199,14 +206,34 @@ def compute_lean_tool_loss_binary(
 def _lean_tool_binary_supervision_count(
     tool_logits: torch.Tensor,
     tool_targets: torch.Tensor,
+    abstain_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Rows with binary H1 supervision -- the micro-average denominator.
 
-    Shares the supervision rules with the CE counter, so ``loss x count``
-    reconstructs the batch SUM that was averaged, keeping the trainer's
-    slot-weighted accumulation valid for both arms.
+    Includes Stratum-A negative-only rows when ``abstain_mask`` is provided so
+    ``loss x count`` reconstructs the exact batch SUM that was averaged.
     """
-    return _lean_tool_supervision_count(tool_logits, tool_targets)
+    base = _lean_tool_supervision_count(tool_logits, tool_targets)
+    if abstain_mask is None or not isinstance(abstain_mask, torch.Tensor):
+        return base
+    if tool_logits.dim() != 2 or tool_logits.numel() == 0:
+        return base
+    live = (tool_logits > _DEAD_ANCHOR_LOGIT).any(-1)
+    am = abstain_mask.reshape(-1).bool().to(live.device)
+    if int(am.size(0)) != int(live.size(0)):
+        return base
+    # Avoid double-counting if a row somehow had both a valid target and abstain_mask.
+    T = tool_targets
+    if isinstance(T, torch.Tensor) and T.numel() > 0:
+        C = int(tool_logits.size(-1))
+        if T.dim() <= 1:
+            has_pos = (T.reshape(-1) >= 0) & (T.reshape(-1) < C)
+        else:
+            has_pos = ((T >= 0) & (T < C)).any(-1)
+        extra = (am & ~has_pos & live).sum()
+    else:
+        extra = (am & live).sum()
+    return base + extra
 
 
 def compute_lean_pointer_loss(
@@ -394,6 +421,7 @@ class LeanLossContainer(nn.Module):
             bin_targets = targets.get("call_tool_targets")
             if bin_targets is None:
                 bin_targets = targets.get("tool_targets")
+            abstain_mask = targets.get("abstain_mask")
             if bin_targets is not None:
                 # ``T - 1`` as the positive weight: with T rendered anchors and
                 # one called tool the raw BCE is dominated by the negatives, and
@@ -403,11 +431,14 @@ class LeanLossContainer(nn.Module):
                     (n_anchor,), float(max(n_anchor - 1, 1)), device=bin_logits.device
                 )
                 b_loss = compute_lean_tool_loss_binary(
-                    bin_logits, bin_targets, pos_weight=pos_weight
+                    bin_logits, bin_targets, pos_weight=pos_weight,
+                    abstain_mask=abstain_mask,
                 )
                 if b_loss is not None:
                     out["tool_binary"] = b_loss.detach()
-                    n_bin_sup = _lean_tool_binary_supervision_count(bin_logits, bin_targets)
+                    n_bin_sup = _lean_tool_binary_supervision_count(
+                        bin_logits, bin_targets, abstain_mask=abstain_mask,
+                    )
                     out["tool_binary_sum"] = b_loss.detach() * n_bin_sup
                     out["tool_binary_count"] = n_bin_sup
                     total_loss = total_loss + self.lambda_tool_binary * b_loss
