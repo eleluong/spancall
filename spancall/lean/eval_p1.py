@@ -50,8 +50,9 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 from collections import Counter, defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from spancall.data.schema import Stratum, UnifiedSample
 
@@ -316,6 +317,137 @@ def _parity_spans_for_call(
     return out
 
 
+def _is_adversarial_r7_dict(row: Dict[str, Any]) -> bool:
+    """True when a canonical JSONL row is an adversarial ``::r7`` marker-injection sample."""
+    sid = str(row.get("sample_id") or "")
+    if "::r7" in sid:
+        return True
+    meta = row.get("metadata") or {}
+    return (
+        meta.get("aug_type") == "adversarial_r7"
+        or meta.get("abstain_reason") == "marker_injection"
+    )
+
+
+def classify_eval_cohort(row: Dict[str, Any]) -> str:
+    """Assign a canonical JSONL row to one non-overlapping evaluation cohort.
+
+    Cohorts:
+    - ``A_missing_gt_schema``: GT tool is absent from ``row['tools']`` (e.g.
+      json-mode rows packed with ``ExpertQAExtractor``); excluded from model
+      scoring so they cannot fabricate ``WRONG_TOOL`` errors.
+    - ``A_adv``: Stratum-A adversarial ``::r7`` marker-injection rows (Step-0
+      pre-encode sanitize gate benchmark).
+    - ``A_clean``: Non-adversarial Stratum-A rows with GT tool present.
+    - ``F_json``: Stratum-F ``json_output`` rows with GT tool present.
+    - ``F_func``: Stratum-F standard function-calling rows with GT tool present.
+    """
+    gt_calls = row.get("ground_truth_calls") or []
+    tools = row.get("tools") or []
+    if not gt_calls or not tools:
+        return "A_missing_gt_schema"
+    gt_name = str(gt_calls[0].get("tool_name") or "")
+    tool_names = {str(t.get("name") or "") for t in tools}
+    if gt_name not in tool_names:
+        return "A_missing_gt_schema"
+    stratum = str(row.get("stratum") or "")
+    if stratum == "A":
+        return "A_adv" if _is_adversarial_r7_dict(row) else "A_clean"
+    return "F_json" if gt_name == "json_output" else "F_func"
+
+
+def build_stratified_eval_subset(
+    split_name: str,
+    data_dir: str,
+    out_path: str,
+    limit: Optional[int] = 500,
+    seed: int = 42,
+    cohort_ratios: Optional[Dict[str, float]] = None,
+) -> Dict[str, Any]:
+    """Build a deterministic stratified evaluation subset across cohorts.
+
+    Prevents sequential ``rows[:limit]`` slicing from landing on a single
+    homogeneous block (such as the leading 100% ``json_output`` block in
+    ``hermes_eval.jsonl``). Rows where ``gt_tool not in s.tools`` are excluded
+    into ``A_missing_gt_schema`` and reported separately.
+    """
+    src = split_name if os.path.isfile(split_name) else os.path.join(data_dir, f"{split_name}.jsonl")
+    if not os.path.exists(src):
+        raise FileNotFoundError(f"Eval split not found: {src}")
+
+    ratios = dict(
+        cohort_ratios
+        or {"F_func": 0.50, "F_json": 0.10, "A_clean": 0.30, "A_adv": 0.10}
+    )
+    cohorts: Dict[str, List[str]] = {
+        "F_func": [],
+        "F_json": [],
+        "A_clean": [],
+        "A_adv": [],
+        "A_missing_gt_schema": [],
+    }
+    with open(src, encoding="utf-8") as fh:
+        for line in fh:
+            raw = line.strip()
+            if not raw:
+                continue
+            d = json.loads(raw)
+            cohorts[classify_eval_cohort(d)].append(raw)
+
+    available = {k: len(v) for k, v in cohorts.items()}
+    scoreable_keys = ["F_func", "F_json", "A_clean", "A_adv"]
+    total_scoreable = sum(available[k] for k in scoreable_keys)
+    target_n = total_scoreable if limit is None else min(int(limit), total_scoreable)
+
+    rng = random.Random(int(seed))
+    shuffled: Dict[str, List[str]] = {}
+    for k in scoreable_keys:
+        items = list(cohorts[k])
+        rng.shuffle(items)
+        shuffled[k] = items
+
+    # Allocate quotas proportionally, redistributing any shortfall.
+    quotas: Dict[str, int] = {k: 0 for k in scoreable_keys}
+    remaining = target_n
+    weight_sum = sum(ratios.get(k, 0.0) for k in scoreable_keys) or 1.0
+    for k in scoreable_keys:
+        want = int(round(target_n * (ratios.get(k, 0.0) / weight_sum)))
+        take = min(want, len(shuffled[k]), remaining)
+        quotas[k] = take
+        remaining -= take
+
+    # Top up any remaining budget from cohorts that still have spare rows.
+    for k in ("F_func", "A_clean", "F_json", "A_adv"):
+        if remaining <= 0:
+            break
+        spare = len(shuffled[k]) - quotas[k]
+        if spare > 0:
+            add = min(spare, remaining)
+            quotas[k] += add
+            remaining -= add
+
+    selected: List[str] = []
+    for k in scoreable_keys:
+        selected.extend(shuffled[k][: quotas[k]])
+
+    out_dir = os.path.dirname(out_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as fh:
+        for line in selected:
+            fh.write(line + "\n")
+
+    return {
+        "source": src,
+        "out_path": out_path,
+        "seed": int(seed),
+        "total_available": sum(available.values()),
+        "available_by_cohort": available,
+        "sampled_by_cohort": quotas,
+        "sampled_total": len(selected),
+    }
+
+
 def eval_param_extraction_lean(
     split_name: str,
     resolver: Any,
@@ -324,6 +456,11 @@ def eval_param_extraction_lean(
     max_param_gap_report: int = 20,
     measure_candidate_parity: bool = True,
     protect_parity_spans: bool = False,
+    context_mode: str = "all",
+    stratum_filter: Optional[str] = None,
+    only_tools: Optional[Sequence[str]] = None,
+    exclude_tools: Optional[Sequence[str]] = None,
+    quiet: bool = False,
 ) -> Dict[str, Any]:
     """Run retrieval-first param-extraction eval on a canonical split.
 
@@ -359,12 +496,17 @@ def eval_param_extraction_lean(
         FileNotFoundError: if the split file does not exist. Returning ``{}``
             made a missing/misnamed split look like a silent zero-metric run.
     """
-    src = os.path.join(data_dir, f"{split_name}.jsonl")
+    src = split_name if os.path.isfile(split_name) else os.path.join(data_dir, f"{split_name}.jsonl")
     if not os.path.exists(src):
         raise FileNotFoundError(
             f"Eval split not found: {src}. Build the canonical split first "
             f"(scripts/prepare_data.py) or point data_dir at the processed dir."
         )
+    ctx_mode = str(context_mode or "all").lower()
+    if ctx_mode not in ("all", "single"):
+        raise ValueError(f"context_mode must be 'all' or 'single', got {context_mode!r}")
+    only_set = set(only_tools) if only_tools else None
+    excl_set = set(exclude_tools) if exclude_tools else None
 
     with open(src, encoding="utf-8") as fh:
         total_available = sum(1 for line in fh if line.strip())
@@ -374,6 +516,7 @@ def eval_param_extraction_lean(
     stratum_f_total = 0
     stratum_f_exact = 0
     stratum_f_hits = 0
+    stratum_f_collapsed = 0
 
     # Groundable (extractable) param metrics — the headline fast-path quality
     ex_tp = 0
@@ -470,6 +613,13 @@ def eval_param_extraction_lean(
             s = UnifiedSample.from_dict(json.loads(line))
             if not s.ground_truth_calls or not s.tools:
                 continue
+            if stratum_filter is not None and s.stratum.value != str(stratum_filter):
+                continue
+            gt_name0 = s.ground_truth_calls[0].tool_name
+            if only_set is not None and gt_name0 not in only_set:
+                continue
+            if excl_set is not None and gt_name0 in excl_set:
+                continue
 
             gt_calls = list(s.ground_truth_calls)
             n_calls_gt = len(gt_calls)
@@ -503,17 +653,18 @@ def eval_param_extraction_lean(
                 # would silently restore the un-instrumented call and report a
                 # parity of "n/a" that looks like a clean run.
                 _supports_parity = bool(getattr(resolver, "supports_candidate_parity", False))
+                _ctx_schemas = [gt_tool] if ctx_mode == "single" else s.tools
                 if getattr(resolver, "supports_context_schemas", False):
                     if _supports_parity:
                         res = resolver.try_resolve(
                             gt_tool, s.utterance, s.recent_context, s.current_time_iso,
-                            context_schemas=s.tools, parity_spans=_p_spans,
+                            context_schemas=_ctx_schemas, parity_spans=_p_spans,
                             protect_parity_spans=protect_parity_spans,
                         )
                     else:
                         res = resolver.try_resolve(
                             gt_tool, s.utterance, s.recent_context, s.current_time_iso,
-                            context_schemas=s.tools,
+                            context_schemas=_ctx_schemas,
                         )
                 else:
                     res = resolver.try_resolve(
@@ -775,6 +926,8 @@ def eval_param_extraction_lean(
                     stratum_f_exact += 1
                 if res0.hit:
                     stratum_f_hits += 1
+                if bool(_feats.get("pointer_collapsed")):
+                    stratum_f_collapsed += 1
                 if set_exact:
                     call_set_exact_F += 1
 
@@ -874,6 +1027,8 @@ def eval_param_extraction_lean(
         # S5: this is the resolver's own schema-valid hit flag, NOT GT accuracy.
         "resolver_hit_rate_F": _round(f_resolver_hit),
         "resolver_hit_rate_F_n": stratum_f_hits,
+        "pointer_collapse_rate_F": _round(_ratio(stratum_f_collapsed, stratum_f_total)),
+        "pointer_collapse_F_n": stratum_f_collapsed,
         # J6 / R0.4: multi-call view. ``exact_payload_match_F`` above still
         # scores ONLY call 0 so its historical number is unchanged; these are the
         # set-level metrics that stop silently ignoring every call but the first.
@@ -944,7 +1099,8 @@ def eval_param_extraction_lean(
         "source_type_distribution": dict(buckets),
     }
 
-    _print_report(metrics, per_param, max_param_gap_report)
+    if not quiet:
+        _print_report(metrics, per_param, max_param_gap_report)
     return metrics
 
 

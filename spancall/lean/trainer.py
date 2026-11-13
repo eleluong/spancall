@@ -750,6 +750,8 @@ class LeanTrainer(BaseTrainer):
         n_span = 0
         tool_hits = 0
         n_tool = 0
+        tool_hits_multi = 0
+        n_tool_multi = 0
         # v2.1 ablation counters: identical denominator and argmax rule as the
         # CE arm above, so ``tool_binary_acc`` and ``tool_acc`` are comparable.
         tool_bin_hits = 0
@@ -757,7 +759,12 @@ class LeanTrainer(BaseTrainer):
         tool_cand_sum = 0.0
         tool_cand_rows = 0
         exact_hits = 0.0
+        params_exact_hits = 0.0
         n_exact = 0
+        exact_hits_t1 = 0.0
+        n_exact_t1 = 0
+        exact_hits_multi = 0.0
+        n_exact_multi = 0
 
         with torch.no_grad():
             for batch in batches:
@@ -821,6 +828,7 @@ class LeanTrainer(BaseTrainer):
                 # promises; it used to be aliased to span_acc, which silently
                 # reported a param-level number as a call-level one.
                 row_ok = torch.ones(int(H.size(0)), dtype=torch.bool, device=H.device)
+                params_ok = torch.ones(int(H.size(0)), dtype=torch.bool, device=H.device)
                 exact_eligible = torch.ones(int(H.size(0)), dtype=torch.bool, device=H.device)
 
                 if "span_logits" in fp32_preds and "pos_indices" in b:
@@ -833,7 +841,14 @@ class LeanTrainer(BaseTrainer):
                     # W0.3: rows with ZERO supervised parameters (e.g. Stratum-A)
                     # must not be counted as exact_call hits.
                     exact_eligible = exact_eligible & valid.any(-1)
-                    row_ok = row_ok & ((acc_t >= 0.5) | ~valid).all(-1)
+                    params_ok = ((acc_t >= 0.5) | ~valid).all(-1)
+                    row_ok = row_ok & params_ok
+
+                live_t_counts = (
+                    (b["tool_positions"] >= 0).sum(-1)
+                    if "tool_positions" in b and b["tool_positions"].numel()
+                    else None
+                )
 
                 if "tool_logits" in fp32_preds and "tool_targets" in b:
                     pred_tools = fp32_preds["tool_logits"].argmax(-1)
@@ -844,6 +859,11 @@ class LeanTrainer(BaseTrainer):
                     if valid_tool.any():
                         tool_hits += int(((pred_tools == tt) & valid_tool).sum().item())
                         n_tool += int(valid_tool.sum().item())
+                        if live_t_counts is not None:
+                            valid_multi = valid_tool & (live_t_counts >= 2)
+                            if valid_multi.any():
+                                tool_hits_multi += int(((pred_tools == tt) & valid_multi).sum().item())
+                                n_tool_multi += int(valid_multi.sum().item())
                     # v2.1 ablation arm: identical denominator and argmax rule.
                     if "tool_binary_logits" in fp32_preds:
                         b_pred = fp32_preds["tool_binary_logits"].argmax(-1)
@@ -863,7 +883,15 @@ class LeanTrainer(BaseTrainer):
                         tool_cand_rows += int(n_cand_b.numel())
 
                 exact_hits += float((row_ok & exact_eligible).sum().item())
+                params_exact_hits += float((params_ok & exact_eligible).sum().item())
                 n_exact += int(exact_eligible.sum().item())
+                if live_t_counts is not None:
+                    t1_elig = exact_eligible & (live_t_counts == 1)
+                    multi_elig = exact_eligible & (live_t_counts >= 2)
+                    exact_hits_t1 += float((row_ok & t1_elig).sum().item())
+                    n_exact_t1 += int(t1_elig.sum().item())
+                    exact_hits_multi += float((row_ok & multi_elig).sum().item())
+                    n_exact_multi += int(multi_elig.sum().item())
                 n_batches += 1
 
         if n_batches == 0:
@@ -931,12 +959,22 @@ class LeanTrainer(BaseTrainer):
             # a different metric.
             "exact_call": overall_exact,
             "exact_payload_match": overall_exact,
+            "exact_params_only": params_exact_hits / max(n_exact, 1),
             "n": float(n_span),
             "n_span": float(n_span),
         }
+        if n_exact_t1 > 0:
+            res["exact_call_t1"] = exact_hits_t1 / n_exact_t1
+            res["n_exact_t1"] = float(n_exact_t1)
+        if n_exact_multi > 0:
+            res["exact_call_multi"] = exact_hits_multi / n_exact_multi
+            res["n_exact_multi"] = float(n_exact_multi)
         if n_tool > 0:
             res["tool_acc"] = tool_hits / n_tool
             res["n_tool"] = float(n_tool)
+        if n_tool_multi > 0:
+            res["tool_acc_multi"] = tool_hits_multi / n_tool_multi
+            res["n_tool_multi"] = float(n_tool_multi)
         if n_tool_bin > 0:
             # Only present when the binary arm actually ran; absent (rather than
             # NaN) keeps the flag-off result dict byte-identical.
@@ -1262,6 +1300,9 @@ class LeanTrainer(BaseTrainer):
                     # while new consumers read exact_call.
                     "exact_call": _f("exact_call"),
                     "exact_payload_match": _f("exact_call"),
+                    "exact_params_only": _f("exact_params_only"),
+                    "exact_call_t1": _f("exact_call_t1"),
+                    "exact_call_multi": _f("exact_call_multi"),
                     "abstain_acc": 0.0,
                     "n": _f("n"),
                     # H1 (tool selection) — persisted so a vacuous single-candidate
@@ -1269,6 +1310,8 @@ class LeanTrainer(BaseTrainer):
                     # the fact. ``mean_n_candidates`` ~1.0 => vacuous.
                     "tool_acc": _f("tool_acc"),
                     "n_tool": _f("n_tool"),
+                    "tool_acc_multi": _f("tool_acc_multi"),
+                    "n_tool_multi": _f("n_tool_multi"),
                     # v2.1: persisted alongside ``tool_acc`` so the kill criterion
                     # (binary <= CE => revert) can be read off the epoch history
                     # without re-running either arm.

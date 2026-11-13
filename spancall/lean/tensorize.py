@@ -400,7 +400,9 @@ def tensorize_sample_lean(
             # later dropped (over-length, dead anchor). ``jitter_draw_hist`` is
             # recorded at the kept-row return instead — see the T12a note there.
             stats["jittered_rows"] = int(stats.get("jittered_rows", 0)) + 1
-    if force_single_tool:
+    if force_single_tool or (
+        jitter and tool_pool is not None and row_pack_tools == 1 and len(gt_calls) == 1
+    ):
         tool_candidates = [gt_tool]
         gt_idx = 0
     elif tool_pool is not None:

@@ -216,7 +216,7 @@ SPLIT_INPUTS = {
 }
 
 SAMPLE_LIMITS = {"t2": None, "dev": None}
-DATA_FRACTION = 1.0
+DATA_FRACTION = 0.2
 TENSORIZE_WORKERS = max(1, min(os.cpu_count() or 1, 16))
 
 EVAL_LIMIT     = 500

@@ -190,7 +190,7 @@ SPLIT_INPUTS = {
 }
 
 SAMPLE_LIMITS = {"t2": None, "dev": None}
-DATA_FRACTION = 1.0
+DATA_FRACTION = 0.2
 TENSORIZE_WORKERS = max(1, min(os.cpu_count() or 1, 16))
 
 EVAL_LIMIT     = 500
@@ -1556,18 +1556,24 @@ if train_log:
         # pointer metrics so a vacuous single-candidate 1.0000 is immediately
         # readable: tool_acc only means something when cands/row > 1. Missing
         # and NaN values render as "—" rather than as a plausible 0.000.
-        print(f"  {'stage':<7}{'ep':>3}{'n':>5}{'span_acc':>10}{'exact_call':>12}"
-              f"{'tool_acc':>10}{'n_tool':>8}{'cands/row':>11}")
+        print(f"  {'stage':<7}{'ep':>3}{'n':>6}{'span_acc':>10}{'params_ok':>11}{'exact_call':>12}"
+              f"{'exact_T1':>10}{'exact_T2+':>10}{'tool_all':>10}{'tool_T2+':>10}{'cands/row':>11}")
         for r in evals:
             span = _num(r, "span_acc")
+            p_ok = _num(r, "exact_params_only")
             exact = _num(r, "exact_call")
+            ex_t1 = _num(r, "exact_call_t1")
+            ex_m = _num(r, "exact_call_multi")
             tool_acc = _num(r, "tool_acc")
-            n_tool = _num(r, "n_tool")
+            tool_m = _num(r, "tool_acc_multi")
             cands = _num(r, "mean_n_candidates")
             sp = f"{span:>10.3f}" if span is not None else f"{'—':>10}"
+            po = f"{p_ok:>11.3f}" if p_ok is not None else f"{'—':>11}"
             ex = f"{exact:>12.3f}" if exact is not None else f"{'—':>12}"
+            et1 = f"{ex_t1:>10.3f}" if ex_t1 is not None else f"{'—':>10}"
+            em = f"{ex_m:>10.3f}" if ex_m is not None else f"{'—':>10}"
             ta = f"{tool_acc:>10.3f}" if tool_acc is not None else f"{'—':>10}"
-            nt = f"{int(n_tool):>8}" if n_tool is not None else f"{'—':>8}"
+            tm = f"{tool_m:>10.3f}" if tool_m is not None else f"{'—':>10}"
             cd = f"{cands:>11.2f}" if cands is not None else f"{'—':>11}"
             if cands is None:
                 vac = "  <-- H1 NOT EVALUATED"
@@ -1575,8 +1581,10 @@ if train_log:
                 vac = "  <-- VACUOUS H1"
             else:
                 vac = ""
-            print(f"  {str(r.get('stage','?')):<7}{r.get('epoch','?'):>3}{r.get('n','?'):>5}"
-                  f"{sp}{ex}{ta}{nt}{cd}{vac}")
+            n_val = _num(r, "n")
+            n_s = f"{int(n_val):>6}" if n_val is not None else f"{'?':>6}"
+            print(f"  {str(r.get('stage','?')):<7}{r.get('epoch','?'):>3}{n_s}"
+                  f"{sp}{po}{ex}{et1}{em}{ta}{tm}{cd}{vac}")
         _cand = [_num(r, "mean_n_candidates") for r in evals]
         _cand = [c for c in _cand if c is not None]
         if _cand and max(_cand) < 1.5:
@@ -1864,7 +1872,7 @@ against a model with no `tool_head_binary`)."""
 CODE_BINARY_ABLATION = '''# ---- v2.1: softmax H1 vs binary H1 ablation (opt-in; default OFF) ----
 import glob, json, math, os, yaml
 
-RUN_BINARY_TOOL_ABLATION = True    # v2.2 W1: run two-arm ce vs binary ablation
+RUN_BINARY_TOOL_ABLATION = False   # v2.3: 1 primary training run by default; set True to run binary arm
 BIN_ABLATION_EPOCHS = int(globals().get("NUM_EPOCHS", 5))   # identical for BOTH arms
 BIN_ABLATION_ARMS = (("ce", False), ("binary", True))
 
@@ -1942,7 +1950,14 @@ if RUN_BINARY_TOOL_ABLATION:
         base_cfg = yaml.safe_load(fh)
 
     results = {}
+    _primary_log = os.path.join(RESULTS_DIR, f"{EXPERIMENT_NAME}_seed{SEED}", "train_log.jsonl")
     for arm_name, use_binary in BIN_ABLATION_ARMS:
+        if arm_name == "ce" and os.path.exists(_primary_log):
+            print("=" * 78)
+            print(f"[v2.1] arm=ce  REUSING primary training run ({_primary_log})")
+            print("=" * 78)
+            results[arm_name] = _bin_arm_summary(RESULTS_DIR, EXPERIMENT_NAME)
+            continue
         arm_root = os.path.join(RESULTS_DIR, "binary_tool_ablation", arm_name)
         cfg_path = _write_binary_arm_config(
             base_cfg, use_binary, f"binary_tool_ablation_{arm_name}", arm_root
@@ -2081,13 +2096,83 @@ if CHECKPOINT_DIR:
 '''
 
 MARKDOWN_PREDICT_INTRO = """---
-## 5. Inference & Evaluation (`LeanResolver`)
+## 5. Inference & Step-by-Step Evaluation (`LeanResolver`)
 
-Loads `LeanSpanCallModel` + `LeanResolver` and evaluates across 3 decoupled parts:
-1. **Eval Part 1 — Parameter Extraction Evaluation (Oracle / Given GT Tool)**: `resolver.try_resolve(gt_tool, ...)`
-2. **Eval Part 2 — Function (Tool) Prediction Evaluation**: `resolver.predict_tool(candidates, ...)`
-3. **Eval Part 3 — End-to-End Function Calling Evaluation**: `resolver.try_resolve_candidates(s.tools, ...)` vs `B1a` (and vs Legacy SpanCall if present).
+Evaluates the single trained `LeanSpanCallModel` across **4 decoupled stages** on one shared, deterministically stratified subset (`subset_{EVAL_SPLIT}.jsonl`):
+- **5.0 Benchmark Slice & Step 0 (Sanitize Gate)**: Stratified cohorts (`F_func`, `F_json`, `A_clean`, `A_adv`) + pre-encode marker-injection audit.
+- **5a. Step 1 in Isolation — Tool Selection (`H1`)**: Native multi-tool (`T=2..6`), random distractor robustness, `F` vs `A_clean` margin separation, per-tool confusion.
+- **5b. Step 2 in Isolation — Parameter Extraction (`H3`, Oracle Tool)**: Breaks Step 2 into **2a Candidate Generation** (`T=1` vs `T=all`), **2b Pure Pointer Scoring** (`protect_parity=True`, gates OFF), and **2c Schema/Collapse/Margin Gates Waterfall**.
+- **5c. Step 3 — Composed E2E (`single_pass` vs `two_step`)**: Stage-by-stage waterfall funnel + `A_clean`/`A_adv` abstention breakdown.
+- **5d. Stage-Attributed Error Forensics**: Concrete examples grouped by the exact step (`Step 1`, `Step 2a`, `Step 2b`, `Step 2c`) where each miss failed.
 """
+
+MARKDOWN_BENCHMARK_SLICE = """### 5.0 Stratified Benchmark Slice & Step 0 (Pre-Encode Sanitize Gate)
+
+Builds `subset_{EVAL_SPLIT}.jsonl` via `build_stratified_eval_subset` so every Part 5 and Part 6 cell scores the **exact same stratified sample** instead of the leading 100% `json_output` block. Then evaluates Step 0 (pre-encode sanitize check) on `A_adv` vs clean cohorts."""
+
+CODE_BENCHMARK_SLICE = '''import json, os
+from collections import Counter
+from span_template.template import RecentRow, build_input_multi
+from span_template.sanitize import SanitizeError
+from spancall.data.schema import UnifiedSample
+from spancall.data.align import tooldef_to_template_tool
+from spancall.lean.eval_p1 import build_stratified_eval_subset, classify_eval_cohort
+
+SUBSET_EVAL_PATH = os.path.join(RESULTS_DIR, f"subset_{EVAL_SPLIT}.jsonl")
+CLEAN_EVAL_PATH  = os.path.join(RESULTS_DIR, f"subset_{EVAL_SPLIT}_clean.jsonl")
+_slice_info = build_stratified_eval_subset(
+    EVAL_SPLIT,
+    data_dir=DATA_DIR,
+    out_path=SUBSET_EVAL_PATH,
+    limit=EVAL_LIMIT,
+    seed=SEED,
+)
+print("=== 5.0 Stratified Benchmark Slice ===")
+print("Available by cohort:", _slice_info["available_by_cohort"])
+print("Sampled   by cohort:", _slice_info["sampled_by_cohort"], f"(total={_slice_info['sampled_total']})")
+
+# Step 0: Pre-encode sanitize gate audit
+_step0_stats = {c: {"n": 0, "vetoed": 0} for c in ("F_func", "F_json", "A_clean", "A_adv")}
+_clean_lines = []
+_cohort_by_sid = {}
+with open(SUBSET_EVAL_PATH, encoding="utf-8") as _fh:
+    for _line in _fh:
+        _raw = _line.strip()
+        if not _raw:
+            continue
+        _d = json.loads(_raw)
+        _cohort = classify_eval_cohort(_d)
+        _s = UnifiedSample.from_dict(_d)
+        _cohort_by_sid[_s.sample_id] = _cohort
+        _st = _step0_stats.setdefault(_cohort, {"n": 0, "vetoed": 0})
+        _st["n"] += 1
+        _vetoed = False
+        try:
+            _recent = [
+                RecentRow(key=str(r.get("key", "")), value=str(r.get("value", "")), source=str(r.get("source", "recent")))
+                for r in (_s.recent_context or [])
+            ]
+            build_input_multi([tooldef_to_template_tool(t) for t in (_s.tools or [])], _s.utterance, recent_context=_recent)
+        except SanitizeError:
+            _vetoed = True
+        except Exception:
+            _vetoed = False
+        if _vetoed:
+            _st["vetoed"] += 1
+        else:
+            _clean_lines.append(_raw)
+
+with open(CLEAN_EVAL_PATH, "w", encoding="utf-8") as _fh:
+    for _l in _clean_lines:
+        _fh.write(_l + "\\n")
+
+print("\\n=== Step 0: Pre-Encode Sanitize Gate ===")
+for _c in ("F_func", "F_json", "A_clean", "A_adv"):
+    _st = _step0_stats.get(_c, {"n": 0, "vetoed": 0})
+    _rate = (_st["vetoed"] / _st["n"]) if _st["n"] else 0.0
+    print(f"  {_c:<8}: vetoed={_st['vetoed']:>3} / {_st['n']:<3} ({_rate:.1%})")
+print(f"Non-vetoed clean eval rows -> {CLEAN_EVAL_PATH} ({len(_clean_lines)} rows)")
+'''
 
 CODE_RESOLVER = '''import json, os
 from typing import Any, Dict, List, Optional
@@ -2159,253 +2244,228 @@ if encoder is not None and hasattr(encoder, "eval"):
 print("LeanResolver ready (checkpoint =", CHECKPOINT_DIR, ")")'''
 
 MARKDOWN_EVAL_PART1 = """---
-## 5a. Evaluation Part 1 — Lean Parameter Extraction (Oracle Tool Given, Retrieval-First)
+## 5b. Step 2 in Isolation — Parameter Extraction (`H3`, Oracle Tool Given)
 
-Evaluates `resolver.try_resolve(gt_tool, ...)` directly on ground-truth tools. Because Lean Flow has no abstain head or gate vetoes, `res.payload_partial` and `res.parameters[p].value` directly reflect the decoded pointer predictions (with R4 equal-value aggregation and greedy top-1 fallback).
-
-**Retrieval-first contract** (`docs/param_extraction_eval_coverage.md`): the pointer head can only *retrieve* a value that already exists in the context (utterance, recent context, time, enum, boolean, null). Params whose ground truth is `unresolved` (needs generation/transformation) are **out of scope** — refusing them is correct behaviour and routes the call to a slower path. So this cell reports:
-
-- **extraction_recall / precision / F1** — headline quality, scored over *extractable* params only (the fast path's actual job). `n/a` means the denominator was empty (no predictions / no params), **not** a perfect score.
-- **fast_path_param_coverage / fast_path_call_coverage** — how much of the workload the fast path can serve at all.
-- **refused_unextractable vs missed_extractable** — splits the old `pointer_empty` bucket into *correct refusals* (routing signal) and *real fast-path failures* (the number to drive down).
-- **recall_all** — legacy blended view over every GT arg, kept as a diagnostic only (always ≤ extractable recall by construction).
-- **pointer_wrong** — predicted a value where GT expects a different value *or* `null`. Null-param false positives are counted here (they used to be invisible).
-- **exact_payload_match_F** — full-call match; **resolver_hit_rate_F** is the resolver's own schema-validity flag and is *not* GT accuracy (kept as a separate, clearly named diagnostic).
-- **E3 aligner drift** — Stratum-F samples whose GT args lack an extractable target. Non-zero is a **data** bug (aligner drift), not a model miss; it is printed with up to 10 example `sample_id:param` pairs.
-- **truncation** — `evaluated / total_available` so a `limit`-capped run is never mistaken for a full-split number.
-
-Explicit `null` GT arguments are part of the GT universe (the fast path should select `<|null|>`), so they count in coverage and every denominator.
-
-Implementation lives in `spancall/lean/eval_p1.py` so it is unit-tested, not notebook-local."""
+Evaluates Step 2 (`resolver.try_resolve(gt_tool, ...)`) on **`F_func`** (standard function calling) and **`F_json`** separately, isolating **3 sub-stages**:
+- **Step 2a (Candidate Mask Generation)**: Does `CandidateMaskBuilder` keep the GT span inside `C=512` (`candidate_parity`)? Compares `T=1` single-tool layout vs `T=all` multi-tool layout.
+- **Step 2b (Pure Pointer Head `H3`)**: Runs with `protect_parity_spans=True` and gates OFF (`min_joint_margin=0.0`, `collapse_guard=False`) to measure true conditional pointer accuracy when the GT span is guaranteed to be offered.
+- **Step 2c (Gates & Schema Waterfall)**: Measures exact Precision, Recall, F1, Collapse Rate, Exact Call (F), and False Hit (`A_clean`) deltas as `P9/P10` schema validation, `collapse_guard`, and `min_joint_margin` are added."""
 
 CODE_EVAL_PART1 = '''import math
 from spancall.lean.eval_p1 import eval_param_extraction_lean
+from spancall.lean.resolver import LeanResolver
 
-def _m(key):
-    """Read a required metric; NaN renders as n/a (empty denominator, not 1.0)."""
-    v = p1_metrics[key]              # KeyError is intentional: no silent fallback
-    return "n/a" if isinstance(v, float) and math.isnan(v) else v
+def _fmt_p1(v):
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return "n/a"
+    return f"{v:.4f}" if isinstance(v, float) else str(v)
 
-# Retrieval-first quality metrics live in spancall/lean/eval_p1.py (unit-tested).
-# NOTE: raises FileNotFoundError if EVAL_SPLIT was never built — loud by design.
-p1_metrics = eval_param_extraction_lean(
-    EVAL_SPLIT,
-    resolver=resolver,
-    data_dir=DATA_DIR,
-    limit=EVAL_LIMIT,
-    max_param_gap_report=25,
+# --- Step 2a: Candidate Generation (T=1 vs T=all, protection OFF) ---
+_p1_2a_all = eval_param_extraction_lean(
+    CLEAN_EVAL_PATH, resolver=resolver, data_dir=DATA_DIR, limit=None,
+    measure_candidate_parity=True, protect_parity_spans=False,
+    context_mode="all", stratum_filter="F", exclude_tools=["json_output"], quiet=True,
 )
+_p1_2a_t1 = eval_param_extraction_lean(
+    CLEAN_EVAL_PATH, resolver=resolver, data_dir=DATA_DIR, limit=None,
+    measure_candidate_parity=True, protect_parity_spans=False,
+    context_mode="single", stratum_filter="F", exclude_tools=["json_output"], quiet=True,
+)
+print("=== Step 2a: Candidate Mask Parity (F_func, protection OFF) ===")
+print(f"  T=all (multi-tool render): parity={_fmt_p1(_p1_2a_all['candidate_parity'])} "
+      f"({_p1_2a_all['candidate_parity_hit']}/{_p1_2a_all['candidate_parity_checked']}) | "
+      f"miss_reasons={_p1_2a_all['parity_miss_reasons']}")
+print(f"  T=1   (two-step render)  : parity={_fmt_p1(_p1_2a_t1['candidate_parity'])} "
+      f"({_p1_2a_t1['candidate_parity_hit']}/{_p1_2a_t1['candidate_parity_checked']}) | "
+      f"miss_reasons={_p1_2a_t1['parity_miss_reasons']}")
 
-tr = p1_metrics["truncation"]
-print("\\n--- Fast-path value proposition ---")
-print(f"split                  = {p1_metrics['split']}  "
-      f"(scored {tr['evaluated']} / {tr['total_available']} available"
-      f"{', TRUNCATED' if tr['truncated'] else ''})")
-print(f"extraction_recall        = {_m('extraction_recall')}")
-print(f"extraction_precision     = {_m('extraction_precision')}")
-print(f"extraction_f1            = {_m('extraction_f1')}")
-print(f"fast_path_param_coverage = {_m('fast_path_param_coverage')}")
-print(f"fast_path_call_coverage  = {_m('fast_path_call_coverage')}")
-print(f"correct refusals         = {_m('refused_unextractable')} "
-      f"| real fast-path misses = {_m('missed_extractable')} "
-      f"| pointer_wrong = {_m('pointer_wrong')}")
-print(f"E3 aligner drift         = {_m('e3_aligner_drift')} sample(s) "
-      f"(>0 is a DATA bug, not a model miss)")
+# --- Step 2b + 2c: Sub-Stage Waterfall on F_func and A_clean ---
+_step2_arms = [
+    ("2b. Oracle Cands (protect=T, gates=OFF)", True,  False, 0.0,              "single"),
+    ("2a+2b. Served Cands (protect=F, gates=OFF)", False, False, 0.0,            "single"),
+    ("2c-1. + collapse_guard=True",               False, True,  0.0,              "single"),
+    (f"2c-2. + min_joint_margin={MIN_JOINT_MARGIN}", False, True, MIN_JOINT_MARGIN, "single"),
+    (f"2c-3. Same gates on T=all layout",         False, True,  MIN_JOINT_MARGIN, "all"),
+]
 
-# Phase I / J6: the call axis and the prompt layout, both read straight off the
-# metrics dict so a multi-call or T=1 run is legible without re-deriving it.
-print(f"\\n--- Call axis & layout (J6 / R0.4) ---")
-print(f"call_exact_set_match     = {_m('call_exact_set_match')} "
-      f"({_m('call_exact_set_match_n')} / {_m('n')} row(s), all calls exact)")
-print(f"exact_payload_match_F    = {_m('exact_payload_match_F')}  <- CALL 0 ONLY; "
-      f"compare against the set number above, not in place of it")
-print(f"call_count_acc           = {_m('call_count_acc')} "
-      f"({_m('call_count_correct_n')} / {_m('n')})")
-print(f"n_calls (GT)             = {_m('n_calls_hist')}  "
-      f"multi-call rows={_m('n_multi_call_samples')}")
-print(f"n_calls (predicted)      = {_m('pred_n_calls_hist')}")
-print(f"mean_render_T            = {_m('mean_render_T')} "
-      f"hist={_m('render_T_hist')} T=1 share={_m('render_T_t1_share')}")
-_rb = p1_metrics.get("recent_budget_effective") or {}
-if _rb:
-    print(f"recent_budget_effective  = {_rb}")
-if _m("render_T_t1_share") == 1.0:
-    print("  [!] every Part-1 prompt rendered T=1: the layouts here are the "
-          "oracle-tool ones, so any multi-call claim must be read against "
-          "Part 3 as well.")
+print("\\n=== Step 2b & 2c: Sub-Stage Waterfall (F_func vs A_clean) ===")
+print(f"{'Stage / Config':<42}{'Parity':>8}{'Prec':>8}{'Rec':>8}{'F1':>8}{'Coll_F':>8}{'Exact_F':>9}{'A_Hit':>8}")
+print("-" * 99)
+_p1_final_f = None
+for _label, _prot, _cg, _mjm, _cmode in _step2_arms:
+    _r_arm = LeanResolver(
+        model=model, encoder=encoder, tokenizer=tokenizer,
+        max_seq_len=cfg.model.max_seq_len, max_span_width=cfg.model.max_span_width,
+        max_calls=MAX_CALLS, call_min_prob=CALL_MIN_PROB, call_min_prob_ratio=CALL_MIN_PROB_RATIO,
+        min_joint_margin=_mjm, collapse_guard=_cg,
+    )
+    _mf = eval_param_extraction_lean(
+        CLEAN_EVAL_PATH, resolver=_r_arm, data_dir=DATA_DIR, limit=None,
+        measure_candidate_parity=True, protect_parity_spans=_prot,
+        context_mode=_cmode, stratum_filter="F", exclude_tools=["json_output"], quiet=True,
+    )
+    _ma = eval_param_extraction_lean(
+        CLEAN_EVAL_PATH, resolver=_r_arm, data_dir=DATA_DIR, limit=None,
+        measure_candidate_parity=False, protect_parity_spans=False,
+        context_mode=_cmode, stratum_filter="A", exclude_tools=["json_output"], quiet=True,
+    )
+    _a_hit = (_ma["extracted"] / _ma["n"]) if _ma["n"] else float("nan")
+    print(f"{_label:<42}{_fmt_p1(_mf['candidate_parity']):>8}"
+          f"{_fmt_p1(_mf['extraction_precision']):>8}{_fmt_p1(_mf['extraction_recall']):>8}"
+          f"{_fmt_p1(_mf['extraction_f1']):>8}{_fmt_p1(_mf['pointer_collapse_rate_F']):>8}"
+          f"{_fmt_p1(_mf['exact_payload_match_F']):>9}{_fmt_p1(_a_hit):>8}")
+    if _label.startswith("2c-2."):
+        _p1_final_f = _mf
 
-# T1/T2: candidate parity is THE split between "the model picked wrong" and
-# "the right answer was never offerable". Printing it only as a raw key in
-# p1_metrics forced the reader to remember which of the two failure modes a
-# given number implies, so state it explicitly.
-print("\\n--- Candidate parity (T1 diagnosis / T2 fix) ---")
-_pc = p1_metrics.get("candidate_parity_checked") or 0
-_arm = "PROTECTED (fix under test)" if p1_metrics.get("parity_protection") else "DIAGNOSIS (protection off)"
-print(f"arm                    = {_arm}")
-if _pc:
-    _cp = p1_metrics["candidate_parity"]
-    print(f"candidate_parity       = {_m('candidate_parity')} "
-          f"({p1_metrics['candidate_parity_hit']} / {_pc} extractable GT spans offered)")
-    print(f"candidate_miss_rate    = {_m('candidate_miss_rate')} "
-          f"| not offered = {p1_metrics['candidate_parity_undetermined']} undetermined")
-    print(f"cands_per_param        = {_m('cands_per_param_hist')} "
-          f"fill={_m('cand_pack_fill')} cap={_m('cand_cap')}")
-    if not p1_metrics.get("parity_protection") and _cp == _cp and _cp < 0.99:
-        print(f"  [!] {1 - _cp:.1%} of extractable GT spans were NEVER in the served "
-              f"candidate set. That is a serve-side defect, not model quality: "
-              f"no amount of training fixes it. Re-run Part 1 with "
-              f"protect_parity_spans=True to measure the headroom the fix recovers.")
-    elif p1_metrics.get("parity_protection") and _cp == _cp and _cp < 0.99:
-        print(f"  [!] protection is ON but parity is still {_cp:.1%}: the GT span is "
-              f"missing for a reason OTHER than max_cands truncation (region/type "
-              f"filter, or a target whose char offsets do not survive tokenization).")
-    else:
-        print("  [i] parity is ~1.0: every extractable GT span was offerable, so "
-              "extraction_recall now measures model quality rather than mask coverage.")
-else:
-    print("candidate_parity       = n/a (no instrumented GT span in this split)")'''
+# Detailed report for F_func (with default gates) and F_json separately
+print("\\n=== Step 2 Detailed Report: F_func (T=1, protect=False, gates=ON) ===")
+p1_metrics = _p1_final_f or eval_param_extraction_lean(
+    CLEAN_EVAL_PATH, resolver=resolver, data_dir=DATA_DIR, limit=None,
+    context_mode="single", stratum_filter="F", exclude_tools=["json_output"],
+)
+_p1_json = eval_param_extraction_lean(
+    CLEAN_EVAL_PATH, resolver=resolver, data_dir=DATA_DIR, limit=None,
+    context_mode="single", stratum_filter="F", only_tools=["json_output"], quiet=True,
+)
+print(f"F_json (N={_p1_json['n']}): Prec={_fmt_p1(_p1_json['extraction_precision'])} "
+      f"Rec={_fmt_p1(_p1_json['extraction_recall'])} F1={_fmt_p1(_p1_json['extraction_f1'])} "
+      f"Exact_F={_fmt_p1(_p1_json['exact_payload_match_F'])} Parity={_fmt_p1(_p1_json['candidate_parity'])}")'''
 
 MARKDOWN_EVAL_PART2 = """---
-## 5b. Evaluation Part 2 — Lean Function (Tool) Prediction (H1)
+## 5a. Step 1 in Isolation — Function (Tool) Prediction (`H1`)
 
-Evaluates `resolver.predict_tool(candidates, ...)` across ≥ 2 candidate schemas per sample."""
+Evaluates `resolver.predict_tool(candidates, ...)` on non-vetoed rows (`CLEAN_EVAL_PATH`) across:
+- **1a. Native Multi-Tool (`len(s.tools) >= 2`)**: No artificial distractors; broken down by `T ∈ {2, 3, 4+}` and `F_func` vs `A_clean`.
+- **1b. Single-Tool + Random Pool Distractors (`T=3`)**: Deterministic random distractors per row from `TOOL_POOL` (never hardcoded to one alphabetical distractor).
+- **1c. `F_func` vs `A_clean` Score & Margin Separation**: Percentiles of `tool_prob` and `tool_margin` to test whether Step 1 separates groundable vs ungroundable queries.
+- **1d. Per-Tool Accuracy & Top Confusions**."""
 
-CODE_EVAL_PART2 = '''import json, os
+CODE_EVAL_PART2 = '''import json, os, random, zlib
 from collections import Counter, defaultdict
 from spancall.data.schema import UnifiedSample
+from spancall.lean.eval_p1 import classify_eval_cohort
 
-def eval_tool_prediction_lean(split_name: str, limit: Optional[int] = 500,
-                              distractor_pool: Optional[dict] = None):
-    src = os.path.join(DATA_DIR, f"{split_name}.jsonl")
-    if not os.path.exists(src):
-        print(f"File not found: {src}")
-        return
+def _pct(vals, q):
+    if not vals:
+        return float("nan")
+    s = sorted(vals)
+    idx = min(len(s) - 1, max(0, int(round((len(s) - 1) * q))))
+    return s[idx]
 
-    rows = []
-    if distractor_pool is None:
-        distractor_pool = {}
-        with open(src) as fh:
-            for line in fh:
-                if not line.strip():
+def eval_tool_prediction_step1(subset_path: str, pool_path: str, pack_k: int = 3):
+    with open(subset_path, encoding="utf-8") as fh:
+        raw_dicts = [json.loads(l) for l in fh if l.strip()]
+
+    # Build a distractor pool from the full split (or TOOL_POOL if in scope)
+    pool = {}
+    if os.path.exists(pool_path):
+        with open(pool_path, encoding="utf-8") as fh:
+            for l in fh:
+                if not l.strip():
                     continue
-                s = UnifiedSample.from_dict(json.loads(line))
-                rows.append(s)
-                for t in s.tools or []:
-                    distractor_pool.setdefault(t.name, t)
-    else:
-        with open(src) as fh:
-            for line in fh:
-                if not line.strip():
-                    continue
-                rows.append(UnifiedSample.from_dict(json.loads(line)))
-    distractor_names = sorted(distractor_pool)
+                for t in (json.loads(l).get("tools") or []):
+                    if t.get("name") and t["name"] not in pool:
+                        pool[t["name"]] = UnifiedSample.from_dict({"sample_id": "p", "utterance": "", "tools": [t], "ground_truth_calls": []}).tools[0]
+    pool_names = sorted(pool)
 
-    total = 0
-    multi_total = 0
-    multi_correct = 0
-    single_total = 0
-    single_correct = 0
-    augmented = 0
-    probs = []
-    margins = []
-    empty_scores = 0
-    # T3: attribute every empty-``tool_scores`` row to a concrete serve-side
-    # cause. Without this bucket the old "75 empty rows" line was unfalsifiable:
-    # it could be no anchors, anchor loss in tokenization, or a head/layout
-    # mismatch, and those have completely different fixes.
-    empty_reasons = Counter()
-    # Phase I: T is the layout axis H1 actually discriminated over. A mean of
-    # 1.0 makes ``tool_acc`` a single-class softmax artifact, so it must be
-    # printed beside the accuracy, never left to be inferred.
-    cand_counts = Counter()
-    wrong_as = Counter()
+    native_stats = {"F_func": [0, 0], "A_clean": [0, 0], "other": [0, 0]}
+    by_t = defaultdict(lambda: [0, 0])
+    aug_stats = [0, 0]
+    probs_by_cohort = defaultdict(list)
+    margins_by_cohort = defaultdict(list)
+    wrong_pairs = Counter()
     per_tool = defaultdict(lambda: {"n": 0, "correct": 0, "wrong_as": Counter()})
+    empty_scores = 0
 
-    for s in rows:
+    for d in raw_dicts:
+        cohort = classify_eval_cohort(d)
+        s = UnifiedSample.from_dict(d)
         if not s.ground_truth_calls or not s.tools:
             continue
         gt_name = s.ground_truth_calls[0].tool_name
-        native_multi = len(s.tools) > 1
-
+        native_multi = len(s.tools) >= 2
         candidates = list(s.tools)
-        names = {t.name for t in candidates}
-        grew = False
-        if gt_name not in names and gt_name in distractor_pool:
-            candidates.append(distractor_pool[gt_name])
-            names.add(gt_name)
-            grew = True
-        if len(names) < 2:
-            distractor = next((distractor_pool[n] for n in distractor_names if n != gt_name), None)
-            if distractor is None:
-                continue
-            candidates.append(distractor)
-            grew = True
-        if grew:
-            augmented += 1
+        if not native_multi and pool_names:
+            seen = {t.name for t in candidates}
+            salt = zlib.crc32(f"step1::{SEED}::{s.sample_id}".encode("utf-8"))
+            rng = random.Random(salt)
+            for pick in rng.sample(pool_names, min(len(pool_names), pack_k + 3)):
+                if len(candidates) >= pack_k:
+                    break
+                if pick not in seen:
+                    candidates.append(pool[pick])
+                    seen.add(pick)
+            rng.shuffle(candidates)
+        if len(candidates) < 2:
+            continue
 
         pred = resolver.predict_tool(candidates, s.utterance, s.recent_context, s.current_time_iso)
         pred_name = pred.get("tool_name")
-        is_correct = bool(pred_name) and pred_name == gt_name
-        total += 1
-        probs.append(pred.get("tool_prob", 0.0))
-        margins.append(pred.get("tool_margin", 0.0))
+        ok = bool(pred_name) and pred_name == gt_name
         if not pred.get("tool_scores"):
             empty_scores += 1
-            empty_reasons[str(pred.get("tool_scores_reason") or "unknown")] += 1
-        # Phase I: count how many candidate schemas H1 actually chose between.
-        _scores = pred.get("tool_scores") or {}
-        cand_counts[len(_scores)] += 1
 
+        bucket = cohort if cohort in native_stats else "other"
         if native_multi:
-            multi_total += 1
-            multi_correct += int(is_correct)
+            native_stats[bucket][1] += 1
+            native_stats[bucket][0] += int(ok)
+            t_key = str(len(candidates)) if len(candidates) <= 4 else "5+"
+            by_t[t_key][1] += 1
+            by_t[t_key][0] += int(ok)
         else:
-            single_total += 1
-            single_correct += int(is_correct)
-        if pred_name and pred_name != gt_name:
-            wrong_as[pred_name] += 1
-        tt = per_tool[gt_name]
-        tt["n"] += 1
-        tt["correct"] += int(is_correct)
-        if pred_name and pred_name != gt_name:
-            tt["wrong_as"][pred_name] += 1
+            aug_stats[1] += 1
+            aug_stats[0] += int(ok)
 
-        if limit is not None and total >= limit:
-            break
+        probs_by_cohort[cohort].append(float(pred.get("tool_prob") or 0.0))
+        margins_by_cohort[cohort].append(float(pred.get("tool_margin") or 0.0))
+        if pred_name and not ok:
+            wrong_pairs[(gt_name, pred_name)] += 1
+        if cohort == "F_func":
+            per_tool[gt_name]["n"] += 1
+            per_tool[gt_name]["correct"] += int(ok)
+            if pred_name and not ok:
+                per_tool[gt_name]["wrong_as"][pred_name] += 1
 
-    acc_all = (single_correct + multi_correct) / max(1, total)
-    acc_multi = multi_correct / max(1, multi_total)
-    acc_single = single_correct / max(1, single_total)
-    mean_p = sum(probs) / max(1, len(probs))
-    mean_m = sum(margins) / max(1, len(margins))
+    print("=== Step 1a: Native Multi-Tool Accuracy (len(s.tools) >= 2) ===")
+    tot_c = sum(v[0] for v in native_stats.values())
+    tot_n = sum(v[1] for v in native_stats.values())
+    print(f"  Overall native multi-tool: {tot_c / max(1, tot_n):.4f} ({tot_c}/{tot_n})")
+    for bk in ("F_func", "A_clean", "other"):
+        c, n = native_stats[bk]
+        if n:
+            print(f"    {bk:<8}: {c / n:.4f} ({c}/{n})")
+    print("  By native candidate count T:", {k: f"{v[0]}/{v[1]} ({v[0]/v[1]:.3f})" for k, v in sorted(by_t.items())})
 
-    mean_cands = (sum(c * n for c, n in cand_counts.items()) / max(1, total))
-    print(f"=== Lean Tool Prediction (H1) on {split_name} (N={total}) — >=2 candidates ===")
-    print(f"Top-1 Tool Accuracy (Overall): {acc_all:.4f} ({(single_correct + multi_correct)}/{total})")
-    print(f"  Multi-tool subset: {acc_multi:.4f} ({multi_correct}/{multi_total})")
-    print(f"  Single+distractor subset: {acc_single:.4f} ({single_correct}/{single_total})")
-    print(f"  mean_n_candidates: {mean_cands:.2f} "
-          f"(hist={dict(sorted(cand_counts.items()))})")
-    if total and mean_cands < 1.5:
-        print("  [!VACUOUS-H1] mean_n_candidates < 1.5: H1 had ONE class per row, so "
-              "the accuracy above is an artifact, not tool-selection skill.")
-    print(f"Mean Winner Tool Probability: {mean_p:.4f} | Mean Margin: {mean_m:.4f}")
-    print(f"Rows with empty tool_scores: {empty_scores}")
-    if empty_scores:
-        print(f"  empty tool_scores by cause: {dict(empty_reasons.most_common())}")
-    print(f"Rows where candidates were augmented beyond s.tools: {augmented}")
-    print(f"Most common wrong picks: {wrong_as.most_common(8)}")
+    print("\\n=== Step 1b: Single-Tool + Random Pool Distractors (T=3) ===")
+    if aug_stats[1]:
+        print(f"  Single+random distractors: {aug_stats[0] / aug_stats[1]:.4f} ({aug_stats[0]}/{aug_stats[1]})")
+    else:
+        print("  (no single-tool rows in clean subset)")
 
+    print("\\n=== Step 1c: Score & Margin Separation (F_func vs A_clean) ===")
+    for bk in ("F_func", "A_clean"):
+        ps = probs_by_cohort.get(bk, [])
+        ms = margins_by_cohort.get(bk, [])
+        if ps:
+            print(f"  {bk:<8} (n={len(ps):>3}) | tool_prob p10={_pct(ps,0.1):.3f} p50={_pct(ps,0.5):.3f} p90={_pct(ps,0.9):.3f} "
+                  f"| margin p10={_pct(ms,0.1):.3f} p50={_pct(ms,0.5):.3f} p90={_pct(ms,0.9):.3f}")
+    print(f"  Empty tool_scores (unexpected after Step 0): {empty_scores}")
+
+    print("\\n=== Step 1d: Top Confusions & Worst F_func Tools ===")
+    if wrong_pairs:
+        print("  Top (gt -> pred):", [(f"{g} -> {p}", cnt) for (g, p), cnt in wrong_pairs.most_common(8)])
     if per_tool:
-        print("\\n--- Per-tool H1 accuracy ---")
-        print(f"{'tool':<30}{'n':>6}{'acc':>8}{'wrong_as':<40}")
-        for tname, st in sorted(per_tool.items(), key=lambda kv: (-kv[1]["n"], kv[1]["correct"])):
-            acc_t = st["correct"] / max(1, st["n"])
-            wrong_str = ", ".join(f"{w}x{v}" for w, v in st["wrong_as"].most_common(3))
-            print(f"{tname:<30}{st['n']:>6}{acc_t:>8.3f}  {wrong_str}")
-    print("==================================================================")
+        print(f"  {'tool':<30}{'n':>5}{'acc':>8}  wrong_as")
+        for tn, st in sorted(per_tool.items(), key=lambda kv: (kv[1]["correct"] / max(1, kv[1]["n"]), -kv[1]["n"]))[:12]:
+            wstr = ", ".join(f"{w}x{c}" for w, c in st["wrong_as"].most_common(2))
+            print(f"  {tn:<30}{st['n']:>5}{st['correct']/max(1,st['n']):>8.3f}  {wstr}")
 
-eval_tool_prediction_lean(EVAL_SPLIT, limit=EVAL_LIMIT)'''
+eval_tool_prediction_step1(CLEAN_EVAL_PATH, os.path.join(DATA_DIR, f"{EVAL_SPLIT}.jsonl"))'''
+
+MARKDOWN_PREDICT_SPLIT = """---
+## 5c. Step 3 — Composed E2E (`single_pass` vs `two_step`) & Stage Waterfall
+
+Runs `predict_split` on the shared stratified subset (`SUBSET_EVAL_PATH`) in both `single_pass` (`preds_eval.jsonl`) and `two_step` (`preds_eval_twostep.jsonl`) modes using the **same checkpoint**, and prints the **Stage-by-Stage Waterfall Funnel** (`Total F_func` → `Step 0 Sanitize` → `Step 1 Tool` → `Step 2a Parity` → `Step 2b Pointer` → `Step 2c Schema & Gates`)."""
 
 CODE_PREDICT_SPLIT = '''def _param_detail(pr) -> Dict[str, Any]:
     return {
@@ -2428,12 +2488,11 @@ def _features_detail(features) -> Dict[str, Any]:
 
 
 def predict_split(split_name: str, out_path: str, limit: Optional[int] = None,
-                  detailed: bool = True, protect_parity_spans: bool = False) -> None:
-    # T8: ONE definition of "a predicted call", shared with Eval Part 1. Imported
-    # here (not copy-pasted) so the two parts cannot drift apart again.
+                  detailed: bool = True, protect_parity_spans: bool = False,
+                  resolve_mode: Optional[str] = None, src_path: Optional[str] = None) -> None:
     from spancall.lean.eval_p1 import _parity_spans_for_call, predicted_call_count as _n_predicted_calls
-    src = os.path.join(DATA_DIR, f"{split_name}.jsonl")
     sub_src = os.path.join(RESULTS_DIR, f"subset_{split_name}.jsonl")
+    src = src_path or (sub_src if (split_name == EVAL_SPLIT and os.path.exists(sub_src)) else os.path.join(DATA_DIR, f"{split_name}.jsonl"))
     if not os.path.exists(src):
         print(f"no source {src} — skipped")
         return
@@ -2463,6 +2522,7 @@ def predict_split(split_name: str, out_path: str, limit: Optional[int] = None,
                 res = resolver.try_resolve_candidates(
                     s.tools, s.utterance, s.recent_context, s.current_time_iso,
                     parity_spans=_p_spans, protect_parity_spans=protect_parity_spans,
+                    resolve_mode=resolve_mode,
                 )
             else:
                 res = resolver.try_resolve_candidates(s.tools, s.utterance, s.recent_context, s.current_time_iso)
@@ -2479,18 +2539,9 @@ def predict_split(split_name: str, out_path: str, limit: Optional[int] = None,
                 "stratum": s.stratum.value,
                 "gt_tool": (s.ground_truth_calls[0].tool_name if s.ground_truth_calls else None),
                 "gt_args": (s.ground_truth_calls[0].arguments if s.ground_truth_calls else {}),
-                # R0.4 / J6: keep the WHOLE gt call list so the evaluator can score
-                # the predicted call SET instead of only the flattened first call.
                 "gt_calls": [{"tool_name": c.tool_name, "arguments": dict(c.arguments or {})}
                              for c in (s.ground_truth_calls or [])],
                 "n_gt_calls": len(s.ground_truth_calls or []),
-                # R0.4: the decoded call list. ``tool_name``/``payload`` above stay
-                # the primary (call-0) view, so single-call consumers are unchanged.
-                # T8: ``n_pred_calls`` uses the SAME rule as Part 1, via the
-                # shared helper — a call with no tool name asserts nothing, so it
-                # is not a prediction. Counting raw ``len(res.calls)`` made Part 3
-                # report abstained decodes as calls and disagree with Part 1 on
-                # the very same resolver output.
                 "calls": [c.as_dict() for c in (getattr(res, "calls", None) or [])],
                 "n_pred_calls": _n_predicted_calls(res),
                 "hit": bool(res.hit),
@@ -2518,89 +2569,148 @@ def predict_split(split_name: str, out_path: str, limit: Optional[int] = None,
     with open(out_path, "w") as fh:
         for p in preds:
             fh.write(json.dumps(p, default=str) + "\\n")
-    with open(sub_src, "w") as fh:
-        for s_dict in subset_samples:
-            fh.write(json.dumps(s_dict, default=str) + "\\n")
+    if os.path.abspath(src) != os.path.abspath(sub_src):
+        with open(sub_src, "w") as fh:
+            for s_dict in subset_samples:
+                fh.write(json.dumps(s_dict, default=str) + "\\n")
     n_hit = sum(1 for p in preds if p["hit"])
     _par_str = f"{parity_hit}/{parity_checked} ({parity_hit / parity_checked:.3f})" if parity_checked else "n/a"
-    print(f"predicted {n} rows → {out_path} (hit={n_hit}, collapse_hits={collapse_hits}, e2e_parity={_par_str}, wrong_tool_parity={parity_wrong_tool}) and saved subset → {sub_src}")
-    if parity_miss_reasons:
-        print(f"  e2e parity_miss_reasons: {dict(sorted(parity_miss_reasons.items(), key=lambda kv: -kv[1]))}")
+    print(f"predicted {n} rows ({resolve_mode or 'default'}) → {out_path} (hit={n_hit}, collapse_hits={collapse_hits}, e2e_parity={_par_str})")
 
-predict_split(EVAL_SPLIT, os.path.join(RESULTS_DIR, "preds_eval.jsonl"), limit=EVAL_LIMIT)'''
+_p_single = os.path.join(RESULTS_DIR, "preds_eval.jsonl")
+_p_two    = os.path.join(RESULTS_DIR, "preds_eval_twostep.jsonl")
+predict_split(EVAL_SPLIT, _p_single, limit=None, resolve_mode="single_pass", src_path=SUBSET_EVAL_PATH)
+predict_split(EVAL_SPLIT, _p_two,    limit=None, resolve_mode="two_step",    src_path=SUBSET_EVAL_PATH)
+
+# --- Stage-by-Stage E2E Waterfall Funnel on F_func ---
+from spancall.eval.toolcall.evaluator import payload_equal
+from spancall.lean.eval_p1 import classify_eval_cohort
+
+_raw_sub = {}
+with open(SUBSET_EVAL_PATH) as _fh:
+    for _l in _fh:
+        if _l.strip():
+            _d = json.loads(_l)
+            _raw_sub[_d["sample_id"]] = (_d, UnifiedSample.from_dict(_d))
+
+def _waterfall(preds_path: str, label: str) -> None:
+    with open(preds_path) as _fh:
+        _ps = [json.loads(l) for l in _fh if l.strip()]
+    _f = [p for p in _ps if classify_eval_cohort(_raw_sub[p["sample_id"]][0]) == "F_func"]
+    _ac = [p for p in _ps if classify_eval_cohort(_raw_sub[p["sample_id"]][0]) == "A_clean"]
+    _aa = [p for p in _ps if classify_eval_cohort(_raw_sub[p["sample_id"]][0]) == "A_adv"]
+
+    n_tot = len(_f)
+    s0 = [p for p in _f if not str(p.get("abstain_reason") or "").startswith("sanitize")]
+    s1 = [p for p in s0 if p.get("tool_name") == p.get("gt_tool")]
+    s2a = [p for p in s1 if int((p.get("features") or {}).get("parity_checked") or 0) == int((p.get("features") or {}).get("parity_hit") or 0)]
+    s2b_exact = []
+    for p in s2a:
+        _s = _raw_sub[p["sample_id"]][1]
+        _gt_t = next((t for t in _s.tools if t.name == p["gt_tool"]), None)
+        _partial_ok = payload_equal(p.get("gt_args") or {}, p.get("payload_partial") or {}, _gt_t)
+        if _partial_ok:
+            s2b_exact.append(p)
+    s2c_hit = [p for p in s2b_exact if p.get("hit")]
+
+    print(f"\\n--- Waterfall Funnel [{label}] on F_func (N={n_tot}) ---")
+    for _name, _cnt in [
+        ("Total F_func", n_tot),
+        ("-> Step 0: Sanitize OK", len(s0)),
+        ("-> Step 1: Correct Tool", len(s1)),
+        ("-> Step 2a: All GT Spans in C=512", len(s2a)),
+        ("-> Step 2b: All Params Matched (partial)", len(s2b_exact)),
+        ("-> Step 2c: Schema & Gates Hit (E2E Exact)", len(s2c_hit)),
+    ]:
+        print(f"  { _name:<44} {_cnt:>4} / {n_tot} ({_cnt / max(1, n_tot):>6.1%})")
+
+    _ac_hit = sum(1 for p in _ac if p.get("hit"))
+    _aa_san = sum(1 for p in _aa if str(p.get("abstain_reason") or "").startswith("sanitize"))
+    print(f"  [A_clean] correct abstain: {len(_ac) - _ac_hit}/{len(_ac)} ({1.0 - _ac_hit / max(1, len(_ac)):.1%}) | "
+          f"[A_adv] sanitize-vetoed: {_aa_san}/{len(_aa)} ({_aa_san / max(1, len(_aa)):.1%})")
+
+_waterfall(_p_single, "single_pass")
+_waterfall(_p_two, "two_step")'''
 
 MARKDOWN_SAMPLES_INTRO = """---
-## 5c. Sample-Prediction Forensics
+## 5d. Stage-Attributed Error Forensics
 
-Inspects per-sample predictions in `preds_eval.jsonl`: hits, wrong-tool picks, and partial/schema-invalid payloads."""
+Groups `F_func` misses in `preds_eval.jsonl` by the exact stage where they failed (`Step 1 WRONG_TOOL`, `Step 2a PARITY_MISS`, `Step 2b POINTER_RANK_MISS`, `Step 2c GATE_OR_SCHEMA_REJECT`) and prints up to 3 concrete examples per bucket."""
 
 CODE_SAMPLES_FORENSICS = '''import json, os, textwrap
-from collections import Counter
+from collections import Counter, defaultdict
+from spancall.data.schema import UnifiedSample
+from spancall.eval.toolcall.evaluator import payload_equal
+from spancall.lean.eval_p1 import classify_eval_cohort
 
 PREDS_PATH = os.path.join(RESULTS_DIR, "preds_eval.jsonl")
 if not os.path.exists(PREDS_PATH):
-    print("preds_eval.jsonl not found — run the predict_split cell first")
+    print("preds_eval.jsonl not found — run Step 3 predict_split first")
 else:
     with open(PREDS_PATH) as fh:
         preds = [json.loads(l) for l in fh if l.strip()]
-    subs = {}
-    sub_path = os.path.join(RESULTS_DIR, f"subset_{EVAL_SPLIT}.jsonl")
-    if os.path.exists(sub_path):
-        from spancall.data.schema import UnifiedSample
-        with open(sub_path) as fh:
+    subs, raw_map = {}, {}
+    if os.path.exists(SUBSET_EVAL_PATH):
+        with open(SUBSET_EVAL_PATH) as fh:
             for l in fh:
                 if l.strip():
                     d = json.loads(l)
-                    subs[d.get("sample_id")] = UnifiedSample.from_dict(d)
+                    raw_map[d["sample_id"]] = d
+                    subs[d["sample_id"]] = UnifiedSample.from_dict(d)
 
     def _utt(sid):
         s = subs.get(sid)
-        return textwrap.shorten(s.utterance, width=160, placeholder=" …") if s else "(n/a)"
+        return textwrap.shorten(s.utterance, width=140, placeholder=" …") if s else "(n/a)"
 
-    def _verdict(p):
-        if p.get("tool_name") and p.get("gt_tool") and p["tool_name"] != p["gt_tool"]:
-            return "WRONG_TOOL"
-        if p.get("hit"):
-            return "HIT"
-        return "PARTIAL"
+    buckets = defaultdict(list)
+    for p in preds:
+        sid = p.get("sample_id")
+        if sid not in raw_map or classify_eval_cohort(raw_map[sid]) != "F_func":
+            continue
+        feats = p.get("features") or {}
+        if str(p.get("abstain_reason") or "").startswith("sanitize"):
+            buckets["STEP0_SANITIZE"].append(p)
+        elif p.get("tool_name") != p.get("gt_tool"):
+            buckets["STEP1_WRONG_TOOL"].append(p)
+        elif int(feats.get("parity_hit") or 0) < int(feats.get("parity_checked") or 0):
+            buckets["STEP2A_PARITY_MISS"].append(p)
+        else:
+            s = subs[sid]
+            gt_t = next((t for t in s.tools if t.name == p["gt_tool"]), None)
+            partial_ok = payload_equal(p.get("gt_args") or {}, p.get("payload_partial") or {}, gt_t)
+            if p.get("hit") and payload_equal(p.get("gt_args") or {}, p.get("payload") or {}, gt_t):
+                buckets["EXACT_HIT"].append(p)
+            elif not partial_ok:
+                buckets["STEP2B_POINTER_RANK_MISS"].append(p)
+            else:
+                buckets["STEP2C_GATE_OR_SCHEMA_REJECT"].append(p)
 
-    verdicts = Counter(_verdict(p) for p in preds)
-    print(f"Loaded {len(preds)} Lean prediction records from {PREDS_PATH}")
-    print("Verdict distribution:")
-    for v, c in verdicts.most_common():
-        print(f"  {v:<12}{c:>5}  ({c / max(1, len(preds)):.1%})")
+    tot_f = sum(len(v) for v in buckets.values())
+    print(f"F_func Stage Attribution (N={tot_f}):")
+    for k in ("EXACT_HIT", "STEP0_SANITIZE", "STEP1_WRONG_TOOL", "STEP2A_PARITY_MISS", "STEP2B_POINTER_RANK_MISS", "STEP2C_GATE_OR_SCHEMA_REJECT"):
+        c = len(buckets[k])
+        print(f"  {k:<30}{c:>4}  ({c / max(1, tot_f):>6.1%})")
 
-    hits = [p for p in preds if p.get("hit")]
-    print("\\n" + "=" * 72)
-    print(f"SAMPLE HITS ({len(hits)} total; showing up to 5)")
-    print("=" * 72)
-    for p in hits[:5]:
-        print(f"\\n--- {p.get('sample_id')} [{p.get('tool_name')}] conf={p.get('confidence'):.3f} ---")
-        print(f"  utt : {_utt(p.get('sample_id'))}")
-        print(f"  gt  : {json.dumps(p.get('gt_args'), default=str)}")
-        print(f"  pred: {json.dumps(p.get('payload'), default=str)}")
-
-    wrong = [p for p in preds if _verdict(p) == "WRONG_TOOL"]
-    if wrong:
+    for k in ("STEP1_WRONG_TOOL", "STEP2A_PARITY_MISS", "STEP2B_POINTER_RANK_MISS", "STEP2C_GATE_OR_SCHEMA_REJECT"):
+        rows_k = buckets[k]
+        if not rows_k:
+            continue
         print("\\n" + "=" * 72)
-        print(f"WRONG-TOOL MISSES ({len(wrong)} total; showing up to 5)")
+        print(f"{k} ({len(rows_k)} total; showing up to 3)")
         print("=" * 72)
-        for p in wrong[:5]:
-            print(f"\\n--- {p.get('sample_id')} → predicted {p.get('tool_name')} (gt={p.get('gt_tool')}) ---")
-            print(f"  utt : {_utt(p.get('sample_id'))}")
-            if "features" in p and "tool_scores" in (p.get("features") or {}):
-                print(f"  H1 scores: {p['features']['tool_scores']}")
-
-    part = [p for p in preds if _verdict(p) == "PARTIAL"]
-    if part:
-        print("\\n" + "=" * 72)
-        print(f"PARTIAL / SCHEMA-INVALID MISSES ({len(part)} total; showing up to 5)")
-        print("=" * 72)
-        for p in part[:5]:
-            print(f"\\n--- {p.get('sample_id')} [{p.get('tool_name')}] reason={p.get('abstain_reason')} ---")
-            print(f"  utt : {_utt(p.get('sample_id'))}")
-            print(f"  gt  : {json.dumps(p.get('gt_args'), default=str)}")
-            print(f"  pred: {json.dumps(p.get('payload_partial'), default=str)}")'''
+        for p in rows_k[:3]:
+            feats = p.get("features") or {}
+            print(f"--- {p.get('sample_id')} | gt={p.get('gt_tool')} | pred={p.get('tool_name')} | reason={p.get('abstain_reason')} ---")
+            print(f"  utt   : {_utt(p.get('sample_id'))}")
+            if k == "STEP1_WRONG_TOOL":
+                print(f"  H1    : {feats.get('tool_scores')}")
+            elif k == "STEP2A_PARITY_MISS":
+                print(f"  parity: {feats.get('parity_hit')}/{feats.get('parity_checked')} | miss_reasons={feats.get('parity_miss_reasons')}")
+            elif k == "STEP2B_POINTER_RANK_MISS":
+                print(f"  gt    : {json.dumps(p.get('gt_args'), default=str)}")
+                print(f"  pred  : {json.dumps(p.get('payload_partial'), default=str)}")
+            elif k == "STEP2C_GATE_OR_SCHEMA_REJECT":
+                print(f"  margin: {p.get('joint_margin'):.4f} | missing_req={p.get('missing_required')} | collapsed={feats.get('pointer_collapsed')}")'''
 
 MARKDOWN_DIAGNOSTICS = """---
 ## 5d. Why the Number Is Low — Validation Diagnostics
@@ -3631,10 +3741,13 @@ cells = [
     new_code_cell(CODE_PICK_CP),
     new_markdown_cell(MARKDOWN_PREDICT_INTRO),
     new_code_cell(CODE_RESOLVER),
-    new_markdown_cell(MARKDOWN_EVAL_PART1),
-    new_code_cell(CODE_EVAL_PART1),
+    new_markdown_cell(MARKDOWN_BENCHMARK_SLICE),
+    new_code_cell(CODE_BENCHMARK_SLICE),
     new_markdown_cell(MARKDOWN_EVAL_PART2),
     new_code_cell(CODE_EVAL_PART2),
+    new_markdown_cell(MARKDOWN_EVAL_PART1),
+    new_code_cell(CODE_EVAL_PART1),
+    new_markdown_cell(MARKDOWN_PREDICT_SPLIT),
     new_code_cell(CODE_PREDICT_SPLIT),
     new_markdown_cell(MARKDOWN_SAMPLES_INTRO),
     new_code_cell(CODE_SAMPLES_FORENSICS),
