@@ -292,7 +292,7 @@ class LeanResolver(BaseResolver):
         validator: Optional[SchemaValidator] = None,
         k_recent: int = 32,
         context_budget_tokens: int = 4096,
-        max_cands: Optional[int] = 512,
+        max_cands: Optional[int] = 2048,
         max_calls: int = 1,
         call_min_prob: float = 0.25,
         call_min_prob_ratio: float = 0.5,

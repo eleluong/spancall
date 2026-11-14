@@ -52,8 +52,12 @@ _env = Environment(loader=FileSystemLoader(str(_TEMPLATE_DIR)), trim_blocks=Fals
                    lstrip_blocks=False)
 
 
+_WS_CTRL_RE = re.compile(r"[\r\n\t]+")
+
+
 def quote_value(v: str) -> str:
-    """R1 quoting: `\\` -> `\\\\`, `"` -> `\\"`, wrapped in double quotes."""
+    """R1 quoting: collapse newlines/tabs, `\\` -> `\\\\`, `"` -> `\\"`, wrapped in double quotes."""
+    v = _WS_CTRL_RE.sub(" ", str(v))
     return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 

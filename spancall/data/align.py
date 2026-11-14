@@ -733,11 +733,35 @@ class ReverseAligner(BaseAligner):
             if e_val == s_val:
                 out.append(self._target(p, e, "recent_ctx", e.value, ctx_key=e.key))
                 continue
-            if not self.fuzzy_matching and _word_bounded_matches(e_val, s_val):
-                # whole-value equality is preferred; substring matches are a
-                # fallback only when the substring is a full word inside the value
-                if _is_full_token_in(e_val, s_val):
-                    out.append(self._target(p, e, "recent_ctx", e.value, ctx_key=e.key))
+            if not self.fuzzy_matching:
+                occ = _word_bounded_matches(e_val, s_val)
+                if occ and _is_full_token_in(e_val, s_val):
+                    # Emit the exact word-bounded substring span & value rather
+                    # than the entire recent_context turn (fixes whole-turn label
+                    # corruption when a param value is embedded in a sentence).
+                    e_text = getattr(e, "text", None) or e_val
+                    if e_text == e_val:
+                        for rs, re_ in occ:
+                            out.append(SpanTarget(
+                                param_name=p.name,
+                                target_type="recent_ctx",
+                                char_start=e.char_start + rs,
+                                char_end=e.char_start + re_,
+                                ctx_key=e.key,
+                                canonical_value=s_val,
+                            ))
+                    else:
+                        idx = e_text.find(s_val)
+                        cs = e.char_start + idx if idx >= 0 else e.char_start
+                        ce = cs + len(s_val) if idx >= 0 else e.char_end
+                        out.append(SpanTarget(
+                            param_name=p.name,
+                            target_type="recent_ctx",
+                            char_start=cs,
+                            char_end=ce,
+                            ctx_key=e.key,
+                            canonical_value=s_val,
+                        ))
         return out
 
     # -------------------------------------------------------------- helpers

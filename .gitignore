@@ -104,3 +104,6 @@ logs/
 .cache/
 hf_cache/
 huggingface/
+
+
+research_paper
