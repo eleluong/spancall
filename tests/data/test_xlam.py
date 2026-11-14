@@ -155,8 +155,9 @@ def test_v2_6_notebook_includes_xlam_mix_and_eval() -> None:
     nb_path = Path(__file__).resolve().parents[2] / "notebooks" / "spancall_lean_v2_6_train_eval.ipynb"
     assert nb_path.is_file()
     nb = json.loads(nb_path.read_text(encoding="utf-8"))
-    assert len(nb["cells"]) == 24
+    assert len(nb["cells"]) == 26
     all_src = "\n".join("".join(c.get("source", [])) for c in nb["cells"])
+    assert "summary_report.md" in all_src
     assert "XLAM_TRAIN_ROWS   = 15000" in all_src
     assert "XLAM_DEV_ROWS     = 1000" in all_src
     assert "SINGLE_CALL_ONLY  = True" in all_src

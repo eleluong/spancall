@@ -1228,6 +1228,98 @@ if os.path.exists(PREDS_PATH) and os.path.exists(SUBSET_EVAL_PATH):
         c = len(buckets[k])
         print(f"  {k:<30}{c:>4}  ({c / max(1, tot_f):>6.1%})")'''
 
+MARKDOWN_EVAL_STEP5 = """---
+### 4e. Param-Precision FP Deep Dive (diagnostic)
+
+Dumps `F_func` rows that reached Step 2 (right tool, parity OK) but produced a wrong payload, with per-parameter `confidence` / `margin` / `source_type` / `char_span` detail. Purpose: test the hypothesis that the decoder force-assigns argmax values to params whose value is absent or ambiguous (T6 refusal off: `min_confidence` / `min_posterior` are `None`, and the greedy fallback in `decode_detailed` returns top-1 with `delta=0`).
+
+Also sweeps per-param confidence / margin thresholds offline over the stored `parameters` detail to estimate the precision/recall tradeoff of enabling per-param refusal."""
+
+CODE_EVAL_STEP5 = '''import json, os
+from collections import Counter, defaultdict
+from spancall.data.schema import UnifiedSample
+from spancall.eval.toolcall.evaluator import payload_equal
+from spancall.lean.eval_p1 import classify_eval_cohort
+
+N_DUMP = 20  # number of FP rows to print in full
+
+with open(PREDS_PATH) as fh:
+    _preds = [json.loads(l) for l in fh if l.strip()]
+
+fp_rows = []
+fp_reason_counter = Counter()
+conf_hist, margin_hist = [], []
+delta_zero_rows = 0
+
+for p in _preds:
+    sid = p.get("sample_id")
+    if sid not in raw_map or classify_eval_cohort(raw_map[sid]) != "F_func":
+        continue
+    feats = p.get("features") or {}
+    if str(p.get("abstain_reason") or "").startswith("sanitize"):
+        continue
+    if p.get("tool_name") != p.get("gt_tool"):
+        continue
+    if int(feats.get("parity_hit") or 0) < int(feats.get("parity_checked") or 0):
+        continue  # candidate-generation miss, not a precision problem
+    if p.get("hit") and payload_equal(p.get("gt_args") or {}, p.get("payload") or {}, None):
+        continue
+    # This row passed Step 0/1/2a but failed payload equality -> precision FP.
+    if abs(float(p.get("joint_margin") or 0.0)) < 1e-9:
+        delta_zero_rows += 1
+    params = p.get("parameters") or {}
+    gt_args = p.get("gt_args") or {}
+    for pn, pr in params.items():
+        conf_hist.append(float(pr.get("confidence") or 0.0))
+        margin_hist.append(float(pr.get("margin") or 0.0))
+        pv = pr.get("value")
+        if pn not in gt_args:
+            fp_reason_counter["param_not_in_gt"] += 1
+        elif gt_args[pn] != pv and gt_args[pn] is not None:
+            fp_reason_counter["wrong_value"] += 1
+        elif gt_args[pn] is None and pv is not None:
+            fp_reason_counter["should_be_null"] += 1
+    fp_rows.append(p)
+
+print(f"F_func Step-2 precision-FP rows: {len(fp_rows)} / {sum(1 for p in _preds if p.get('sample_id') in raw_map and classify_eval_cohort(raw_map[p['sample_id']]) == 'F_func')}")
+print(f"  joint_margin == 0 (greedy fallback / no runner-up) rows: {delta_zero_rows}")
+print(f"  FP reasons: {dict(fp_reason_counter)}")
+if conf_hist:
+    conf_hist.sort(); margin_hist.sort()
+    def _q(a, q): return a[min(len(a) - 1, int(q * len(a)))]
+    print(f"  predicted-param confidence: p10={_q(conf_hist, 0.10):.3f} p50={_q(conf_hist, 0.50):.3f} p90={_q(conf_hist, 0.90):.3f}")
+    print(f"  predicted-param margin:      p10={_q(margin_hist, 0.10):.3f} p50={_q(margin_hist, 0.50):.3f} p90={_q(margin_hist, 0.90):.3f}")
+
+for p in fp_rows[:N_DUMP]:
+    print("-" * 100)
+    print(f"{p['sample_id']}  tool={p.get('tool_name')}  hit={p.get('hit')}  joint_margin={p.get('joint_margin'):.4f}")
+    print(f"  utterance: {(raw_map[p['sample_id']].get('utterance') or '')[:220]!r}")
+    print(f"  gt_args:   {json.dumps(p.get('gt_args') or {}, default=str)[:400]}")
+    print(f"  payload:   {json.dumps(p.get('payload') or {}, default=str)[:400]}")
+    for pn, pr in (p.get("parameters") or {}).items():
+        gt_v = (p.get("gt_args") or {}).get(pn, "<NOT_IN_GT>")
+        flag = "OK" if gt_v == pr.get("value") else ("NULL?" if gt_v is None else "WRONG")
+        print(f"    [{flag:<6}] {pn:<28} pred={str(pr.get('value'))[:60]!s:<62} gt={str(gt_v)[:40]:<42} conf={pr.get('confidence'):.3f} margin={pr.get('margin'):.3f} src={pr.get('source_type')} span={pr.get('char_span')}")
+
+# Offline refusal sweep: what would per-param thresholding have done?
+if conf_hist or margin_hist:
+    print("\\n=== Offline Per-Param Refusal Sweep (stored predictions, no re-inference) ===")
+    print(f"{'conf>=':>7}{'margin>=':>9}{'dropped':>9}{'dropped_OK':>12}{'dropped_bad':>12}")
+    for c_thr in (0.0, 0.3, 0.5, 0.7):
+        for m_thr in (0.0, 0.05, 0.1, 0.2):
+            dropped = ok = bad = 0
+            for p in fp_rows:
+                gt_args = p.get("gt_args") or {}
+                for pn, pr in (p.get("parameters") or {}).items():
+                    if float(pr.get("confidence") or 0.0) < c_thr or float(pr.get("margin") or 0.0) < m_thr:
+                        dropped += 1
+                        if pn in gt_args and gt_args[pn] == pr.get("value"):
+                            ok += 1  # would have removed a CORRECT param
+                        else:
+                            bad += 1  # would have removed a wrong/spurious param
+            print(f"{c_thr:>7.2f}{m_thr:>9.2f}{dropped:>9d}{ok:>12d}{bad:>12d}")
+    print("(dropped_bad >> dropped_OK at the operating point => per-param refusal (T6) would recover precision)")'''
+
 MARKDOWN_TEST = """---
 ## 5. OOD / Adversarial Test Splits & Drive Persistence
 
@@ -1289,6 +1381,169 @@ if DRIVE_MOUNT:
             shutil.copytree(src, dst, dirs_exist_ok=True)
             print(f"mirrored {src} -> {dst}")'''
 
+MARKDOWN_SUMMARY_REPORT = """---
+## 6. Final Run Summary Report
+
+Aggregates the configuration, tensorized dataset counts, best training epoch, `hermes_eval` headline metrics, and all OOD/cross-corpus test results into a single summary printed to stdout and saved as `summary_report.json` / `summary_report.md`."""
+
+CODE_SUMMARY_REPORT = '''import json, os
+
+def _count_jsonl(path: str) -> int:
+    if not os.path.exists(path):
+        return 0
+    with open(path, encoding="utf-8") as fh:
+        return sum(1 for line in fh if line.strip())
+
+def _safe_round(v, ndigits: int = 4):
+    if v is None:
+        return None
+    try:
+        return round(float(v), ndigits)
+    except (TypeError, ValueError):
+        return None
+
+_t2_n = _count_jsonl(os.path.join(TENSOR_DIR, "t2.jsonl"))
+_dev_n = _count_jsonl(os.path.join(TENSOR_DIR, "dev.jsonl"))
+
+_best_epoch = None
+_all_epochs = []
+_train_log_file = os.path.join(exp_root, "train_log.jsonl")
+if os.path.exists(_train_log_file):
+    with open(_train_log_file, encoding="utf-8") as _fh:
+        _recs = [json.loads(l) for l in _fh if l.strip()]
+    _evals = [r for r in _recs if r.get("event") == "epoch_eval"]
+    _ends = {r.get("epoch"): r for r in _recs if r.get("event") == "epoch_end"}
+    for _r in _evals:
+        _ep = _r.get("epoch")
+        _end = _ends.get(_ep, {})
+        _entry = {
+            "epoch": _ep,
+            "span_acc": _safe_round(_r.get("span_acc")),
+            "exact_params_only": _safe_round(_r.get("exact_params_only")),
+            "exact_call": _safe_round(_r.get("exact_call")),
+            "tool_acc": _safe_round(_r.get("tool_acc")),
+            "eval_loss": _safe_round(_r.get("eval_loss")),
+            "train_loss": _safe_round(_end.get("mean_loss")),
+        }
+        _all_epochs.append(_entry)
+    if _all_epochs:
+        _best_epoch = max(
+            _all_epochs,
+            key=lambda e: (e["exact_call"] if e["exact_call"] is not None else -1.0),
+        )
+
+_headline = {}
+for _label, _fn in [
+    ("B1a (regex)", f"toolcall_metrics_{EVAL_SPLIT}_b1a.json"),
+    ("SpanCall Lean (single_pass)", f"toolcall_metrics_{EVAL_SPLIT}_lean.json"),
+    ("SpanCall Lean (two_step)", f"toolcall_metrics_{EVAL_SPLIT}_lean_twostep.json"),
+]:
+    _m = _load_metrics(os.path.join(RESULTS_DIR, _fn))
+    if not _m:
+        continue
+    _mf = _m.get("metrics_by_stratum", {}).get("F", {})
+    _headline[_label] = {
+        "n_F": int(_mf.get("n", 0)),
+        "exact_F": _safe_round(_mf.get("exact_payload_match"), 3),
+        "hit_F": _safe_round(_mf.get("hit_rate"), 3),
+        "collapse_F": _safe_round(_mf.get("collapse_hit_rate"), 3),
+        "param_F1_F": _safe_round(_mf.get("param_f1"), 3),
+        "false_hit_on_A": _safe_round(_m.get("false_hit_rate_on_a"), 4),
+        "exact_all": _safe_round(_m.get("exact_payload_match"), 3),
+    }
+
+_split_results = {}
+for _sp in TEST_SPLITS + [EVAL_SPLIT]:
+    _split_results[_sp] = {}
+    for _lbl in ("b1a", "lean"):
+        _m = _load_metrics(os.path.join(RESULTS_DIR, f"toolcall_metrics_{_sp}_{_lbl}.json"))
+        if not _m:
+            continue
+        _mf = _m.get("metrics_by_stratum", {}).get("F", {})
+        _split_results[_sp][_lbl] = {
+            "n_F": int(_mf.get("n", 0)),
+            "exact_F": _safe_round(_mf.get("exact_payload_match"), 3),
+            "hit_F": _safe_round(_mf.get("hit_rate"), 3),
+            "param_F1": _safe_round(_mf.get("param_f1"), 3),
+            "false_hit_on_A": _safe_round(_m.get("false_hit_rate_on_a"), 4),
+            "exact_all": _safe_round(_m.get("exact_payload_match"), 3),
+        }
+
+_summary = {
+    "config": {
+        "experiment_name": EXPERIMENT_NAME,
+        "backbone": BACKBONE,
+        "seed": SEED,
+        "single_call_only": SINGLE_CALL_ONLY,
+        "xlam_train_rows": XLAM_TRAIN_ROWS,
+        "xlam_dev_rows": XLAM_DEV_ROWS,
+        "max_calls": MAX_CALLS,
+        "min_joint_margin": MIN_JOINT_MARGIN,
+        "checkpoint_dir": CHECKPOINT_DIR,
+    },
+    "tensorized_rows": {"t2": _t2_n, "dev": _dev_n},
+    "best_epoch": _best_epoch,
+    "hermes_eval_headline": _headline,
+    "split_results": _split_results,
+}
+
+_summary_json = os.path.join(RESULTS_DIR, "summary_report.json")
+with open(_summary_json, "w", encoding="utf-8") as _fh:
+    json.dump(_summary, _fh, indent=2)
+
+_md_lines = [
+    f"# SpanCall Lean v2.6 Run Summary ({EXPERIMENT_NAME})",
+    "",
+    "## Configuration & Data",
+    f"- **Backbone**: `{BACKBONE}` | **Seed**: `{SEED}` | **Single-Call Only**: `{SINGLE_CALL_ONLY}`",
+    f"- **xLAM Mix Caps**: `XLAM_TRAIN_ROWS={XLAM_TRAIN_ROWS}`, `XLAM_DEV_ROWS={XLAM_DEV_ROWS}`",
+    f"- **Tensorized Rows**: `t2={_t2_n}`, `dev={_dev_n}`",
+    f"- **Checkpoint**: `{CHECKPOINT_DIR}`",
+    "",
+    "## Best Dev Epoch",
+]
+if _best_epoch:
+    _md_lines.append(
+        f"- Epoch `{_best_epoch['epoch']}`: `exact_call={_best_epoch['exact_call']}`, "
+        f"`tool_acc={_best_epoch['tool_acc']}`, `span_acc={_best_epoch['span_acc']}`, "
+        f"`exact_params_only={_best_epoch['exact_params_only']}`, `eval_loss={_best_epoch['eval_loss']}`"
+    )
+else:
+    _md_lines.append("- No training log found.")
+
+_md_lines.extend([
+    "",
+    f"## Headline Comparison ({EVAL_SPLIT})",
+    "| System | n_F | exact_F | hit_F | collapse_F | param_F1_F | false_hit_on_A | exact_all |",
+    "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+])
+for _sys_name, _vals in _headline.items():
+    _md_lines.append(
+        f"| {_sys_name} | {_vals['n_F']} | {_vals['exact_F']} | {_vals['hit_F']} | "
+        f"{_vals['collapse_F']} | {_vals['param_F1_F']} | {_vals['false_hit_on_A']} | {_vals['exact_all']} |"
+    )
+
+_md_lines.extend([
+    "",
+    "## All Test Splits (two_step Lean vs B1a)",
+    "| Split | System | n_F | exact_F | hit_F | param_F1 | false_hit_on_A | exact_all |",
+    "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+])
+for _sp, _by_sys in _split_results.items():
+    for _lbl, _vals in _by_sys.items():
+        _md_lines.append(
+            f"| {_sp} | {_lbl} | {_vals['n_F']} | {_vals['exact_F']} | {_vals['hit_F']} | "
+            f"{_vals['param_F1']} | {_vals['false_hit_on_A']} | {_vals['exact_all']} |"
+        )
+
+_summary_md_text = "\\n".join(_md_lines) + "\\n"
+_summary_md = os.path.join(RESULTS_DIR, "summary_report.md")
+with open(_summary_md, "w", encoding="utf-8") as _fh:
+    _fh.write(_summary_md_text)
+
+print(_summary_md_text)
+print(f"Saved summary -> {_summary_json} & {_summary_md}")'''
+
 # --------------------------------------------------------------------------
 # Build
 # --------------------------------------------------------------------------
@@ -1316,8 +1571,12 @@ cells = [
     new_code_cell(CODE_EVAL_STEP3),
     new_markdown_cell(MARKDOWN_EVAL_STEP4),
     new_code_cell(CODE_EVAL_STEP4),
+    new_markdown_cell(MARKDOWN_EVAL_STEP5),
+    new_code_cell(CODE_EVAL_STEP5),
     new_markdown_cell(MARKDOWN_TEST),
     new_code_cell(CODE_TEST_AND_PERSIST),
+    new_markdown_cell(MARKDOWN_SUMMARY_REPORT),
+    new_code_cell(CODE_SUMMARY_REPORT),
 ]
 
 # --------------------------------------------------------------------------
