@@ -22,6 +22,9 @@ data:
     context_budget_tokens: 4096
   sources:
     - name: "xlam"
+      hub_id: "Salesforce/xlam-function-calling-60k"
+      single_call_only: true
+      local_path: null
       path: null
     - name: "glaive"
       path: null

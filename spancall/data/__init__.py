@@ -13,7 +13,12 @@ from spancall.data.base import BaseAligner, BaseAugmenter, BaseDatasetLoader
 from spancall.data.align import ReverseAligner
 from spancall.data.augment import DataAugmenter
 from spancall.data.mix import DatasetMixer
-from spancall.data.partition import partition_schema_disjoint, write_splits_jsonl
+from spancall.data.partition import (
+    gt_tool_key,
+    partition_schema_disjoint,
+    partition_schema_groups,
+    write_splits_jsonl,
+)
 
 __all__ = [
     "BaseAligner",
@@ -29,6 +34,8 @@ __all__ = [
     "Stratum",
     "ToolDefinition",
     "UnifiedSample",
+    "gt_tool_key",
     "partition_schema_disjoint",
+    "partition_schema_groups",
     "write_splits_jsonl",
 ]

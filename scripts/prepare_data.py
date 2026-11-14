@@ -37,12 +37,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import yaml
 
+from span_template.stamp import write_stamp
 from spancall.data.align import ReverseAligner
 from spancall.data.augment import DataAugmenter
 from spancall.data.mix import DatasetMixer
-from spancall.data.partition import write_splits_jsonl
+from spancall.data.partition import gt_tool_key, schema_key, write_splits_jsonl
 from spancall.data.schema import Split, Stratum, UnifiedSample
-from spancall.data.sources import HERMES_CONFIGS, HermesLoader
+from spancall.data.sources import HERMES_CONFIGS, HermesLoader, XLAMLoader
 
 
 def parse_args() -> argparse.Namespace:
@@ -89,6 +90,34 @@ def ingest_hermes(source_cfg: Dict[str, object]) -> List[UnifiedSample]:
             f"dropped={loader.stats['dropped_no_gt'] + loader.stats['dropped_no_conversation'] + loader.stats['dropped_no_human_turn']}"
         )
     return out
+
+
+def ingest_xlam(source_cfg: Dict[str, object]) -> List[UnifiedSample]:
+    """Ingest Salesforce/xlam-function-calling-60k into UnifiedSample records."""
+    hub_id = str(source_cfg.get("hub_id") or "Salesforce/xlam-function-calling-60k")
+    local_path = source_cfg.get("local_path") or source_cfg.get("path")
+    limit = source_cfg.get("limit")
+    single_call_only = bool(source_cfg.get("single_call_only", True))
+    loader = XLAMLoader(
+        data_path_or_hub_id=hub_id,
+        local_path=str(local_path) if local_path else None,
+        limit=int(limit) if limit else None,
+        single_call_only=single_call_only,
+    )
+    samples = list(loader.load())
+    dropped = (
+        loader.stats["dropped_multi_call"]
+        + loader.stats["dropped_parse_error"]
+        + loader.stats["dropped_empty_gt"]
+        + loader.stats["dropped_empty_query"]
+    )
+    print(
+        f"[SpanCall Data] xlam (single_call_only={single_call_only}): "
+        f"seen={loader.stats['rows_seen']} yielded={loader.stats['rows_yielded']} "
+        f"gt_calls={loader.stats['parsed_gt_calls']} "
+        f"dropped_multi_call={loader.stats['dropped_multi_call']} total_dropped={dropped}"
+    )
+    return samples
 
 
 def _stratum_mix_from_yaml(cfg_yaml: Dict[str, Any]) -> Dict[str, float]:
@@ -141,23 +170,15 @@ def build_report(
     }
 
 
-def main() -> None:
-    args = parse_args()
-    source_cfgs = _load_sources_from_yaml(args.config)
-    hermes_cfgs = [c for c in source_cfgs if isinstance(c, dict) and c.get("name") == "hermes"]
-    if not hermes_cfgs:
-        print(f"[SpanCall Data] No 'hermes' source found in {args.config}; nothing to do.", file=sys.stderr)
-        sys.exit(1)
-
-    with open(args.config, "r") as fh:
-        cfg_yaml = yaml.safe_load(fh) or {}
-
-    all_samples: List[UnifiedSample] = []
-    for cfg in hermes_cfgs:
-        all_samples.extend(ingest_hermes(cfg))
-    print(f"[SpanCall Data] Total ingested: {len(all_samples)} UnifiedSample records")
-
-    # ---- seeds/shares from config -----------------------------------------
+def _process_source(
+    source_name: str,
+    samples: List[UnifiedSample],
+    *,
+    cfg_yaml: Dict[str, Any],
+    args: argparse.Namespace,
+    group_by: str,
+) -> Dict[str, Any]:
+    """Run align -> augment -> partition -> finalize -> write for one source."""
     schema_split = (cfg_yaml.get("data") or {}).get("schema_split") or {}
     seed = args.seed if args.seed is not None else int(schema_split.get("seed", 42))
     pack_tools = int((cfg_yaml.get("data") or {}).get("pack_tools", 1))
@@ -169,11 +190,8 @@ def main() -> None:
         max_date_drift_days=14,
         align_json_mode_keys=True,
     )
-    aligned: List[UnifiedSample] = []
-    for s in all_samples:
-        a = aligner.align(s)
-        aligned.append(a)
-    align_stats: Dict[str, int] = {
+    aligned: List[UnifiedSample] = [aligner.align(s) for s in samples]
+    align_stats: Dict[str, Any] = {
         "total": len(aligned),
         "stratum_f": sum(1 for s in aligned if s.stratum == Stratum.F),
         "stratum_a": sum(1 for s in aligned if s.stratum == Stratum.A),
@@ -205,18 +223,17 @@ def main() -> None:
     }
     f_share = align_stats["stratum_f"] / align_stats["total"] if align_stats["total"] else 0.0
     print(
-        f"[SpanCall Data] Aligned: F={align_stats['stratum_f']} A={align_stats['stratum_a']} "
-        f"F_share={f_share:.3f} (E0 gate floor >= 0.50)"
+        f"[SpanCall Data] [{source_name}] Aligned: F={align_stats['stratum_f']} "
+        f"A={align_stats['stratum_a']} F_share={f_share:.3f} (E0 gate floor >= 0.50)"
     )
 
-    # ---- per-config F-share (E0 gate, plan line 366) ------------------------
     per_config: Dict[str, Dict[str, int]] = {}
     for s in aligned:
         cfg = str(s.metadata.get("config") or "unknown")
         entry = per_config.setdefault(cfg, {"F": 0, "A": 0})
         entry[str(s.stratum.value)] = entry.get(str(s.stratum.value), 0) + 1
     align_stats["per_config"] = per_config
-    print("[SpanCall Data] Per-config F-share (E0 gate: F_share >= 0.50 on function-calling configs):")
+    print(f"[SpanCall Data] [{source_name}] Per-config F-share:")
     for cfg in sorted(per_config):
         f = per_config[cfg]["F"]
         a = per_config[cfg]["A"]
@@ -225,10 +242,10 @@ def main() -> None:
         print(f"  {cfg:<28} F={f:>6} A={a:>6} F_share={share:.3f}  {flag}")
 
     # ---- 2. augmentation ----------------------------------------------------
-    aug_stats: Dict[str, int] = {"total_augmented": 0}
+    aug_stats: Dict[str, Any] = {"total_augmented": 0}
     if args.skip_augment:
         augmented = aligned
-        print("[SpanCall Data] Augmentation skipped (--skip_augment)")
+        print(f"[SpanCall Data] [{source_name}] Augmentation skipped (--skip_augment)")
     else:
         augmenter = DataAugmenter(
             enable_shuffling=True,
@@ -246,8 +263,10 @@ def main() -> None:
             augmented.extend(variants)
         aug_stats["total_augmented"] = len(augmented) - len(aligned)
         aug_stats["by_type"] = dict(aug_by_type)
-        print(f"[SpanCall Data] Augmentation produced {aug_stats['total_augmented']} variants "
-              f"{dict(aug_by_type)}")
+        print(
+            f"[SpanCall Data] [{source_name}] Augmentation produced "
+            f"{aug_stats['total_augmented']} variants {dict(aug_by_type)}"
+        )
 
     # ---- 3. schema-disjoint partition (train/dev/calib/test_ood_schema) ----
     mixer = DatasetMixer(pack_tools=pack_tools, seed=seed, **mix_kwargs)
@@ -257,9 +276,10 @@ def main() -> None:
         calib_ratio=float(schema_split.get("calib_ratio", 0.05)),
         dev_ratio=float(schema_split.get("dev_ratio", 0.05)),
         seed=seed,
+        group_by=group_by,
     )
     print(
-        f"[SpanCall Data] Schema partition: "
+        f"[SpanCall Data] [{source_name}] Schema partition (group_by={group_by}): "
         + ", ".join(f"{k.value}={len(v)}" for k, v in schema_splits.items())
     )
 
@@ -281,18 +301,75 @@ def main() -> None:
     for sp in Split:
         n = len(final.get(sp, []))
         f_n = sum(1 for s in final.get(sp, []) if s.stratum == Stratum.F)
-        print(f"[SpanCall Data] final/{sp.value}: n={n} F={f_n} A={n - f_n}")
+        print(f"[SpanCall Data] [{source_name}] final/{sp.value}: n={n} F={f_n} A={n - f_n}")
 
     # ---- 5. write JSONL + report -------------------------------------------
-    paths = write_splits_jsonl(final, args.output_dir, prefix="hermes")
+    paths = write_splits_jsonl(final, args.output_dir, prefix=source_name)
     report = build_report(final, align_stats, aug_stats, pack_tools, seed)
-    report_path = os.path.join(args.output_dir, "prepare_report.json")
-    os.makedirs(args.output_dir, exist_ok=True)
-    with open(report_path, "w") as fh:
-        json.dump(report, fh, indent=2, default=str)
+    report["source"] = source_name
+    report["group_by"] = group_by
+    print(f"[SpanCall Data] [{source_name}] Split files -> {sorted(paths.values())}")
+    return report
 
-    print(f"[SpanCall Data] Split files -> {sorted(paths.values())}")
-    print(f"[SpanCall Data] Report -> {report_path}")
+
+def main() -> None:
+    args = parse_args()
+    source_cfgs = _load_sources_from_yaml(args.config)
+    requested = [s.strip() for s in (args.sources or ["hermes"])]
+
+    with open(args.config, "r") as fh:
+        cfg_yaml = yaml.safe_load(fh) or {}
+
+    ingestors = {
+        "hermes": (ingest_hermes, "schema"),
+        "xlam": (ingest_xlam, "gt_tool"),
+    }
+
+    reports: Dict[str, Any] = {}
+    for src_name in requested:
+        if src_name not in ingestors:
+            print(f"[SpanCall Data] Unsupported source {src_name!r}; skipping.", file=sys.stderr)
+            continue
+        matched = [c for c in source_cfgs if isinstance(c, dict) and c.get("name") == src_name]
+        if not matched:
+            print(f"[SpanCall Data] No {src_name!r} source found in {args.config}; skipping.", file=sys.stderr)
+            continue
+        ingest_fn, group_by = ingestors[src_name]
+        samples: List[UnifiedSample] = []
+        for cfg in matched:
+            samples.extend(ingest_fn(cfg))
+        print(f"[SpanCall Data] [{src_name}] Total ingested: {len(samples)} UnifiedSample records")
+        if not samples:
+            continue
+        reports[src_name] = _process_source(
+            src_name,
+            samples,
+            cfg_yaml=cfg_yaml,
+            args=args,
+            group_by=group_by,
+        )
+
+    if not reports:
+        print(f"[SpanCall Data] No configured sources produced data from {args.config}.", file=sys.stderr)
+        sys.exit(1)
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    for src_name, rep in reports.items():
+        if len(reports) == 1 and src_name == "hermes":
+            continue
+        src_report_path = os.path.join(args.output_dir, f"prepare_report_{src_name}.json")
+        with open(src_report_path, "w") as fh:
+            json.dump(rep, fh, indent=2, default=str)
+        print(f"[SpanCall Data] Report -> {src_report_path}")
+
+    if "hermes" in reports or len(reports) > 1:
+        report_path = os.path.join(args.output_dir, "prepare_report.json")
+        combined_report = next(iter(reports.values())) if len(reports) == 1 else {"sources": reports}
+        with open(report_path, "w") as fh:
+            json.dump(combined_report, fh, indent=2, default=str)
+        print(f"[SpanCall Data] Report -> {report_path}")
+    stamp_path = write_stamp(args.output_dir, extra={"pipeline": "prepare_data", "sources": list(reports)})
+    print(f"[SpanCall Data] Stamp -> {stamp_path}")
     print(f"[SpanCall Data] Done.")
 
 

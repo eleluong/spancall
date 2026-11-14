@@ -108,6 +108,7 @@ class DatasetMixer:
         dev_ratio: float = 0.05,
         seed: int = 42,
         paraphrase_disjoint: bool = True,
+        group_by: str = "schema",
     ) -> Dict[Split, List[UnifiedSample]]:
         """Split by whole-schema groups into train/dev/calib/test_ood_schema.
 
@@ -136,7 +137,7 @@ class DatasetMixer:
             "calib": calib_ratio,
             "test_ood_schema": test_schema_ratio,
         }
-        splits, _ = partition_schema_groups(samples, targets, seed=seed)
+        splits, _ = partition_schema_groups(samples, targets, seed=seed, group_by=group_by)
         if paraphrase_disjoint:
             # Calib shares no schema group with train/dev/test_ood_schema by
             # construction -> paraphrase-disjoint via schema disjointness.

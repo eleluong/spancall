@@ -55,6 +55,17 @@ def schema_key(sample: UnifiedSample) -> Tuple[str, ...]:
     return tuple(sorted(tool.name for tool in sample.tools)) or ("__no_tools__",)
 
 
+def gt_tool_key(sample: UnifiedSample) -> Tuple[str, ...]:
+    """Deterministic key for the ground-truth tool(s) of a sample.
+
+    Used for corpora like xLAM where each row packs a subset of overlapping
+    candidate tools (so grouping by all candidate tools creates a single
+    connected component), ensuring every GT tool is disjoint across splits.
+    """
+    names = tuple(sorted({c.tool_name for c in (sample.ground_truth_calls or []) if c.tool_name}))
+    return names or schema_key(sample)
+
+
 def partition_schema_disjoint(
     samples: Sequence[UnifiedSample],
     ratios: Optional[Dict[str, float]] = None,
@@ -186,6 +197,7 @@ def partition_schema_groups(
     samples: Sequence[UnifiedSample],
     targets: Dict[str, float],
     seed: int = 42,
+    group_by: str = "schema",
 ) -> Tuple[Dict[Split, List[UnifiedSample]], Dict[str, Any]]:
     """Generalized schema-disjoint partition over *arbitrary* target splits.
 
@@ -203,6 +215,9 @@ def partition_schema_groups(
             ``{"train": 0.80, "dev": 0.05, "calib": 0.05,
                 "test_ood_schema": 0.10}``. Ratios are normalized to sum 1.
         seed: RNG seed for deterministic assignment.
+        group_by: ``"schema"`` (sorted candidate tool names, default) or
+            ``"gt_tool"`` (sorted ground-truth tool names, recommended for
+            multi-tool-candidate corpora like xLAM).
 
     Returns:
         ``(splits, report)``: ``splits`` maps ``Split`` -> samples; ``report``
@@ -210,6 +225,9 @@ def partition_schema_groups(
     """
     if not targets:
         raise ValueError("targets must be non-empty")
+    if group_by not in ("schema", "gt_tool"):
+        raise ValueError(f"Unknown group_by={group_by!r}; expected 'schema' or 'gt_tool'")
+    key_fn = gt_tool_key if group_by == "gt_tool" else schema_key
     # Normalize ratios over the requested splits (key by Split).
     total = sum(float(v) for v in targets.values())
     norm: Dict[Split, float] = {}
@@ -223,7 +241,7 @@ def partition_schema_groups(
 
     groups: Dict[Tuple[str, ...], List[UnifiedSample]] = {}
     for s in samples:
-        groups.setdefault(schema_key(s), []).append(s)
+        groups.setdefault(key_fn(s), []).append(s)
     distinct_schemas = len(groups)
     rng = random.Random(seed)
     assigned: Dict[Split, List[UnifiedSample]] = {k: [] for k in requested}
