@@ -97,6 +97,12 @@ class SpanCallTransformerEncoder(BaseEncoder, nn.Module):
         else:
             self.backbone = AutoModel.from_pretrained(model_name_or_path, **from_pretrained_kwargs)
 
+        # Disable ModernBERT's automatic torch.compile (reference_compile) when
+        # present so variable-length batches and resized embeddings do not
+        # trigger dynamo recompilation stalls during training/eval.
+        if hasattr(getattr(self.backbone, "config", None), "reference_compile"):
+            self.backbone.config.reference_compile = False
+
         if bidirectional:
             self._force_bidirectional()
 
@@ -157,11 +163,13 @@ class SpanCallTransformerEncoder(BaseEncoder, nn.Module):
         e.g. ModernBERT, do not use segment embeddings and reject non-None
         segment ids; passing ``None`` matches the backbone defaults exactly).
         """
-        outputs = self.backbone(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-        )
+        kwargs: dict[str, Any] = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+        if token_type_ids is not None:
+            kwargs["token_type_ids"] = token_type_ids
+        outputs = self.backbone(**kwargs)
         H = outputs.last_hidden_state
         return self.dropout(H)
 

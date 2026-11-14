@@ -681,7 +681,11 @@ def _tensorize_lean_task(args):
         for _floor, _cnt in (ts_stats.get("jitter_draw_hist") or {}).items():
             _k = f"jitter_draw={int(_floor)}"
             drops[_k] = drops.get(_k, 0) + int(_cnt)
-        if row is None or not has_positive_targets(row):
+        if ts_stats.get("abstain_rows"):
+            drops["abstain_rows"] = drops.get("abstain_rows", 0) + int(
+                ts_stats["abstain_rows"]
+            )
+        if row is None or (not has_positive_targets(row) and not bool(row.get("is_abstain", 0))):
             return None, drops, errors
         # Serialize inside the child: the parent then only concatenates text.
         return json.dumps(_serialize(row)), drops, errors
@@ -1267,7 +1271,9 @@ if os.path.exists(dev_path):
             1 for r in rows
             if any(pi >= 0 for p_pos in r.get("pos_indices", []) for pi in p_pos)
         )
-        print(f"dev.jsonl: {len(rows)} rows; rows with ≥1 positive target (pi >= 0): {n_hit} ({n_hit/len(rows):.1%})")
+        n_abstain = sum(1 for r in rows if r.get("is_abstain"))
+        print(f"dev.jsonl: {len(rows)} rows; rows with ≥1 positive target (pi >= 0): {n_hit} ({n_hit/len(rows):.1%}); "
+              f"abstain (Stratum-A) rows: {n_abstain} ({n_abstain/len(rows):.1%})")
         r = rows[0]
         print("sample row keys:", sorted(r.keys()))
         c_len = len(r["cand_starts"][0]) if r.get("cand_starts") and len(r["cand_starts"]) > 0 else 0
@@ -1319,15 +1325,15 @@ if os.path.exists(dev_path):
                   "softmax has a single class, CE is identically 0, and H1 receives NO "
                   "gradient. Set data.pack_tools > 1 in configs/default.yaml and rebuild "
                   "the tool pool (ToolPool.from_row_dicts).")
-        if tool_rows:
+        pos_tool_rows = [r for r in tool_rows if not r.get("is_abstain")]
+        if pos_tool_rows:
             # tool_targets must be a valid index into [0, T) AND must point at a
-            # LIVE anchor; -1 is the collate padding sentinel and must NOT appear
-            # pre-collate. A target pointing at a dead slot is unbounded H1
-            # supervision (the logit is -1e4, so CE explodes instead of training).
+            # LIVE anchor on non-abstain rows; -1 is the collate padding sentinel
+            # (or the expected target on is_abstain=1 rows).
             bad_t = 0
             bad_examples = []
             gt_hist = Counter()
-            for r in tool_rows:
+            for r in pos_tool_rows:
                 gt = r.get("tool_targets")
                 if isinstance(gt, list):
                     gt = gt[0] if gt else -1
@@ -1339,8 +1345,9 @@ if os.path.exists(dev_path):
                     if len(bad_examples) < 5:
                         bad_examples.append((r.get("sample_id", "?"), gi, len(tp)))
                 gt_hist[gi] += 1
-            print(f"  tool_targets in-range AND live: {n_tool_rows - bad_t}/{n_tool_rows} "
-                  f"(must equal rows; out-of-range/dead targets are silently wrong H1 "
+            print(f"  tool_targets in-range AND live (non-abstain rows): "
+                  f"{len(pos_tool_rows) - bad_t}/{len(pos_tool_rows)} "
+                  f"(must equal non-abstain rows; out-of-range/dead targets are silently wrong H1 "
                   f"supervision)")
             if bad_t:
                 print(f"  [!] bad tool_targets examples (sample_id, gt, T): {bad_examples}")
@@ -1447,6 +1454,7 @@ cfg["training"]["eval_limit"] = 500
 # made the setting a silent no-op: ``TrainingConfig.from_dict`` never looked
 # there, so the notebook's knob did nothing at all.
 cfg["training"]["freeze_encoder_stages"] = []
+cfg["model"]["backbone_name"] = BACKBONE
 cfg["model"]["max_seq_len"] = MAX_SEQ_LEN
 
 # fraction is a TRAINER-side subsample; pack_tools is a TENSORIZER-side knob, so

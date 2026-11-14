@@ -186,6 +186,12 @@ def apply_lora(
     if backbone is None:
         raise ValueError("apply_lora: model has no `backbone` to adapt")
 
+    # Auto-adapt LoRA target_modules for ModernBERT (which uses fused Wqkv / Wo / Wi
+    # instead of q_proj / k_proj / v_proj / o_proj) when default targets are absent.
+    mod_names = {n.split(".")[-1] for n, _ in backbone.named_modules()}
+    if not any(t in mod_names for t in targets) and "Wqkv" in mod_names:
+        targets = [t for t in ("Wqkv", "Wo", "Wi") if t in mod_names]
+
     lora_cfg = LoraConfig(
         r=int(r),
         lora_alpha=int(alpha),

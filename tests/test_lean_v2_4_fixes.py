@@ -114,3 +114,83 @@ def test_binary_tool_loss_supervises_stratum_a_abstain_rows():
     out["loss"].backward()
     # Gradient on row 1 (abstain) should push both logits DOWN (positive grad on logits)
     assert (logits.grad[1] > 0).all()
+
+
+def test_tensorize_abstain_sample_packs_distractors_and_trainer_retains(tmp_path):
+    """Stratum-A rows tensorized with include_abstain=True must pack distractors
+    from tool_pool and survive LeanTrainer.load_rows when use_binary_tool_head=True."""
+    import json
+    from spancall.data.schema import ParameterSchema, ToolDefinition, UnifiedSample
+    from spancall.lean.tensorize import ToolPool, tensorize_sample_lean
+    from spancall.lean.trainer import LeanTrainer
+
+    class _CharTokenizer:
+        def __call__(self, text, return_offsets_mapping=True, add_special_tokens=False):
+            words = text.split(" ")
+            ids, offsets = [], []
+            pos = 0
+            for idx, w in enumerate(words):
+                start = text.index(w, pos)
+                end = start + len(w)
+                ids.append((idx % 90) + 5)
+                offsets.append((start, end))
+                pos = end
+            return {"input_ids": ids, "offset_mapping": offsets}
+
+    t1 = ToolDefinition(
+        name="get_weather",
+        description="Get weather",
+        parameters=[ParameterSchema(name="city", description="City", param_type="string", required=True)],
+    )
+    t2 = ToolDefinition(
+        name="book_flight",
+        description="Book flight",
+        parameters=[ParameterSchema(name="dest", description="Destination", param_type="string", required=True)],
+    )
+    pool = ToolPool([t1, t2], seed=42)
+    sample = UnifiedSample(
+        sample_id="abstain-1",
+        source_dataset="hermes",
+        utterance="Just saying hello today",
+        tools=[t1],
+        ground_truth_calls=[],
+    )
+    stats = {}
+    row = tensorize_sample_lean(
+        sample=sample,
+        tokenizer=_CharTokenizer(),
+        mask_builder=None,
+        max_seq_len=512,
+        tool_pool=pool,
+        pack_tools=2,
+        jitter=False,
+        include_abstain=True,
+        stats=stats,
+    )
+    assert row is not None
+    assert int(row["is_abstain"].item()) == 1
+    assert int(row["tool_targets"].item()) == -1
+    assert int(row["_n_tool_candidates"]) == 2
+    assert stats.get("abstain_rows") == 1
+
+    # Verify LeanTrainer.load_rows keeps is_abstain=1 only when use_binary_tool_head=True
+    p = tmp_path / "abstain.jsonl"
+    serial = {
+        k: (v.tolist() if hasattr(v, "tolist") else v)
+        for k, v in row.items()
+    }
+    p.write_text(json.dumps(serial) + "\n")
+
+    dummy_trainer_bin = SimpleNamespace(
+        config=SimpleNamespace(data_dir=str(tmp_path), data=None, seed=42),
+        use_binary_tool_head=True,
+    )
+    dummy_trainer_ce = SimpleNamespace(
+        config=SimpleNamespace(data_dir=str(tmp_path), data=None, seed=42),
+        use_binary_tool_head=False,
+    )
+    rows_bin = LeanTrainer.load_rows(dummy_trainer_bin, "abstain")
+    rows_ce = LeanTrainer.load_rows(dummy_trainer_ce, "abstain")
+    assert len(rows_bin) == 1
+    assert len(rows_ce) == 0
+

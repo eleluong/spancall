@@ -327,13 +327,42 @@ def _tensorize_abstain_sample(
     k_recent: int,
     context_budget_tokens: int,
     stats: Optional[Dict[str, Any]],
+    tool_pool: Optional[ToolPool] = None,
+    pack_tools: int = 1,
+    jitter: bool = True,
+    jitter_seed: int = 42,
+    jitter_min_tools: int = 1,
+    force_single_tool: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Tensorize a Stratum-A (no-call) row for BinaryToolHead negative supervision."""
-    tool_candidates = list(sample.tools or [])
-    if not tool_candidates:
+    native_tools = list(sample.tools or [])
+    if not native_tools:
         return None
-    if max_tools is not None and len(tool_candidates) > max(1, int(max_tools)):
-        tool_candidates = tool_candidates[: max(1, int(max_tools))]
+    primary_tool = native_tools[0]
+
+    row_pack_tools = int(pack_tools)
+    if jitter and tool_pool is not None:
+        row_pack_tools = jitter_pack_tools(
+            int(pack_tools),
+            sample.sample_id or primary_tool.name,
+            seed=jitter_seed,
+            min_tools=jitter_min_tools,
+        )
+        if stats is not None:
+            stats["jittered_rows"] = int(stats.get("jittered_rows", 0)) + 1
+
+    if force_single_tool or (
+        jitter and tool_pool is not None and row_pack_tools == 1 and len(native_tools) == 1
+    ):
+        tool_candidates = [primary_tool]
+    elif tool_pool is not None:
+        tool_candidates, _ = tool_pool.candidates_for(
+            sample, primary_tool, row_pack_tools, max_tools=max_tools,
+        )
+    else:
+        tool_candidates = native_tools
+        if max_tools is not None and len(tool_candidates) > max(1, int(max_tools)):
+            tool_candidates = tool_candidates[: max(1, int(max_tools))]
 
     base_date = date(2026, 1, 1)
     if sample.current_time_iso:
@@ -390,11 +419,17 @@ def _tensorize_abstain_sample(
         tsnap = _snap_token_range(e.char_start, e.char_end, offsets, max_seq_len)
         tool_positions.append(PAD_INDEX if tsnap is None else tsnap[0])
 
-    if not any(p >= 0 for p in tool_positions):
+    n_live_tools = int(sum(1 for p in tool_positions if p >= 0))
+    if n_live_tools == 0:
         return None
 
     if stats is not None:
         stats["abstain_rows"] = int(stats.get("abstain_rows", 0)) + 1
+        rth = stats.setdefault("render_T_hist", {})
+        rth[int(n_live_tools)] = int(rth.get(int(n_live_tools), 0)) + 1
+        if jitter and tool_pool is not None:
+            jdh = stats.setdefault("jitter_draw_hist", {})
+            jdh[int(row_pack_tools)] = int(jdh.get(int(row_pack_tools), 0)) + 1
 
     return {
         "input_ids": torch.tensor(ids, dtype=torch.long),
@@ -411,7 +446,7 @@ def _tensorize_abstain_sample(
         "tool_targets": torch.tensor(PAD_INDEX, dtype=torch.long),
         "call_tool_targets": torch.tensor([PAD_INDEX], dtype=torch.long),
         "is_abstain": torch.tensor(1, dtype=torch.long),
-        "_n_tool_candidates": int(sum(1 for p in tool_positions if p >= 0)),
+        "_n_tool_candidates": n_live_tools,
         "_lean_converted": True,
     }
 
@@ -473,6 +508,12 @@ def tensorize_sample_lean(
                 k_recent=k_recent,
                 context_budget_tokens=context_budget_tokens,
                 stats=stats,
+                tool_pool=tool_pool,
+                pack_tools=pack_tools,
+                jitter=jitter,
+                jitter_seed=jitter_seed,
+                jitter_min_tools=jitter_min_tools,
+                force_single_tool=force_single_tool,
             )
         return None
 
