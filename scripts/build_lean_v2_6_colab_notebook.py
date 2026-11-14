@@ -108,6 +108,7 @@ TEST_SPLITS       = [
 #   None  -> Hermes + full xLAM train
 XLAM_TRAIN_ROWS   = 15000
 XLAM_DEV_ROWS     = 1000
+SINGLE_CALL_ONLY  = True
 
 MAX_UTT_STALE_RATE = 0.02
 MAX_UNRESOLVABLE   = 0.02
@@ -139,8 +140,8 @@ MAX_TOOLS = None if MAX_TOOLS in (None, "", 0) else int(MAX_TOOLS)
 JITTER_PACK_TOOLS = bool(_data_cfg.get("jitter_pack_tools", True))
 
 SPLIT_INPUTS = {
-    "t2":  "hermes_train.jsonl",
-    "dev": "hermes_dev.jsonl",
+    "t2":  ["hermes_train.jsonl", "xlam_train.jsonl"],
+    "dev": ["hermes_dev.jsonl", "xlam_dev.jsonl"],
 }
 SAMPLE_LIMITS     = {"t2": None, "dev": None}
 DATA_FRACTION     = 1.0
@@ -155,7 +156,7 @@ print(f"EXPERIMENT_NAME   = {EXPERIMENT_NAME}  SEED = {SEED}")
 print(f"BACKBONE          = {BACKBONE}")
 print(f"MAX_SEQ_LEN       = {MAX_SEQ_LEN}  MAX_SPAN_WIDTH = {MAX_SPAN_WIDTH}  MAX_POS = {MAX_POS}")
 print(f"DATA_FRACTION     = {DATA_FRACTION}  TENSORIZE_WORKERS = {TENSORIZE_WORKERS}")
-print(f"XLAM_TRAIN_ROWS   = {XLAM_TRAIN_ROWS}  XLAM_DEV_ROWS = {XLAM_DEV_ROWS}")
+print(f"XLAM_TRAIN_ROWS   = {XLAM_TRAIN_ROWS}  XLAM_DEV_ROWS = {XLAM_DEV_ROWS}  SINGLE_CALL_ONLY = {SINGLE_CALL_ONLY}")
 print(f"EVAL_LIMIT        = {EVAL_LIMIT}  TEST_LIMIT = {TEST_LIMIT}")
 print(f"DATA_DIR          = {DATA_DIR}")
 print(f"TENSOR_DIR        = {TENSOR_DIR}")
@@ -438,6 +439,19 @@ def _tensorize_many(raw, pack_multi: bool, need, workers: int, executor=None):
             break
     return rows, drops_total, errors_total
 
+def _filter_single_call_lines(raw_lines):
+    if not SINGLE_CALL_ONLY:
+        return list(raw_lines), 0
+    kept = []
+    dropped = 0
+    for line in raw_lines:
+        d = json.loads(line)
+        if len(d.get("ground_truth_calls") or []) == 1:
+            kept.append(line)
+        else:
+            dropped += 1
+    return kept, dropped
+
 def _cap_lines(raw_lines, cap: Optional[int], seed: int):
     raw_lines = list(raw_lines)
     if cap is None or cap >= len(raw_lines):
@@ -449,18 +463,26 @@ def _cap_lines(raw_lines, cap: Optional[int], seed: int):
     return [d for i, d in enumerate(raw_lines) if i in keep]
 
 os.makedirs(TENSOR_DIR, exist_ok=True)
-POOL_SOURCE = SPLIT_INPUTS.get("t2") or next(iter(SPLIT_INPUTS.values()))
-_pool_path = os.path.join(DATA_DIR, POOL_SOURCE)
-_xlam_train_path = os.path.join(DATA_DIR, "xlam_train.jsonl")
-_xlam_dev_path = os.path.join(DATA_DIR, "xlam_dev.jsonl")
-if PACK_TOOLS > 1 and os.path.exists(_pool_path):
-    _pool_dicts = list(_iter_raw_dicts(_pool_path))
-    if (XLAM_TRAIN_ROWS is None or XLAM_TRAIN_ROWS > 0) and os.path.exists(_xlam_train_path):
-        for _l in _cap_lines(_iter_raw_lines(_xlam_train_path), XLAM_TRAIN_ROWS, SEED):
-            _pool_dicts.append(json.loads(_l))
-    TOOL_POOL = ToolPool.from_row_dicts(_pool_dicts, seed=SEED)
-    print(f"[tool-pool] built from Hermes+xLAM: {len(TOOL_POOL)} schemas "
-          f"(collisions={len(TOOL_POOL.name_collisions)}, pack_tools={PACK_TOOLS})")
+_t2_sources = SPLIT_INPUTS.get("t2") or next(iter(SPLIT_INPUTS.values()))
+if isinstance(_t2_sources, str):
+    _t2_sources = [_t2_sources]
+if PACK_TOOLS > 1:
+    _pool_dicts = []
+    for _src_file in _t2_sources:
+        _src_path = os.path.join(DATA_DIR, _src_file)
+        if not os.path.exists(_src_path):
+            continue
+        if _src_file.startswith("xlam_"):
+            if XLAM_TRAIN_ROWS is not None and XLAM_TRAIN_ROWS <= 0:
+                continue
+            for _l in _cap_lines(_iter_raw_lines(_src_path), XLAM_TRAIN_ROWS, SEED):
+                _pool_dicts.append(json.loads(_l))
+        else:
+            _pool_dicts.extend(_iter_raw_dicts(_src_path))
+    if _pool_dicts:
+        TOOL_POOL = ToolPool.from_row_dicts(_pool_dicts, seed=SEED)
+        print(f"[tool-pool] built from {_t2_sources}: {len(TOOL_POOL)} schemas "
+              f"(collisions={len(TOOL_POOL.name_collisions)}, pack_tools={PACK_TOOLS})")
 PACK_TOOLS_EPH = int(PACK_TOOLS) if TOOL_POOL is not None else 1
 
 _fork_ctx = None
@@ -473,16 +495,26 @@ if TENSORIZE_WORKERS > 1:
         print(f"[!] fork pool unavailable ({_exc}); running single-process")
 
 try:
-    for out_name, in_name in SPLIT_INPUTS.items():
-        src = os.path.join(DATA_DIR, in_name)
-        hermes_raw = _fraction_subset(_iter_raw_lines(src), DATA_FRACTION, SEED)
-        xlam_raw: List[str] = []
-        if out_name == "t2" and (XLAM_TRAIN_ROWS is None or XLAM_TRAIN_ROWS > 0) and os.path.exists(_xlam_train_path):
-            xlam_raw = _cap_lines(_iter_raw_lines(_xlam_train_path), XLAM_TRAIN_ROWS, SEED)
-        elif out_name == "dev" and (XLAM_DEV_ROWS is None or XLAM_DEV_ROWS > 0) and os.path.exists(_xlam_dev_path):
-            xlam_raw = _cap_lines(_iter_raw_lines(_xlam_dev_path), XLAM_DEV_ROWS, SEED)
-        raw = list(hermes_raw) + list(xlam_raw)
-        if xlam_raw:
+    for out_name, in_spec in SPLIT_INPUTS.items():
+        in_files = [in_spec] if isinstance(in_spec, str) else list(in_spec)
+        raw: List[str] = []
+        per_src_counts: Dict[str, int] = {}
+        for in_name in in_files:
+            src = os.path.join(DATA_DIR, in_name)
+            if not os.path.exists(src):
+                per_src_counts[in_name] = 0
+                continue
+            filtered_lines, n_multi_drop = _filter_single_call_lines(_iter_raw_lines(src))
+            if in_name.startswith("xlam_"):
+                cap = XLAM_TRAIN_ROWS if out_name == "t2" else XLAM_DEV_ROWS
+                part = _cap_lines(filtered_lines, cap, SEED)
+            else:
+                part = _fraction_subset(filtered_lines, DATA_FRACTION, SEED)
+            per_src_counts[in_name] = len(part)
+            if n_multi_drop:
+                print(f"  [{out_name}/{in_name}] SINGLE_CALL_ONLY dropped {n_multi_drop} multi-call rows")
+            raw.extend(part)
+        if len(in_files) > 1:
             _shuf_rng = random.Random(int(SEED))
             _shuf_rng.shuffle(raw)
         limit = SAMPLE_LIMITS.get(out_name)
@@ -493,7 +525,7 @@ try:
         with open(out_path, "w") as fh:
             fh.write("\\n".join(rows) + ("\\n" if rows else ""))
         render_hist = {k.split("=")[1]: v for k, v in drops.items() if k.startswith("render_T=")}
-        print(f"[tensorize] {out_name:<4} (hermes={len(hermes_raw)}, xlam={len(xlam_raw)}) -> {len(rows):>6} rows in {dt:.1f}s "
+        print(f"[tensorize] {out_name:<4} <- {per_src_counts}: {len(rows):>6} rows in {dt:.1f}s "
               f"({len(rows)/max(dt, 1e-6):.1f} rows/s) | render_T={render_hist} "
               f"| match_missed={drops.get('match_missed', 0)} | errors={dict(errors)}")
 finally:
@@ -657,7 +689,7 @@ model = LeanSpanCallModel(
     hidden_dim=encoder.hidden_dim,
 )
 
-MAX_CALLS = int(getattr(cfg.data, "max_calls", 1))
+MAX_CALLS = 1 if SINGLE_CALL_ONLY else int(getattr(cfg.data, "max_calls", 1))
 CALL_MIN_PROB = float(getattr(cfg.data, "call_min_prob", 0.25))
 CALL_MIN_PROB_RATIO = float(getattr(cfg.data, "call_min_prob_ratio", 0.5))
 
@@ -705,6 +737,15 @@ _slice_info = build_stratified_eval_subset(
     limit=EVAL_LIMIT,
     seed=SEED,
 )
+if SINGLE_CALL_ONLY:
+    with open(SUBSET_EVAL_PATH, encoding="utf-8") as _fh:
+        _one_call_lines = [
+            _l for _l in _fh
+            if _l.strip() and len((json.loads(_l).get("ground_truth_calls") or [])) == 1
+        ]
+    with open(SUBSET_EVAL_PATH, "w", encoding="utf-8") as _fh:
+        _fh.writelines(_one_call_lines)
+    print(f"[SINGLE_CALL_ONLY] filtered {EVAL_SPLIT} slice -> {len(_one_call_lines)} 1-call rows")
 print("=== 4.0 Stratified Benchmark Slice ===")
 print("Available by cohort:", _slice_info["available_by_cohort"])
 print("Sampled   by cohort:", _slice_info["sampled_by_cohort"], f"(total={_slice_info['sampled_total']})")
@@ -1204,6 +1245,14 @@ for split in TEST_SPLITS:
         limit=TEST_LIMIT,
         seed=SEED,
     )
+    if SINGLE_CALL_ONLY:
+        with open(sub_test_path, encoding="utf-8") as _fh:
+            _one_call_lines = [
+                _l for _l in _fh
+                if _l.strip() and len((json.loads(_l).get("ground_truth_calls") or [])) == 1
+            ]
+        with open(sub_test_path, "w", encoding="utf-8") as _fh:
+            _fh.writelines(_one_call_lines)
     predict_split(
         split,
         os.path.join(RESULTS_DIR, f"preds_{split}.jsonl"),

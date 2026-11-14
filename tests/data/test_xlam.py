@@ -159,6 +159,9 @@ def test_v2_6_notebook_includes_xlam_mix_and_eval() -> None:
     all_src = "\n".join("".join(c.get("source", [])) for c in nb["cells"])
     assert "XLAM_TRAIN_ROWS   = 15000" in all_src
     assert "XLAM_DEV_ROWS     = 1000" in all_src
+    assert "SINGLE_CALL_ONLY  = True" in all_src
+    assert '["hermes_train.jsonl", "xlam_train.jsonl"]' in all_src
+    assert '["hermes_dev.jsonl", "xlam_dev.jsonl"]' in all_src
     assert '"xlam_eval"' in all_src
     assert '"xlam_test_ood_schema"' in all_src
     assert 'CONFIG_PATH = "configs/colab_lean_v2_6.yaml"' in all_src
