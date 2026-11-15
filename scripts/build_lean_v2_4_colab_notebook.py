@@ -1421,7 +1421,7 @@ cfg["experiment"]["seed"] = SEED
 cfg["experiment"]["output_dir"] = RESULTS_DIR
 cfg["experiment"]["data_dir"] = TENSOR_DIR
 
-NUM_EPOCHS = 5
+NUM_EPOCHS = 3
 cfg["optimization"]["num_epochs"] = NUM_EPOCHS
 # MICRO batch. Rows per OPTIMIZER step is EFFECTIVE_BATCH_SIZE and the
 # accumulation factor is derived from the two, so they cannot disagree.
@@ -1446,7 +1446,7 @@ cfg["optimization"]["mixed_precision"] = "bf16"
 # is only a fallback for a config that lacks effective_batch_size.
 cfg["training"]["gradient_accumulation_steps"] = max(
     int(round(EFFECTIVE_BATCH_SIZE / MICRO_BATCH_SIZE)), 1)
-cfg["training"]["gradient_checkpointing"] = True
+cfg["training"]["gradient_checkpointing"] = False
 cfg["training"]["eval_splits"] = ["dev"]
 cfg["training"]["eval_limit"] = 500
 # IMPORTANT: ``freeze_encoder_stages`` belongs to the TRAINING section, not

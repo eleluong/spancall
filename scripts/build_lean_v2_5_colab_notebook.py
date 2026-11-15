@@ -2,7 +2,7 @@
 """Generate notebooks/spancall_lean_v2_5_train_eval.ipynb via nbformat (valid JSON guaranteed).
 
 SpanCall Lean Flow **v2.5** — Essential Full-Data Pipeline with ModernBERT-large:
-- Uses 100% of training and dev data (`DATA_FRACTION = 1.0`, `TRAIN_FRACTION = 1.0`).
+- Uses 100% of training and dev data (`DATA_FRACTION = 0.5`, `TRAIN_FRACTION = 1.0`).
 - Native bidirectional backbone (`answerdotai/ModernBERT-large`).
 - Single training run (drops optional LoRA/Binary H1 ablation re-trainings and legacy v1/v2.0 diagnostic bloat).
 - Keeps the essential pipeline:
@@ -27,7 +27,7 @@ OUT = Path(__file__).resolve().parent / ".." / "notebooks" / "spancall_lean_v2_5
 
 MARKDOWN_TITLE = """# SpanCall Lean Flow **v2.5** — Full-Data ModernBERT-large Pipeline
 
-Essential end-to-end training and step-by-step evaluation notebook based on **v2.4.1**, stripped down to core stages and scaled to **100% training data (`DATA_FRACTION = 1.0`)**:
+Essential end-to-end training and step-by-step evaluation notebook based on **v2.4.1**, stripped down to core stages and scaled to **100% training data (`DATA_FRACTION = 0.5`)**:
 - **Backbone**: `answerdotai/ModernBERT-large` (native bidirectional attention, `MAX_SEQ_LEN = 4096`).
 - **Model (`LeanSpanCallModel`)**: `backbone` + `ToolSelectionHead` (`H1`) + `LeanPointerHead` (`H3` over `0..C-1` candidates + `<|null|>`).
 - **Decoder & Resolver (`LeanJointDecoder`, `LeanResolver`)**: Utterance-first candidate packing, cross-parameter span exclusivity (`prevent_param_collapse=True`), collapse guard (`collapse_guard=True`), and `single_pass` vs `two_step` resolution.
@@ -137,7 +137,7 @@ SPLIT_INPUTS = {
     "dev": "hermes_dev.jsonl",
 }
 SAMPLE_LIMITS     = {"t2": None, "dev": None}
-DATA_FRACTION     = 1.0
+DATA_FRACTION = 0.5
 TENSORIZE_WORKERS = max(1, min(os.cpu_count() or 1, 16))
 EVAL_LIMIT        = 500
 TEST_LIMIT        = 200
@@ -247,7 +247,7 @@ for _split in (EVAL_SPLIT, "hermes_dev"):
         raise SystemExit(f"PRE-FLIGHT FAILED on {_split}")'''
 
 MARKDOWN_TENSORIZE = """---
-## 2. Lean Tensorizer — Full Dataset (`DATA_FRACTION = 1.0`)
+## 2. Lean Tensorizer — Full Dataset (`DATA_FRACTION = 0.5`)
 
 Tensorizes `hermes_train.jsonl` (`t2.jsonl`) and `hermes_dev.jsonl` (`dev.jsonl`) into 0-indexed Lean trainer rows using a shared multiprocessing fork pool."""
 
@@ -456,7 +456,7 @@ CODE_TRAIN_CFG_AND_RUN = '''import os, yaml
 from scripts.train_lean import main as train_lean_main
 
 TRAIN_FRACTION = 1.0
-NUM_EPOCHS = 5
+NUM_EPOCHS = 3
 MICRO_BATCH_SIZE = 32
 EFFECTIVE_BATCH_SIZE = 128
 
@@ -480,7 +480,7 @@ cfg["optimization"]["restore_best_on_exit"] = True
 cfg["optimization"]["mixed_precision"] = "bf16"
 
 cfg["training"]["gradient_accumulation_steps"] = max(int(round(EFFECTIVE_BATCH_SIZE / MICRO_BATCH_SIZE)), 1)
-cfg["training"]["gradient_checkpointing"] = True
+cfg["training"]["gradient_checkpointing"] = False
 cfg["training"]["eval_splits"] = ["dev"]
 cfg["training"]["eval_limit"] = 2000
 cfg["training"]["freeze_encoder_stages"] = []

@@ -144,7 +144,7 @@ SPLIT_INPUTS = {
     "dev": ["hermes_dev.jsonl", "xlam_dev.jsonl"],
 }
 SAMPLE_LIMITS     = {"t2": None, "dev": None}
-DATA_FRACTION     = 1.0
+DATA_FRACTION = 0.5
 TENSORIZE_WORKERS = max(1, min(os.cpu_count() or 1, 16))
 EVAL_LIMIT        = 500
 TEST_LIMIT        = 200
@@ -560,7 +560,7 @@ CODE_TRAIN_CFG_AND_RUN = '''import os, yaml
 from scripts.train_lean import main as train_lean_main
 
 TRAIN_FRACTION = 1.0
-NUM_EPOCHS = 5
+NUM_EPOCHS = 3
 MICRO_BATCH_SIZE = 32
 EFFECTIVE_BATCH_SIZE = 128
 
@@ -584,7 +584,7 @@ cfg["optimization"]["restore_best_on_exit"] = True
 cfg["optimization"]["mixed_precision"] = "bf16"
 
 cfg["training"]["gradient_accumulation_steps"] = max(int(round(EFFECTIVE_BATCH_SIZE / MICRO_BATCH_SIZE)), 1)
-cfg["training"]["gradient_checkpointing"] = True
+cfg["training"]["gradient_checkpointing"] = False
 cfg["training"]["eval_splits"] = ["dev"]
 cfg["training"]["eval_limit"] = 2000
 cfg["training"]["freeze_encoder_stages"] = []

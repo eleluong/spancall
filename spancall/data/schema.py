@@ -123,20 +123,51 @@ class ParameterSchema:
 
 @dataclass
 class ToolDefinition:
-    """Specification of an available tool."""
+    """Specification of an available tool.
+
+    ``object_paths`` records the Lean v2.7 object decomposition: for every
+    declared ``object`` param that was flattened into scalar leaves it maps the
+    root name to the leaf dotted paths (``{"filters": ["filters.color",
+    "filters.size"]}``). ``None`` means "this tool has no decomposed objects" and
+    is byte-identical to the pre-v2.7 schema. The resolver uses it to reassemble
+    leaves before casting/validation; see :mod:`spancall.data.flatten`.
+    """
     name: str
     description: str
     parameters: List[ParameterSchema] = field(default_factory=list)
     risk_tier: str = "read_only"  # "read_only", "idempotent", "side_effecting"
+    object_paths: Optional[Dict[str, List[str]]] = None
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> "ToolDefinition":
+        params = [ParameterSchema.from_dict(p) for p in (d.get("parameters") or [])]
+        raw_paths = d.get("object_paths")
+        object_paths: Optional[Dict[str, List[str]]] = None
+        if raw_paths:
+            object_paths = {
+                str(k): [str(x) for x in (v or [])] for k, v in dict(raw_paths).items()
+            }
+        else:
+            # Back-compat derive: a dataset that was flattened by the aligner
+            # but whose tool record predates ``object_paths`` still round-trips.
+            # ``validate_object_paths`` guarantees this never shadows a literal
+            # param namespace, because such a tool is rejected at ingest time.
+            from spancall.data.flatten import object_paths_from_params, validate_object_paths
+
+            candidate = object_paths_from_params(params)
+            if candidate and not validate_object_paths([p.name for p in params], candidate):
+                object_paths = candidate
         return cls(
             name=str(d.get("name", "")),
             description=str(d.get("description", "")),
-            parameters=[ParameterSchema.from_dict(p) for p in (d.get("parameters") or [])],
+            parameters=params,
             risk_tier=str(d.get("risk_tier", "read_only")),
+            object_paths=object_paths,
         )
+
+    def has_object_paths(self) -> bool:
+        """True when at least one object param was decomposed into leaves."""
+        return bool(self.object_paths)
 
 
 @dataclass

@@ -72,7 +72,7 @@ def test_v2_5_notebook_is_essential_and_full_data():
     assert len(nb["cells"]) <= 30
     all_src = "\n".join("".join(c.get("source", [])) for c in nb["cells"])
     assert 'BACKBONE       = "answerdotai/ModernBERT-large"' in all_src
-    assert "DATA_FRACTION     = 1.0" in all_src
+    assert "DATA_FRACTION = 0.5" in all_src
     assert "TRAIN_FRACTION = 1.0" in all_src
     assert 'cfg["model"]["backbone_name"] = BACKBONE' in all_src
     assert "tensorized_lean_v2_5" in all_src
