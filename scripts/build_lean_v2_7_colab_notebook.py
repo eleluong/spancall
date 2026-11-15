@@ -65,7 +65,7 @@ End-to-end training and step-by-step evaluation notebook for the **v2.7** change
 **Path changes vs v2.6:** `data/tensorized_lean_v2_7` and `results_lean_v2_7`, and the tensors are rebuilt from `data/processed_v2_7` (realigned through the v2.7 template)."""
 
 MARKDOWN_OBJECT_AUDIT = """---
-## 4b. Object-Decomposition Audit
+### 4d. Object-Decomposition Audit
 
 Quantifies the v2.7 change on the evaluation split:
 
@@ -73,14 +73,14 @@ Quantifies the v2.7 change on the evaluation split:
 - **Outcome split by param type** — exact-match rate per `string` / `integer` / `number` / `boolean` / `enum` / `array` / `object` / `object-leaf`. This is the table that shows whether decomposition moved objects and how large the remaining array gap is.
 - **Obj-shaped residual examples** — up to 5 failing rows whose only mismatches are object leaves or arrays, with the leaf-level diff, so "did reassembly round-trip" is checkable by eye rather than inferred from a scalar."""
 
-CODE_OBJECT_AUDIT = '''# 4b. Object-decomposition audit (schema coverage + per-param-type accuracy + residual examples)
+CODE_OBJECT_AUDIT = '''# 4d. Object-decomposition audit (schema coverage + per-param-type accuracy + residual examples)
 import json, os
-from collections import Counter, defaultdict
+from collections import Counter
 from typing import Any, Dict, List
 
 import spancall.data.flatten as _flat
 from spancall.data.schema import UnifiedSample
-from spancall.eval.toolcall.evaluator import payload_equal, _deep_equal
+from spancall.eval.toolcall.evaluator import _deep_equal
 
 
 def _is_object_leaf(name: str, object_paths: Dict[str, List[str]]) -> bool:
@@ -108,11 +108,9 @@ def _gather_samples(path: str, limit: int = 0) -> List[Dict[str, Any]]:
 
 # ---------------------------------------------------------------- schema view
 _schema_stats = Counter()
-_per_tool_paths: Dict[str, Dict[str, List[str]]] = {}
 for _raw in _gather_samples(os.path.join(DATA_DIR, f"{EVAL_SPLIT}.jsonl")):
     _s = UnifiedSample.from_dict(_raw)
     for _t in _s.tools:
-        _per_tool_paths[_t.name] = dict(_t.object_paths or {})
         _opaque = [p.name for p in _t.parameters if (p.param_type or "").lower() == "object"]
         _leaves = [p.name for p in _t.parameters if _is_object_leaf(p.name, _t.object_paths or {})]
         if _opaque:
@@ -143,6 +141,9 @@ _type_tot = Counter()
 _type_ok = Counter()
 _residual: List[Dict[str, Any]] = []
 
+if not _preds_by_id:
+    print(f"\\n[!] no predictions at {_PRED_PATH} - run 4c first. Per-type table skipped.")
+
 for _raw in _gather_samples(SUBSET_EVAL_PATH):
     _sid = _raw.get("sample_id")
     _p = _preds_by_id.get(_sid)
@@ -156,9 +157,17 @@ for _raw in _gather_samples(SUBSET_EVAL_PATH):
     if _gt_tool is None:
         continue
     _paths = dict(_gt_tool.object_paths or {})
-    _pred_args = _p.get("payload_partial") or {}
-    _bad_names: List[str] = []
     _gt_full = _flat.flatten_args(_gt_call.arguments or {}, _paths)
+
+    # The predicted payload must be flattened into the SAME key space as the GT,
+    # otherwise a nested ``{"filters": {...}}`` never matches a ``filters.color``
+    # slot and every object leaf scores as wrong regardless of model quality.
+    # ``flatten_args`` is idempotent for already-flat payloads, so this is safe
+    # both before and after the resolver's unflatten step lands.
+    _pred_raw = _p.get("payload_partial") or {}
+    _pred_args = _flat.flatten_args(_pred_raw, _paths)
+
+    _bad_names: List[str] = []
 
     for _param in _gt_tool.parameters:
         _name = _param.name
@@ -193,13 +202,17 @@ print(f"{'param_type':<14}{'n':>6}{'exact':>9}{'rate':>8}")
 print("-" * 40)
 for _k in sorted(_type_tot, key=lambda x: -_type_tot[x]):
     _n, _ok = _type_tot[_k], _type_ok[_k]
-    print(f"{_k:<14}{_n:>6}{_ok:>9}{_ok / max(1, _n):>8.3f}")
+    _rate = f"{_ok / _n:>8.3f}" if _n else f"{'n/a':>8}"
+    print(f"{_k:<14}{_n:>6}{_ok:>9}{_rate}")
 
-_n_obj = sum(v for k, v in _type_tot.items() if k == "object-leaf")
+_n_obj = _type_tot["object-leaf"]
 print(f"\\n  object-leaf params scored: {_n_obj}"
-      f"  (exact {_type_ok['object-leaf']}/{max(1, _n_obj)})")
+      f"  (exact {_type_ok['object-leaf']}/{_n_obj})")
 print(f"  array params scored      : {_type_tot['array']}"
-      f"  (exact {_type_ok['array']}/{max(1, _type_tot['array'])})")
+      f"  (exact {_type_ok['array']}/{_type_tot['array']})")
+if not _n_obj:
+    print("  [!] zero object-leaf params scored: either no object-bearing tool is in")
+    print("      this split, or step 3 (aligner object case) is not applied yet.")
 print("  [i] 'object-leaf' is the decomposed form: a scalar slot that reassembles into")
 print("      the parent object. A rate here above the pre-v2.7 'object' rate is the win.")
 
@@ -213,7 +226,14 @@ if not _residual:
     print("  none - no row failed exclusively on object/array params.")
 
 # Reassembly integrity: does the emitted payload equal the unflattened GT exactly?
-_roundtrip_ok = _roundtrip_tot = 0
+# Reassembly integrity is checked on the LEAVES, not on the whole payload.
+# ``payload_equal`` requires identical key sets, so using it here would report
+# "reassembly broken" whenever the model merely omitted an argument -- mixing a
+# model-quality signal into a correctness check. What this block must prove is
+# narrower and model-independent: for every object leaf the model DID emit, does
+# unflatten sit that leaf back at the same dotted path with the same value?
+_rt_tot = _rt_ok = 0
+_rt_bad: List[Dict[str, Any]] = []
 for _raw in _gather_samples(SUBSET_EVAL_PATH):
     _p = _preds_by_id.get(_raw.get("sample_id"))
     if _p is None:
@@ -224,15 +244,39 @@ for _raw in _gather_samples(SUBSET_EVAL_PATH):
     _gt_tool = next((t for t in _s.tools if t.name == _s.ground_truth_calls[0].tool_name), None)
     if _gt_tool is None or not _gt_tool.object_paths:
         continue
-    _roundtrip_tot += 1
-    _rebuilt = _flat.unflatten_args(_p.get("payload_partial") or {}, _gt_tool.object_paths, strict=False)
-    if payload_equal(_s.ground_truth_calls[0].arguments or {}, _rebuilt, _gt_tool):
-        _roundtrip_ok += 1
+    _rt_tot += 1
+    # Normalise to the flat key space first: ``get_path`` walks dotted segments,
+    # so on a flat payload it would always report ``_MISSING``. The resolver's
+    # payload may be flat (pre-step-5) or nested (post-step-5); flattening both
+    # forms idempotently makes this check true in either case.
+    _pred_flat = _flat.flatten_args(_p.get("payload_partial") or {},
+                                    _gt_tool.object_paths)
+    _rebuilt = _flat.unflatten_args(_pred_flat, _gt_tool.object_paths, strict=False)
+    # Walk every declared leaf: does it survive the flat -> nested round trip?
+    _leaf_bad = []
+    for _root, _leaves in _gt_tool.object_paths.items():
+        for _leaf in _leaves:
+            _before = _pred_flat.get(str(_leaf), _flat.MISSING)
+            _after = _flat.get_path(_rebuilt, _leaf)
+            if _before is _flat.MISSING and _after is _flat.MISSING:
+                continue  # not emitted and not reassembled -> consistent
+            if _before is _flat.MISSING or not _deep_equal(_before, _after):
+                _leaf_bad.append({"leaf": _leaf,
+                                  "flat": None if _before is _flat.MISSING else _before,
+                                  "nested": None if _after is _flat.MISSING else _after})
+    if _leaf_bad:
+        _rt_bad.append({"sample_id": _raw.get("sample_id"), "leaves": _leaf_bad})
+    else:
+        _rt_ok += 1
 
 print("\\n=== Reassembly Integrity (object-bearing calls) ===")
-if _roundtrip_tot:
-    print(f"  calls with decomposed objects : {_roundtrip_tot}")
-    print(f"  reassembled payload == GT     : {_roundtrip_ok} ({_roundtrip_ok / _roundtrip_tot:.3f})")
+if _rt_tot:
+    print(f"  calls with decomposed objects        : {_rt_tot}")
+    print(f"  every emitted leaf reassembles at its path : {_rt_ok} ({_rt_ok / _rt_tot:.3f})")
+    for _b in _rt_bad[:3]:
+        print(f"  [LEAF MISMATCH] {_b['sample_id']}: {_b['leaves'][:3]}")
+    if not _rt_bad:
+        print("  no leaf-level reassembly defect - flat/nested round trip is sound.")
 else:
     print("  no object-bearing call in this split")'''
 
@@ -304,15 +348,33 @@ def _patch(name: str, src: str) -> str:
     return out
 
 
+#: v2.7 inserts a new evaluation section between 4c and 4d, so those two
+#: sections shift down. Anchored on the heading + title text rather than on a
+#: bare "4d"/"4e", because the numbers also appear in body prose.
+_SECTION_RENUMBER = [
+    (re.compile(r"(?m)^(#{2,3}\s*)4d\.(\s*Stage-Attributed Error Forensics)"),
+     r"\g<1>4e.\g<2>"),
+    (re.compile(r"(?m)^(#{2,3}\s*)4e\.(\s*Param-Precision FP Deep Dive)"),
+     r"\g<1>4f.\g<2>"),
+]
+
+
 def _patch_paths(src: str) -> str:
-    """Bump v2_6 path tokens only.
+    """Bump v2_6 path tokens and renumber shifted sections in prose.
 
     Used for markdown cells: they legitimately contain *comparative* prose
     ("In v2.6 an object value fell through the scalar branch ..."), which must
     survive verbatim, while a path such as ``data/processed_v2/`` must not.
+
+    Order matters: renumbering runs before nothing else touches the headings,
+    and the patterns are applied 4d -> 4e then 4e -> 4f, so a heading moved to
+    4e in step 1 would be re-matched in step 2. Renumber the *last* section
+    first to avoid that cascade.
     """
     out = src
     for pattern, new in _VERSION_RULES:
+        out = pattern.sub(new, out)
+    for pattern, new in reversed(_SECTION_RENUMBER):
         out = pattern.sub(new, out)
     return out
 

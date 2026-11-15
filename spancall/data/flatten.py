@@ -51,6 +51,11 @@ class _Missing:
 
 _MISSING = _Missing()
 
+#: Public alias for the "path not present" sentinel. Callers outside this module
+#: (the v2.7 audit cell, diagnostics) must compare against this rather than the
+#: private ``_MISSING`` so the identity contract can be refactored safely.
+MISSING = _MISSING
+
 
 # --------------------------------------------------------------------------- #
 # Schema helpers
