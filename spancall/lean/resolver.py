@@ -21,6 +21,7 @@ import torch
 
 from spancall.agent.context import select_recent_context
 from spancall.data.align import tooldef_to_template_tool
+from spancall.data.flatten import unflatten_args
 from spancall.data.schema import ParameterSchema, ToolDefinition
 from spancall.infer.base import (
     BaseResolveResult,
@@ -1334,6 +1335,11 @@ class LeanResolver(BaseResolver):
         valid, validation_reason = self.validator.validate(payload, schema)
         if valid:
             payload = self.validator.apply_defaults(payload, schema)
+
+        object_paths = getattr(schema, "object_paths", None)
+        if object_paths:
+            payload = unflatten_args(payload, object_paths, strict=False)
+            payload_partial = unflatten_args(payload_partial, object_paths, strict=False)
 
         is_hit = valid and len(missing_required) == 0 and len(cast_failures) == 0
 

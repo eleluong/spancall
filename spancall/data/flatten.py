@@ -164,6 +164,78 @@ def _is_path_segment(key: Any) -> bool:
     return isinstance(key, str) and bool(key) and PATH_SEP not in key
 
 
+def expand_object_parameter(
+    name: str,
+    spec: Mapping[str, Any],
+    *,
+    required: bool,
+    type_resolver: Any,
+    depth: int = 1,
+    max_depth: int = OBJECT_MAX_DEPTH,
+    default_required: bool = False,
+) -> List[Dict[str, Any]]:
+    """Recursively expand a JSON-Schema/xLAM parameter into flat leaf specs.
+
+    Decomposes ``object``-typed params with a non-empty ``properties`` mapping
+    up to ``max_depth`` dotted segments (``filters.color`` == depth 2).
+    Free-form objects (no ``properties``), keys containing ``PATH_SEP``, or
+    subtrees at ``depth >= max_depth`` are kept as opaque ``object`` params.
+    """
+    ptype, items_type, is_opt = type_resolver(spec)
+    eff_required = bool(required) and not bool(is_opt)
+
+    if str(ptype).lower() == "object" and depth < int(max_depth):
+        props = spec.get("properties")
+        if (
+            isinstance(props, Mapping)
+            and props
+            and all(_is_path_segment(k) for k in props)
+            and all(isinstance(v, Mapping) for v in props.values())
+        ):
+            raw_req = spec.get("required")
+            req_set = (
+                {str(r) for r in raw_req}
+                if isinstance(raw_req, (list, tuple, set))
+                else None
+            )
+            leaves: List[Dict[str, Any]] = []
+            for child_name, child_spec in props.items():
+                if req_set is not None:
+                    child_req = eff_required and (str(child_name) in req_set)
+                else:
+                    child_req = (
+                        eff_required
+                        and bool(default_required)
+                        and ("default" not in child_spec)
+                    )
+                leaves.extend(
+                    expand_object_parameter(
+                        f"{name}{PATH_SEP}{child_name}",
+                        child_spec,
+                        required=child_req,
+                        type_resolver=type_resolver,
+                        depth=depth + 1,
+                        max_depth=max_depth,
+                        default_required=default_required,
+                    )
+                )
+            return leaves
+
+    raw_enum = spec.get("enum")
+    enum = [str(v) for v in raw_enum] if isinstance(raw_enum, list) else None
+    return [
+        {
+            "name": str(name),
+            "description": str(spec.get("description") or ""),
+            "param_type": str(ptype),
+            "required": eff_required,
+            "enum": enum,
+            "default": spec.get("default"),
+            "items_type": items_type,
+        }
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # flatten
 # --------------------------------------------------------------------------- #

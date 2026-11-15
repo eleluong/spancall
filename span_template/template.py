@@ -611,8 +611,9 @@ def gate_tool_call(
         resolved; otherwise abstain (whole call) with the list of missing
         required params. For multi-tool packs (`build_input_multi`) this is a
         whole-call gate across ALL tools — no partial emission (pipeline_io Q8).
-        Payload keys are namespaced ``<tool>.<param>`` when more than one tool
-        is present, so same-named params across tools cannot collide.
+        Payload keys are namespaced ``<tool>::<param>`` when more than one tool
+        is present, so same-named params across tools (including dotted object
+        leaves) cannot collide.
 
     Schema defaults (Q6.2): an absent *optional* param carrying a declared
     `default` is materialized deterministically from the schema — the encoder
@@ -627,7 +628,7 @@ def gate_tool_call(
     missing: List[str] = []
     for t in tools:
         for p in t.params:
-            key = f"{t.name}.{p.name}" if multi else p.name
+            key = f"{t.name}::{p.name}" if multi else p.name
             ok, value = resolve(p)
             if not ok:
                 if p.required:

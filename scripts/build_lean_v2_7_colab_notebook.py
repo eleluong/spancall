@@ -390,20 +390,68 @@ _V27_FIXES: Dict[str, Any] = {
             '    if os.path.exists(os.path.join(DATA_DIR, f"{_osp}.jsonl")):\n'
             "        _audit_splits.append(_osp)",
         ),
-        # Gate A reads a DIRECTORY-level stamp; prepare_data.py writes its own,
-        # overwriting the one realign_v2 wrote. Say so instead of letting the
-        # PASS line imply the Hermes splits were attested by that stamp.
+        # Fallback: prepare xLAM-60k (1-call) splits in DATA_DIR if still missing.
+        # Prefer re-aligning the public convoicon/spancall xLAM splits (no HF gate
+        # on Salesforce/xlam-function-calling-60k); only fall back to
+        # prepare_data.py --sources xlam if the hub snapshot did not provide them.
         (
+            "# Fallback: prepare xLAM-60k (1-call) splits in DATA_DIR if still missing\n"
+            "_missing_xlam = [f for f in XLAM_SPLITS if not os.path.exists(os.path.join(DATA_DIR, f))]\n"
+            "if _missing_xlam and (XLAM_TRAIN_ROWS is None or XLAM_TRAIN_ROWS > 0):\n"
+            "    print(f\"Preparing xLAM-60k (1-call) splits into {DATA_DIR} via scripts/prepare_data.py ...\")\n"
+            "    _prep_rc = subprocess.run([\n"
+            "        sys.executable, os.path.join(str(PROJECT_ROOT), \"scripts\", \"prepare_data.py\"),\n"
+            "        \"--sources\", \"xlam\",\n"
+            "        \"--output_dir\", DATA_DIR,\n"
+            "    ], cwd=str(PROJECT_ROOT)).returncode\n"
             "    if _prep_rc != 0:\n"
-            '        raise SystemExit(f"prepare_data.py --sources xlam exited {_prep_rc}")',
-            "    if _prep_rc != 0:\n"
-            '        raise SystemExit(f"prepare_data.py --sources xlam exited {_prep_rc}")\n'
-            "    # v2.7 provenance note: template_stamp.json is directory-level, so the\n"
-            "    # stamp now attests the xLAM splits prepare_data just wrote, not the\n"
-            "    # Hermes splits realigned above. Gate A below still validates the\n"
-            "    # template REVISION (the thing that invalidated v1), nothing more.\n"
-            '    print("[Gate A / note] prepare_data.py re-stamped " + DATA_DIR +'
-            ' " -> Hermes splits are no longer attested by that stamp.")',
+            "        raise SystemExit(f\"prepare_data.py --sources xlam exited {_prep_rc}\")",
+            "# xLAM-60k (1-call) splits: download public xlam_*.jsonl from convoicon/spancall\n"
+            "# and re-align through the v2.7 aligner (avoids the gated Salesforce/xlam-60k\n"
+            "# hub download unless the snapshot lacks them).\n"
+            "_missing_xlam = [f for f in XLAM_SPLITS if not os.path.exists(os.path.join(DATA_DIR, f))]\n"
+            "if _missing_xlam and (XLAM_TRAIN_ROWS is None or XLAM_TRAIN_ROWS > 0):\n"
+            "    _xlam_src_dir = os.path.join(str(PROJECT_ROOT), \"data\", \"processed_v2\")\n"
+            "    _missing_xlam_src = [f for f in XLAM_SPLITS if not os.path.exists(os.path.join(_xlam_src_dir, f))]\n"
+            "    if _missing_xlam_src:\n"
+            "        print(f\"Downloading xLAM splits from {HF_DATASET_ID} ...\")\n"
+            "        snapshot_download(\n"
+            "            repo_id=HF_DATASET_ID,\n"
+            "            repo_type=\"dataset\",\n"
+            "            local_dir=str(PROJECT_ROOT),\n"
+            "            allow_patterns=[\"data/processed_v2\" + \"/xlam_*.jsonl\", \"data/processed_v2\" + \"/*.json\"],\n"
+            "            token=HF_TOKEN,\n"
+            "        )\n"
+            "    if all(os.path.exists(os.path.join(_xlam_src_dir, f)) for f in XLAM_SPLITS):\n"
+            "        print(f\"Re-aligning xLAM splits -> {DATA_DIR} ...\")\n"
+            "        _xlam_realign = [\n"
+            "            sys.executable, os.path.join(str(PROJECT_ROOT), \"scripts\", \"realign_v2.py\"),\n"
+            "            \"--src_dir\", _xlam_src_dir,\n"
+            "            \"--out_dir\", DATA_DIR,\n"
+            "            \"--splits\", *[os.path.splitext(f)[0] for f in XLAM_SPLITS],\n"
+            "            \"--gate_split\", \"xlam_eval\",\n"
+            "            \"--max_utt_stale_rate\", str(MAX_UTT_STALE_RATE),\n"
+            "            \"--max_unresolvable\", str(MAX_UNRESOLVABLE),\n"
+            "        ]\n"
+            "        if ALLOW_STALE_LABELS:\n"
+            "            _xlam_realign.append(\"--force\")\n"
+            "        _xrc = subprocess.run(_xlam_realign, cwd=str(PROJECT_ROOT)).returncode\n"
+            "        if _xrc != 0:\n"
+            "            raise SystemExit(f\"realign_v2 (xlam) exited {_xrc}. Inspect data/processed_v2_7/realign_report.json.\")\n"
+            "    else:\n"
+            "        print(f\"Preparing xLAM-60k (1-call) splits into {DATA_DIR} via scripts/prepare_data.py ...\")\n"
+            "        _prep_rc = subprocess.run([\n"
+            "            sys.executable, os.path.join(str(PROJECT_ROOT), \"scripts\", \"prepare_data.py\"),\n"
+            "            \"--sources\", \"xlam\",\n"
+            "            \"--output_dir\", DATA_DIR,\n"
+            "        ], cwd=str(PROJECT_ROOT)).returncode\n"
+            "        if _prep_rc != 0:\n"
+            "            raise SystemExit(f\"prepare_data.py --sources xlam exited {_prep_rc} (set HF_TOKEN if Salesforce/xlam-function-calling-60k is gated)\")\n"
+            "        # v2.7 provenance note: template_stamp.json is directory-level, so the\n"
+            "        # stamp now attests the xLAM splits prepare_data just wrote, not the\n"
+            "        # Hermes splits realigned above. Gate A below still validates the\n"
+            "        # template REVISION (the thing that invalidated v1), nothing more.\n"
+            "        print(\"[Gate A / note] prepare_data.py re-stamped \" + DATA_DIR + \" -> Hermes splits are no longer attested by that stamp.\")",
         ),
         # Gate C: the v2.7 win is contingent on object params existing as dotted
         # leaves. Warning-level, not fatal: plan steps 2-3 (nested schema parsing

@@ -40,6 +40,11 @@ import re
 from typing import Any, Dict, Iterator, List, Optional
 
 from spancall.data.base import BaseDatasetLoader
+from spancall.data.flatten import (
+    expand_object_parameter,
+    object_paths_from_params,
+    validate_object_paths,
+)
 from spancall.data.schema import (
     GroundTruthCall,
     ParameterSchema,
@@ -216,6 +221,18 @@ def _json_mode_tool_name(parsed_schema: Optional[Dict[str, Any]]) -> str:
     return _slugify_tool_name(parsed_schema.get("title"))
 
 
+def _hermes_type_resolver(pspec: Dict[str, Any]):
+    ptype = pspec.get("type", "string")
+    items_type: Optional[str] = None
+    if ptype == "array":
+        items = pspec.get("items")
+        if isinstance(items, dict):
+            items_type = items.get("type")
+        elif isinstance(items, str):
+            items_type = items
+    return ptype, items_type, False
+
+
 def _tool_from_json_schema(
     name: str, description: str, params: Dict[str, Any]
 ) -> ToolDefinition:
@@ -226,28 +243,24 @@ def _tool_from_json_schema(
     for pname, pspec in properties.items():
         if not isinstance(pspec, dict):
             continue
-        ptype = pspec.get("type", "string")
-        # item type for array params
-        items_type: Optional[str] = None
-        if ptype == "array":
-            items = pspec.get("items")
-            if isinstance(items, dict):
-                items_type = items.get("type")
-            elif isinstance(items, str):
-                items_type = items
-        param_schemas.append(
-            ParameterSchema(
-                name=pname,
-                description=pspec.get("description", ""),
-                param_type=ptype,
-                required=pname in required,
-                enum=pspec.get("enum"),
-                default=pspec.get("default"),
-                items_type=items_type,
-            )
-        )
-    tool_type = str(params.get("type", "object"))
-    return ToolDefinition(name=name, description=description, parameters=param_schemas, risk_tier="read_only")
+        for leaf in expand_object_parameter(
+            str(pname),
+            pspec,
+            required=pname in required,
+            type_resolver=_hermes_type_resolver,
+            default_required=False,
+        ):
+            param_schemas.append(ParameterSchema(**leaf))
+    object_paths = object_paths_from_params(param_schemas) or None
+    if object_paths and validate_object_paths([p.name for p in param_schemas], object_paths):
+        object_paths = None
+    return ToolDefinition(
+        name=name,
+        description=description,
+        parameters=param_schemas,
+        risk_tier="read_only",
+        object_paths=object_paths,
+    )
 
 
 def _parse_schema_block(system_value: str) -> Optional[str]:

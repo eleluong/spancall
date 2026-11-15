@@ -15,6 +15,11 @@ import os
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from spancall.data.base import BaseDatasetLoader
+from spancall.data.flatten import (
+    expand_object_parameter,
+    object_paths_from_params,
+    validate_object_paths,
+)
 from spancall.data.schema import (
     GroundTruthCall,
     ParameterSchema,
@@ -63,9 +68,13 @@ def map_xlam_type(raw_type: Optional[str]) -> Tuple[str, Optional[str], bool]:
         elif "bool" in tl:
             items_type = "boolean"
         return "array", items_type, is_optional
-    if tl == "dict" or tl.startswith("dict["):
+    if tl in ("dict", "object") or tl.startswith("dict["):
         return "object", None, is_optional
     return "string", None, is_optional
+
+
+def _xlam_type_resolver(pspec: Dict[str, Any]) -> Tuple[str, Optional[str], bool]:
+    return map_xlam_type(pspec.get("type"))
 
 
 def _parse_xlam_tools(raw_tools: Any) -> Optional[List[ToolDefinition]]:
@@ -86,27 +95,25 @@ def _parse_xlam_tools(raw_tools: Any) -> Optional[List[ToolDefinition]]:
             for pname, pspec in params_raw.items():
                 if not isinstance(pspec, dict):
                     continue
-                ptype, items_type, is_opt = map_xlam_type(pspec.get("type"))
                 has_default = "default" in pspec
-                raw_enum = pspec.get("enum")
-                enum = [str(v) for v in raw_enum] if isinstance(raw_enum, list) else None
-                param_schemas.append(
-                    ParameterSchema(
-                        name=str(pname),
-                        description=str(pspec.get("description") or ""),
-                        param_type=ptype,
-                        required=not (is_opt or has_default),
-                        enum=enum,
-                        default=pspec.get("default"),
-                        items_type=items_type,
-                    )
-                )
+                for leaf in expand_object_parameter(
+                    str(pname),
+                    pspec,
+                    required=not has_default,
+                    type_resolver=_xlam_type_resolver,
+                    default_required=True,
+                ):
+                    param_schemas.append(ParameterSchema(**leaf))
+        object_paths = object_paths_from_params(param_schemas) or None
+        if object_paths and validate_object_paths([p.name for p in param_schemas], object_paths):
+            object_paths = None
         tools.append(
             ToolDefinition(
                 name=str(name),
                 description=str(item.get("description") or ""),
                 parameters=param_schemas,
                 risk_tier="read_only",
+                object_paths=object_paths,
             )
         )
     return tools

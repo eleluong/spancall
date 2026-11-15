@@ -31,7 +31,7 @@ from __future__ import annotations
 import hashlib
 import re
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from span_template.template import (
     Param,
@@ -42,6 +42,7 @@ from span_template.template import (
 )
 
 from spancall.data.base import BaseAligner
+from spancall.data.flatten import flatten_args
 from spancall.data.schema import (
     GroundTruthCall,
     ParameterSchema,
@@ -54,7 +55,7 @@ from spancall.data.schema import (
 # ---------------------------------------------------------------------------
 # H4 reason vocabulary (docs/heads.md §H4)
 # ---------------------------------------------------------------------------
-H4_REASONS = ("OK", "ABSENT", "AMBIGUOUS", "NEEDS_REASONING", "OFF_WINDOW")
+H4_REASONS = ("OK", "ABSENT", "AMBIGUOUS", "NEEDS_REASONING", "OFF_WINDOW", "OBJECT_UNDECOMPOSED")
 
 # ---------------------------------------------------------------------------
 # Deterministic synthetic-clock helpers
@@ -148,7 +149,8 @@ def _resolve_base_date(sample: UnifiedSample, gt_dates: Sequence[date]) -> Tuple
 
 def _resolve_gt_dates(gt_call: GroundTruthCall) -> List[date]:
     out: List[date] = []
-    for v in (gt_call.arguments or {}).values():
+    flat = flatten_args(gt_call.arguments or {})
+    for v in flat.values():
         day = _parse_iso_datetime(v)
         if day is not None:
             out.append(day)
@@ -506,7 +508,12 @@ class ReverseAligner(BaseAligner):
 
         params = tool_def.parameters or []
         names = {p.name for p in params}
-        args = gt_call.arguments or {}
+        raw_args = gt_call.arguments or {}
+        args = (
+            flatten_args(raw_args, tool_def.object_paths)
+            if tool_def.object_paths
+            else raw_args
+        )
         reasons: Dict[str, Optional[str]] = {}
         ok = True
         for p in params:
@@ -634,6 +641,10 @@ class ReverseAligner(BaseAligner):
         # Case F: array
         if p.param_type == "array" and isinstance(val, list):
             return self._align_array(p, val, output, base, sample)
+
+        # Case G: opaque / undecomposed object (free-form or depth > OBJECT_MAX_DEPTH)
+        if p.param_type == "object" or isinstance(val, Mapping):
+            return self._fail(p, "OBJECT_UNDECOMPOSED")
 
         # Case E: scalar string / integer / number
         # -- recent-context first (most specific: whole-value equality on a

@@ -445,8 +445,8 @@ class GateTest(unittest.TestCase):
         result = gate_tool_call(out, self._resolve(mapping))
         self.assertFalse(result.hit)
         self.assertTrue(result.abstained)
-        self.assertIn("search_flights.origin", result.missing_required)
-        self.assertIn("search_flights.destination", result.missing_required)
+        self.assertIn("search_flights::origin", result.missing_required)
+        self.assertIn("search_flights::destination", result.missing_required)
 
     def test_multi_tool_gate_hit_namespaces_payload(self):
         t2 = Tool("search_flights", "Search flights",
@@ -458,9 +458,9 @@ class GateTest(unittest.TestCase):
         result = gate_tool_call(out, self._resolve(mapping))
         self.assertTrue(result.hit)
         self.assertFalse(result.abstained)
-        # multi pack -> payload keys are namespaced <tool>.<param>
-        self.assertEqual(result.payload["book_flight.flight_id"], "VN123")
-        self.assertEqual(result.payload["search_flights.origin"], "Hanoi")
+        # multi pack -> payload keys are namespaced <tool>::<param>
+        self.assertEqual(result.payload["book_flight::flight_id"], "VN123")
+        self.assertEqual(result.payload["search_flights::origin"], "Hanoi")
 
     def test_abstained_reports_missing_required(self):
         out = demo_input()
