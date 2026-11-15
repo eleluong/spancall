@@ -390,6 +390,22 @@ _V27_FIXES: Dict[str, Any] = {
             '    if os.path.exists(os.path.join(DATA_DIR, f"{_osp}.jsonl")):\n'
             "        _audit_splits.append(_osp)",
         ),
+        # Marker-injection adversarial splits have target_spans={} by contract
+        # (align.py:387-391), so 0 utterance targets -> NaN rates is expected.
+        (
+            "    _ok = (\n"
+            "        isinstance(_stale, float) and _stale == _stale and _stale < MAX_UTT_STALE_RATE\n"
+            "        and ((_unres is None) or (isinstance(_unres, float) and _unres == _unres and _unres < MAX_UNRESOLVABLE))\n"
+            "    )",
+            "    _n_utt = int(_m.get(\"utterance_span_targets\") or 0)\n"
+            "    if _n_utt == 0 and \"adversarial\" in _split:\n"
+            "        _ok = True  # marker-injection splits have target_spans={} by contract\n"
+            "    else:\n"
+            "        _ok = (\n"
+            "            isinstance(_stale, float) and _stale == _stale and _stale < MAX_UTT_STALE_RATE\n"
+            "            and ((_unres is None) or (isinstance(_unres, float) and _unres == _unres and _unres < MAX_UNRESOLVABLE))\n"
+            "        )",
+        ),
         # Fallback: prepare xLAM-60k (1-call) splits in DATA_DIR if still missing.
         # Prefer re-aligning the public convoicon/spancall xLAM splits (no HF gate
         # on Salesforce/xlam-function-calling-60k); only fall back to
