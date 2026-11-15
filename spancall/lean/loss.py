@@ -277,9 +277,26 @@ def compute_lean_pointer_loss(
         ),
     )
 
-    numerator = torch.logsumexp(pos_logits, dim=-1)   # (B, K)
+    # A-1 (multi-span lists): rows with a SINGLE positive keep the exact
+    # marginal-likelihood semantics (logsumexp over positives == the positive
+    # logit). Rows with MULTIPLE positives -- i.e. array-param element spans
+    # since tensorize stopped clamping them to max_pos=1 -- use a UNIFORM
+    # cross-entropy over the positives instead. The marginal form
+    # ``logsumexp(z) - logsumexp(pos)`` hits its minimum when mass sits on ANY
+    # subset of the positives, so the model could satisfy the loss while
+    # pointing at only one or two list elements; the uniform form
+    # ``logsumexp(z) - mean(pos_logits)`` keeps a positive gradient until every
+    # element span carries mass, which is what the list decoder needs.
+    n_valid = valid.sum(-1).clamp(min=1)  # (B, K), avoid div-by-0 on empty rows
+    multi = (n_pos > 1).unsqueeze(-1)     # (B, K, 1)
+    # zero (NOT -inf) on invalid slots before summing: -inf * 0 = NaN.
+    mean_pos = torch.where(valid, pos_logits, torch.zeros_like(pos_logits)).sum(-1) / n_valid  # (B, K)
+    # On no-positive rows pos_logits is all zeros and mean is 0; the final
+    # masking below zeroes those rows anyway.
+    marginal = torch.logsumexp(pos_logits, dim=-1)   # (B, K)
+    numerator = torch.where(multi.squeeze(-1), mean_pos, marginal)
     denominator = torch.logsumexp(z, dim=-1)           # (B, K)
-    losses = denominator - numerator                   # (B, K), >= 0
+    losses = denominator - numerator                   # (B, K)
 
     # Zero out rows with no positive groundings
     losses = torch.where(n_pos > 0, losses, torch.zeros_like(losses))

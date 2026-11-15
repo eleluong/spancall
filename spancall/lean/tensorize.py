@@ -1040,8 +1040,15 @@ def tensorize_sample_lean(
         # That silently filled the 512 columns with ~2x repeats, leaving the
         # model a softmax over duplicated candidates and roughly half the
         # distinct coverage the resolver gets.
+        # A-1 (multi-span lists): array-typed params keep ALL their element
+        # positives, not just the first ``max_pos`` (default 1). Supervising
+        # only the first element of ``['chicken','broccoli','cheese']`` while
+        # the other two are background is what produced the confident
+        # 1-element list FPs in the v2.6 precision deep-dive.
+        is_array_param = (param.param_type or "").strip().lower() == "array"
+        eff_max_pos = max(max_pos, len(matched_cis)) if is_array_param else max_pos
         if len(cands) > max_cands:
-            keep_pos = matched_cis[:max_pos]
+            keep_pos = matched_cis[:eff_max_pos]
             # Positives first: a capped row must never lose the span it is
             # supervised on (matched_cis indices stay valid through idx_map).
             keep_set = set(keep_pos)
@@ -1077,9 +1084,20 @@ def tensorize_sample_lean(
         cand_start_rows.append([c.tok_start for c in cands])
         cand_end_rows.append([c.tok_end for c in cands])
 
-        # 0-indexed candidate positives!
-        pos_cols = [ci for ci in matched_cis[:max_pos]]
-        pos_rows.append((pos_cols + [-1] * max_pos)[:max_pos])
+        # 0-indexed candidate positives! Array rows may exceed ``max_pos``
+        # width; the row-wide width below re-pads them uniformly (a ragged
+        # list would break torch.tensor), LeanBatchCollate pads across the
+        # batch to the widest row, and the pointer loss masks slots < 0.
+        pos_cols = [ci for ci in matched_cis[:eff_max_pos]]
+        pos_rows.append(pos_cols)
+
+    # A-1: uniform positive width. Non-array rows are capped at ``max_pos``
+    # columns; array rows keep ALL element positives (they may be wider).
+    # PAD_INDEX (-1) fills the unused slots and the pointer loss ignores
+    # them, so only the width semantics changed.
+    P = max([len(r) for r in pos_rows] + [max_pos])
+    for i in range(len(pos_rows)):
+        pos_rows[i] = (pos_rows[i] + [-1] * P)[:P]
 
     C = max((len(c) for c in cand_start_rows), default=0)
     C = max(min(C, max_cands), 1)

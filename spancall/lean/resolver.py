@@ -21,7 +21,7 @@ import torch
 
 from spancall.agent.context import select_recent_context
 from spancall.data.align import tooldef_to_template_tool
-from spancall.data.schema import ToolDefinition
+from spancall.data.schema import ParameterSchema, ToolDefinition
 from spancall.infer.base import (
     BaseResolveResult,
     BaseResolver,
@@ -305,6 +305,7 @@ class LeanResolver(BaseResolver):
         resolve_mode: str = "single_pass",
         collapse_guard: bool = False,
         prevent_param_collapse: bool = False,
+        list_decode: bool = True,
         **kwargs: Any,
     ) -> None:
         if model is None and encoder is not None:
@@ -327,6 +328,12 @@ class LeanResolver(BaseResolver):
         self.min_confidence = float(min_confidence) if min_confidence is not None else None
         self.min_posterior = float(min_posterior) if min_posterior is not None else None
         self.prevent_param_collapse = bool(prevent_param_collapse)
+        # A-1 (multi-span lists): assemble array-typed params from the top
+        # non-conflicting element choices. On old single-positive checkpoints
+        # the element distribution puts ~all mass on one span, so this is
+        # inert there; on multi-positive-trained checkpoints it recovers the
+        # full list.
+        self.list_decode = bool(list_decode)
         self.decoder = decoder or LeanJointDecoder(
             top_k=5,
             free_string_overlap_allowed=not self.prevent_param_collapse,
@@ -1201,6 +1208,57 @@ class LeanResolver(BaseResolver):
             choice = chosen.get(p.name)
             raw_ptype = (p.param_type or "string").lower()
             is_nullable = "null" in raw_ptype
+            is_array_param = "array" in raw_ptype
+
+            if choice is not None and is_array_param and self.list_decode:
+                # A-1 (multi-span lists): assemble the value from the top
+                # non-conflicting element choices instead of letting the
+                # joint winner collapse the list to its first element.
+                elem_choices = self.decoder.select_list_choices(
+                    per_param_scores.get(p.name, [])
+                )
+                if elem_choices and getattr(elem_choices[0], "region", "") != "null":
+                    items: List[Any] = []
+                    spans: List[Tuple[int, int]] = []
+                    src_regions: List[str] = []
+                    elem_conf: List[float] = []
+                    cast_ok = True
+                    # Cast each ELEMENT against the element schema (items_type),
+                    # not against the array param itself — otherwise the array
+                    # caster wraps every element into its own 1-item list.
+                    elem_param = ParameterSchema(
+                        name=p.name,
+                        description=p.description,
+                        param_type=(getattr(p, "items_type", None) or "string"),
+                        required=p.required,
+                    )
+                    for ec in elem_choices:
+                        ok_e, v_e, _r = self.caster.cast_choice(ec, elem_param, output)
+                        if not ok_e or v_e is None:
+                            cast_ok = False
+                            break
+                        items.append(v_e)
+                        ec_span = getattr(ec, "span", None)
+                        if ec_span is not None:
+                            spans.append((int(ec_span[0]), int(ec_span[1])))
+                        src_regions.append(str(getattr(ec, "region", "value")))
+                        elem_conf.append(float(getattr(ec, "prob", 0.0)))
+                    if cast_ok and items:
+                        span = spans[0] if spans else None
+                        payload[p.name] = items
+                        payload_partial[p.name] = items
+                        parameters[p.name] = LeanParameterResolution(
+                            name=p.name,
+                            value=items,
+                            confidence=min(elem_conf) if elem_conf else 0.0,
+                            margin=float(margins.get(p.name, 0.0)),
+                            source_type=src_regions[0] if src_regions else "value",
+                            char_span=(int(span[0]), int(span[1])) if span is not None else None,
+                            p_abstain=0.0,
+                        )
+                        continue
+                # element cast failed or null won -> fall through to the
+                # single-choice path below (old behaviour).
 
             if choice is not None:
                 ok, value, reason = self.caster.cast_choice(choice, p, output)

@@ -1381,6 +1381,86 @@ if DRIVE_MOUNT:
             shutil.copytree(src, dst, dirs_exist_ok=True)
             print(f"mirrored {src} -> {dst}")'''
 
+MARKDOWN_CORPUS_EVAL = """---
+### 5b. Per-Corpus Evaluation (Hermes vs xLAM)
+
+Splits every evaluation subset by `source_dataset` (Hermes vs xLAM) and reruns `scripts/eval_toolcall.py` per corpus, so Hermes-only and xLAM-only metrics are reported separately instead of blended. Runs after all subsets and predictions exist (eval split + all test splits)."""
+
+CODE_CORPUS_EVAL = '''import json, os, subprocess, sys
+
+def _corpus_of(row):
+    sd = str(row.get("source_dataset") or "")
+    if sd.startswith("xlam"):
+        return "xlam"
+    if sd.startswith("hermes"):
+        return "hermes"
+    # Fallback: sample_id prefix ("xlam::..." vs hermes-style ids)
+    return "xlam" if str(row.get("sample_id") or "").startswith("xlam") else "hermes"
+
+_corpus_eval_pairs = []  # (split, corpus, label, metrics_path)
+
+for split in TEST_SPLITS + [EVAL_SPLIT]:
+    sub_path = SUBSET_EVAL_PATH if (split == EVAL_SPLIT and os.path.exists(SUBSET_EVAL_PATH)) \\
+        else os.path.join(RESULTS_DIR, f"subset_{split}.jsonl")
+    if not os.path.exists(sub_path):
+        continue
+    with open(sub_path, encoding="utf-8") as fh:
+        rows = [json.loads(l) for l in fh if l.strip()]
+    by_corpus = {"hermes": [], "xlam": []}
+    for r in rows:
+        by_corpus[_corpus_of(r)].append(r)
+    if split == EVAL_SPLIT:
+        _pred_specs = [
+            ("b1a", None),
+            ("lean", os.path.join(RESULTS_DIR, "preds_eval.jsonl")),
+            ("lean_twostep", os.path.join(RESULTS_DIR, "preds_eval_twostep.jsonl")),
+        ]
+    else:
+        _pred_specs = [("b1a", None), ("lean", os.path.join(RESULTS_DIR, f"preds_{split}.jsonl"))]
+    for corpus, crows in by_corpus.items():
+        if not crows:
+            continue
+        csub = os.path.join(RESULTS_DIR, f"subset_{split}_{corpus}.jsonl")
+        with open(csub, "w", encoding="utf-8") as fh:
+            for r in crows:
+                fh.write(json.dumps(r, default=str) + "\\n")
+        ids = {r["sample_id"] for r in crows}
+        for label, pred_path in _pred_specs:
+            cpred = None
+            if pred_path is not None:
+                if not os.path.exists(pred_path):
+                    continue
+                with open(pred_path, encoding="utf-8") as fh:
+                    _pred_rows = [json.loads(l) for l in fh if l.strip()]
+                _keep = [p for p in _pred_rows if p.get("sample_id") in ids]
+                if not _keep:
+                    continue
+                cpred = os.path.join(RESULTS_DIR, f"preds_{split}_{corpus}_{label}.jsonl")
+                with open(cpred, "w", encoding="utf-8") as fh:
+                    for p in _keep:
+                        fh.write(json.dumps(p, default=str) + "\\n")
+            out_json = os.path.join(RESULTS_DIR, f"toolcall_metrics_{split}_{corpus}_{label}.json")
+            _cmd = [sys.executable, "scripts/eval_toolcall.py", "--test_data", csub]
+            if label == "b1a":
+                _cmd += ["--baseline", "b1a"]
+            else:
+                _cmd += ["--predictions", cpred]
+            _cmd += ["--output", out_json]
+            subprocess.run(_cmd, check=False)
+            _corpus_eval_pairs.append((split, corpus, label, out_json))
+
+print(f"\\n=== Per-Corpus Evaluation (Hermes vs xLAM) ===")
+print(f"{'split':<26}{'corpus':<9}{'system':<14}{'n_F':>6}{'exact_F':>9}{'hit_F':>8}{'param_F1':>9}{'exact_all':>10}")
+print("-" * 90)
+for split, corpus, label, out_json in _corpus_eval_pairs:
+    m = _load_metrics(out_json)
+    if not m:
+        continue
+    m_f = m.get("metrics_by_stratum", {}).get("F", {})
+    print(f"{split:<26}{corpus:<9}{label:<14}{int(m_f.get('n', 0)):>6}"
+          f"{m_f.get('exact_payload_match', 0.0):>9.3f}{m_f.get('hit_rate', 0.0):>8.3f}"
+          f"{m_f.get('param_f1', 0.0):>9.3f}{m.get('exact_payload_match', 0.0):>10.3f}")'''
+
 MARKDOWN_SUMMARY_REPORT = """---
 ## 6. Final Run Summary Report
 
@@ -1575,6 +1655,8 @@ cells = [
     new_code_cell(CODE_EVAL_STEP5),
     new_markdown_cell(MARKDOWN_TEST),
     new_code_cell(CODE_TEST_AND_PERSIST),
+    new_markdown_cell(MARKDOWN_CORPUS_EVAL),
+    new_code_cell(CODE_CORPUS_EVAL),
     new_markdown_cell(MARKDOWN_SUMMARY_REPORT),
     new_code_cell(CODE_SUMMARY_REPORT),
 ]

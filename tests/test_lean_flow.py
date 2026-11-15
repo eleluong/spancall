@@ -18,7 +18,7 @@ from spancall.data.schema import (
 )
 from spancall.infer.base import FakeTokenizer
 from spancall.lean.decode import LeanJointDecoder
-from spancall.data.align import tooldef_to_template_tool
+from spancall.data.align import ReverseAligner, tooldef_to_template_tool
 from spancall.lean.eval_p1 import (
     EXTRACTABLE_TARGET_TYPES,
     _parity_spans_for_call,
@@ -1968,28 +1968,146 @@ def test_tensorize_max_pos_populates_multiple_positive_slots() -> None:
 
 
 def test_compute_lean_pointer_loss_weights_every_positive() -> None:
-    """R7: a second positive must change the loss, and the result is a lower bound.
+    """R7 (amended by A-1): multi-positive rows use uniform CE, not marginal.
 
-    Adding a valid alternative can only make the marginal likelihood better, so
-    ``loss(2 positives) <= loss(1 positive)`` must hold pointwise for the same
-    logits. This is the property that makes multi-positive supervision correct
-    rather than merely different.
+    The original R7 property ("adding a positive can only lower the loss")
+    encoded the marginal-likelihood semantics. A-1 changed multi-positive
+    rows (array element spans) to a UNIFORM cross-entropy because the
+    marginal form hits its minimum when mass sits on ANY subset of the
+    positives — letting the model satisfy the loss while pointing at only
+    one list element. The new guarantee: the loss stays strictly positive
+    until EVERY positive span carries mass, and single-positive rows keep
+    the exact marginal semantics.
     """
     logits = torch.tensor([[[1.0, 2.0, 0.5, -1.0]]])  # (B=1, K=1, C=4)
     one = torch.tensor([[[1, -1, -1]]], dtype=torch.long)
     two = torch.tensor([[[1, 2, -1]]], dtype=torch.long)
+
+    # Single-positive rows: identical to the classic marginal form.
     loss_one = float(compute_lean_pointer_loss(logits, one).sum())
+    expected_one = float(torch.logsumexp(logits, -1) - logits[0, 0, 1])
+    assert abs(loss_one - expected_one) < 1e-6
+
+    # Multi-positive rows: uniform CE over the positives, finite and >= 0.
     loss_two = float(compute_lean_pointer_loss(logits, two).sum())
-    assert loss_two <= loss_one + 1e-6, (
-        f"adding a positive raised the loss ({loss_two} > {loss_one}); the "
-        "marginal likelihood is being computed against the wrong set"
+    expected_two = float(
+        torch.logsumexp(logits, -1) - (logits[0, 0, 1] + logits[0, 0, 2]) / 2.0
     )
-    # With BOTH positives at the top-2 logits, the loss must be strictly smaller.
-    assert loss_two < loss_one, "second positive had no effect on the loss"
+    assert abs(loss_two - expected_two) < 1e-6, (
+        f"uniform CE expected for multi-positive rows, got {loss_two}"
+    )
+    assert loss_two >= 0.0 and not math.isnan(loss_two)
 
     # A row with no positives contributes exactly zero (never NaN).
     none = torch.tensor([[[-1, -1, -1]]], dtype=torch.long)
     assert float(compute_lean_pointer_loss(logits, none).sum()) == 0.0
+
+
+def test_tensorize_array_param_keeps_all_element_positives() -> None:
+    """A-1: an array param's element positives must not be capped at max_pos.
+
+    ``max_pos=1`` (the v2.6 default) kept only the FIRST element of a GT
+    list and treated the rest as background, which is exactly what produced
+    the confident ``['chicken']`` vs ``['chicken','broccoli','cheese']``
+    precision FPs. Array params are now exempt from the clamp.
+    """
+    tok = FakeTokenizer()
+    mb = CandidateMaskBuilder(max_seq_len=1024, max_span_width=16)
+    arr = ToolDefinition(
+        name="add_tags",
+        description="d",
+        parameters=[
+            ParameterSchema(
+                name="tags", description="tags", param_type="array",
+                items_type="string", required=True,
+            )
+        ],
+    )
+    sample = ReverseAligner().align(UnifiedSample(
+        sample_id="arr-multipos",
+        source_dataset="test",
+        utterance="tag urgent, legal and finance",
+        tools=[arr],
+        ground_truth_calls=[
+            GroundTruthCall(tool_name="add_tags", arguments={"tags": ["urgent", "legal", "finance"]})
+        ],
+        current_time_iso="2026-11-09",
+        stratum=Stratum.F,
+    ))
+    row = tensorize_sample_lean(
+        sample, tok, mb, max_seq_len=1024, max_pos=1, pack_multi_tools=True,
+    )
+    assert row is not None
+
+    pos_row = row["pos_indices"][0].tolist()
+    live_pos = [p for p in pos_row if p >= 0]
+    # Token-snapping can emit near-duplicate spans for one element, so the
+    # assertion is COVERAGE: every GT element must appear among the positives.
+    # (Under the pre-fix max_pos=1 clamp only the first element survived.)
+    assert len(live_pos) >= 3, (
+        f"array param must keep all 3 element positives, got {len(live_pos)}: {pos_row}"
+    )
+    # Each aligned element target (render-absolute char offsets) must be
+    # covered by at least one positive candidate span, with one char of
+    # token-snapping slack.
+    starts = row["cand_starts"][0].tolist()
+    ends = row["cand_ends"][0].tolist()
+    pos_spans = [(starts[p], ends[p]) for p in live_pos]
+    for t in sample.target_spans["tags"]:
+        assert any(abs(s - t.char_start) <= 1 for s, _e in pos_spans), (
+            f"element {t.canonical_value!r} at {t.char_start} missing from "
+            f"positives: {pos_spans}"
+        )
+    assert len(set(live_pos)) == len(live_pos), f"duplicate positive slots: {pos_row}"
+    # ...and the marginal pointer loss consumes the wider row without NaN.
+    logits = torch.randn(1, 1, row["cand_starts"].shape[1], requires_grad=True)
+    ptr = torch.tensor([[pos_row]], dtype=torch.long)
+    loss = compute_lean_pointer_loss(logits, ptr)
+    assert torch.isfinite(loss).all()
+
+
+def test_decoder_select_list_choices_unions_top_elements() -> None:
+    """A-1: the decoder must return multiple element choices for arrays."""
+    decoder = LeanJointDecoder()
+    entries = [
+        (_j4_cand("chicken", 10, 17, 0.60), 0.60),
+        (_j4_cand("broccoli", 19, 27, 0.55), 0.55),
+        (_j4_cand("cheese", 29, 35, 0.50), 0.50),
+        # Distractor: far below the rel_threshold floor (0.5 x winner prob).
+        (_j4_cand("fish", 40, 44, -3.0), -3.0),
+    ]
+    sel = decoder.select_list_choices(entries)
+    values = [v.value for v in sel]
+    assert values == ["chicken", "broccoli", "cheese"], (
+        f"top-3 non-conflicting elements expected, got {values}"
+    )
+
+
+def test_decoder_select_list_choices_inert_on_single_positive_distribution() -> None:
+    """A-1: old checkpoints (one dominant span) must be untouched."""
+    # Mirror the production resolver's decoder (normalize_scores=False):
+    # with softmax the 0.97-vs-0.01 gap flattens to ~0.27 relative, which
+    # any rel_threshold would accept; raw-score normalization preserves it.
+    decoder = LeanJointDecoder(normalize_scores=False)
+    entries = [
+        (_j4_cand("chicken", 10, 17, 0.97), 0.97),
+        (_j4_cand("broccoli", 19, 27, 0.01), 0.01),
+        (_j4_cand("cheese", 29, 35, 0.01), 0.01),
+        (_j4_cand("fish", 40, 44, 0.01), 0.01),
+        (_j4_cand("rice", 48, 52, 0.01), 0.01),
+    ]
+    sel = decoder.select_list_choices(entries)
+    assert [v.value for v in sel] == ["chicken"]
+
+
+def test_decoder_select_list_choices_skips_null_winner() -> None:
+    """A-1: a null winner must be returned as-is (no element union)."""
+    decoder = LeanJointDecoder()
+    null_cand = SimpleNamespace(
+        canon_value=None, char_start=None, char_end=None, region="null", entry_index=-1
+    )
+    sel = decoder.select_list_choices([(null_cand, 0.9), (_j4_cand("x", 1, 2, 0.1), 0.1)])
+    assert len(sel) == 1 and getattr(sel[0], "region", "") == "null"
 
 
 def test_tensorize_capped_candidates_have_no_duplicate_spans() -> None:
