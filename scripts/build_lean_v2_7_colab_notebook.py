@@ -107,10 +107,21 @@ def _gather_samples(path: str, limit: int = 0) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------- schema view
+# This is a SCHEMA-level number, so it must be counted once per distinct tool.
+# The same tool schema repeats in every sample that offers it (~10-50x), and a
+# per-occurrence counter would silently turn "tools with decomposed objects"
+# into a sample-weighted count - a number that can exceed the number of distinct
+# tools in the split and moves when the eval slice size changes.
 _schema_stats = Counter()
+_seen_tools: set = set()
+_dup_tools = 0
 for _raw in _gather_samples(os.path.join(DATA_DIR, f"{EVAL_SPLIT}.jsonl")):
     _s = UnifiedSample.from_dict(_raw)
     for _t in _s.tools:
+        if _t.name in _seen_tools:
+            _dup_tools += 1
+            continue
+        _seen_tools.add(_t.name)
         _opaque = [p.name for p in _t.parameters if (p.param_type or "").lower() == "object"]
         _leaves = [p.name for p in _t.parameters if _is_object_leaf(p.name, _t.object_paths or {})]
         if _opaque:
@@ -122,7 +133,9 @@ for _raw in _gather_samples(os.path.join(DATA_DIR, f"{EVAL_SPLIT}.jsonl")):
         if _t.object_paths:
             _schema_stats["object_roots_decomposed"] += len(_t.object_paths)
 
-print("=== Object Decomposition Coverage (schema level) ===")
+print("=== Object Decomposition Coverage (schema level, distinct tools) ===")
+print(f"  distinct tool schemas scanned    : {len(_seen_tools)}"
+      f"  ({_dup_tools} repeated occurrences ignored)")
 print(f"  object roots decomposed          : {_schema_stats['object_roots_decomposed']}")
 print(f"  scalar leaf params emitted       : {_schema_stats['decomposed_leaf_params']}")
 print(f"  tools with decomposed objects    : {_schema_stats['tools_with_decomposed_object']}")
@@ -323,16 +336,284 @@ if FORCE_HF_DOWNLOAD or _missing_v2:
 
 _V27_DOWNLOAD = '''_missing_v2 = [f for f in CANONICAL_SPLITS + XLAM_SPLITS if not os.path.exists(os.path.join(DATA_DIR, f))]
 if _missing_v2:
-    # v2.7: never pull a prebuilt processed_v2 - object decomposition changes the
-    # rendered param list, so labels must be rebuilt from v1 (next block).
-    print(f"{len(_missing_v2)} split(s) missing in {DATA_DIR} -> produced by re-alignment below.")'''
+    # v2.7: never pull a prebuilt processed_v2. Object decomposition changes the
+    # rendered param list, so a stale directory would train on v2.6-shaped labels
+    # (one opaque `object` param, no dotted leaves) and every object number in
+    # section 4d would be 0 for a reason that has nothing to do with the model.
+    # Hermes splits are rebuilt by the realign block below; xLAM by prepare_data.
+    print(f"[v2.7] {len(_missing_v2)} of {len(CANONICAL_SPLITS) + len(XLAM_SPLITS)} split(s) "
+          f"missing in {DATA_DIR}")
+    print("       no prebuilt v2 download is used in v2.7 - every split is rebuilt below.")'''
+
+
+# --------------------------------------------------------------------------
+# v2.7 surgical cell fixes
+# --------------------------------------------------------------------------
+# ``_REPLACEMENTS``/``_VERSION_RULES`` are *token* rewrites shared by every cell.
+# The fixes below are per-cell and semantic, and they must land **after** the
+# version bump, so each NEEDLE is written against the post-bump text and must
+# not itself contain a version token (otherwise the bump would rewrite it).
+#
+# Two defect classes are addressed:
+#   1. flat/nested key-space mismatch - the v2.6 eval cells compare nested
+#      ``gt_args`` against dotted ``payload_partial`` keys, so every object leaf
+#      scores as wrong regardless of model quality;
+#   2. silent-failure gates - a missing checkpoint or an un-audited split that
+#      reports a number instead of refusing.
+_V27_FIXES: Dict[str, Any] = {
+    # -- §1 data & pre-flight ------------------------------------------------
+    "CODE_DATA_AND_PREFLIGHT": [
+        # Explicit imports: the cell calls subprocess/sys but relied on the setup
+        # cell having been run first, which breaks when this cell is run alone.
+        (
+            "from spancall.lean.diagnostics import audit_gt_offsets\nimport json, os",
+            "from spancall.lean.diagnostics import audit_gt_offsets\n"
+            "import json, os, subprocess, sys",
+        ),
+        # Gate B audited only eval+dev while §5 reports on the OOD/adversarial
+        # splits, which are aligned by the same pass -> a label-offset defect
+        # there showed up as a low score with no gate above it.
+        (
+            "# Pre-Flight Gate B: offset audit on eval & dev (Hermes + xLAM)\n"
+            '_audit_splits = [EVAL_SPLIT, "hermes_dev"]\n'
+            'for _xsp in ("xlam_eval", "xlam_dev"):\n'
+            '    if os.path.exists(os.path.join(DATA_DIR, f"{_xsp}.jsonl")):\n'
+            "        _audit_splits.append(_xsp)",
+            "# Pre-Flight Gate B: offset audit on every split this notebook later\n"
+            "# reports on, not just eval+dev. The OOD / adversarial splits come from\n"
+            "# the same aligner, so an offset defect there has to fail here rather\n"
+            "# than surface as a mysteriously low section-5 score.\n"
+            '_audit_splits = [EVAL_SPLIT, "hermes_dev"]\n'
+            'for _osp in list(TEST_SPLITS) + ["xlam_dev"]:\n'
+            "    if _osp in _audit_splits:\n"
+            "        continue\n"
+            '    if os.path.exists(os.path.join(DATA_DIR, f"{_osp}.jsonl")):\n'
+            "        _audit_splits.append(_osp)",
+        ),
+        # Gate A reads a DIRECTORY-level stamp; prepare_data.py writes its own,
+        # overwriting the one realign_v2 wrote. Say so instead of letting the
+        # PASS line imply the Hermes splits were attested by that stamp.
+        (
+            "    if _prep_rc != 0:\n"
+            '        raise SystemExit(f"prepare_data.py --sources xlam exited {_prep_rc}")',
+            "    if _prep_rc != 0:\n"
+            '        raise SystemExit(f"prepare_data.py --sources xlam exited {_prep_rc}")\n'
+            "    # v2.7 provenance note: template_stamp.json is directory-level, so the\n"
+            "    # stamp now attests the xLAM splits prepare_data just wrote, not the\n"
+            "    # Hermes splits realigned above. Gate A below still validates the\n"
+            "    # template REVISION (the thing that invalidated v1), nothing more.\n"
+            '    print("[Gate A / note] prepare_data.py re-stamped " + DATA_DIR +'
+            ' " -> Hermes splits are no longer attested by that stamp.")',
+        ),
+        # Gate C: the v2.7 win is contingent on object params existing as dotted
+        # leaves. Warning-level, not fatal: plan steps 2-3 (nested schema parsing
+        # and the aligner object case) may not be applied yet, and a hard gate
+        # would make the notebook unrunnable rather than merely honest.
+        (
+            "    if not _ok and not ALLOW_STALE_LABELS:\n"
+            '        raise SystemExit(f"PRE-FLIGHT FAILED on {_split}")',
+            "    if not _ok and not ALLOW_STALE_LABELS:\n"
+            '        raise SystemExit(f"PRE-FLIGHT FAILED on {_split}")\n'
+            "\n"
+            "# Pre-Flight Gate C (v2.7, warning-only): is object decomposition present?\n"
+            "# If the labels are still v2.6-shaped (one opaque `object` param, no dotted\n"
+            "# leaves) then every 'object-leaf' figure in section 4d is structurally 0\n"
+            "# and the v2.7 question cannot be answered by this run. Warn loudly instead\n"
+            "# of aborting, because the label-side work is plan steps 2-3.\n"
+            "from spancall.data.schema import UnifiedSample as _C_Sample\n"
+            "from spancall.data.flatten import PATH_SEP as _C_SEP\n"
+            "_c_roots = _c_leaves = _c_opaque = 0\n"
+            '_c_path = os.path.join(DATA_DIR, f"{EVAL_SPLIT}.jsonl")\n'
+            "if os.path.exists(_c_path):\n"
+            "    with open(_c_path) as _fh_c:\n"
+            "        for _i_c, _line_c in enumerate(_fh_c):\n"
+            "            if _i_c >= 300:\n"
+            "                break\n"
+            "            if not _line_c.strip():\n"
+            "                continue\n"
+            "            _s_c = _C_Sample.from_dict(json.loads(_line_c))\n"
+            "            for _t_c in _s_c.tools:\n"
+            "                _c_roots += len(_t_c.object_paths or {})\n"
+            "                for _p_c in _t_c.parameters:\n"
+            "                    if _C_SEP in _p_c.name:\n"
+            "                        _c_leaves += 1\n"
+            '                    elif (_p_c.param_type or "").lower() == "object":\n'
+            "                        _c_opaque += 1\n"
+            "if _c_roots + _c_leaves + _c_opaque == 0:\n"
+            '    print("[Gate C / Decompose] no object-bearing tool in "\n'
+            "          + EVAL_SPLIT + \" - nothing to check.\")\n"
+            "else:\n"
+            "    _c_ok = _c_roots > 0 and _c_opaque == 0\n"
+            '    print(f"[Gate C / Decompose] roots={_c_roots} leaves={_c_leaves} '
+            'opaque={_c_opaque} -> {\'PASS\' if _c_ok else \'WARN\'}")\n'
+            "    if not _c_ok:\n"
+            "        print(\"  [!] labels look v2.6-shaped for object params: opaque `object`\")\n"
+            "        print(\"      params outnumber dotted leaves. Section 4d will report zero\")\n"
+            "        print(\"      object-leaf slots until plan steps 2-3 land (nested schema\")\n"
+            "        print(\"      parsing + aligner object case). Do not read 4d as model quality.\")",
+        ),
+    ],
+    # -- §3 resolver: silent untrained-model path ----------------------------
+    "CODE_TELEMETRY_AND_RESOLVER": [
+        (
+            "    CHECKPOINT_DIR = os.path.dirname(cps[-1]) if cps else None",
+            "    CHECKPOINT_DIR = os.path.dirname(cps[-1]) if cps else None\n"
+            "if CHECKPOINT_DIR is None:\n"
+            "    # LeanResolver(model_path=None) skips load_checkpoint entirely, so the\n"
+            "    # eval below would score randomly initialised weights and still print\n"
+            "    # plausible-looking numbers. Refuse instead.\n"
+            "    raise SystemExit(\n"
+            '        "no model.pt under " + exp_root + ": training persisted no checkpoint. "\n'
+            '        "LeanResolver(model_path=None) would run UNTRAINED weights, so every "\n'
+            '        "metric in sections 3-5 would be noise."\n'
+            "    )",
+        ),
+    ],
+    # -- §4c waterfall: flat vs nested key space ----------------------------
+    "CODE_EVAL_STEP3": [
+        (
+            "from spancall.eval.toolcall.evaluator import payload_equal",
+            "import spancall.data.flatten as _flat\n"
+            "from spancall.eval.toolcall.evaluator import payload_equal",
+        ),
+        (
+            "        _gt_t = next((t for t in _s.tools if t.name == p[\"gt_tool\"]), None)\n"
+            "        if payload_equal(p.get(\"gt_args\") or {}, p.get(\"payload_partial\") or {}, _gt_t):\n"
+            "            s2b_exact.append(p)",
+            "        _gt_t = next((t for t in _s.tools if t.name == p[\"gt_tool\"]), None)\n"
+            "        # v2.7: GT args are NESTED while ``payload_partial`` carries dotted\n"
+            "        # leaf keys. Comparing them raw makes every object leaf a mismatch,\n"
+            "        # which drops the whole waterfall one stage early. flatten_args is\n"
+            "        # idempotent, so this holds before and after the resolver unflattens.\n"
+            "        _paths = dict(getattr(_gt_t, \"object_paths\", None) or {})\n"
+            "        _gt_flat = _flat.flatten_args(p.get(\"gt_args\") or {}, _paths)\n"
+            "        _pred_flat = _flat.flatten_args(p.get(\"payload_partial\") or {}, _paths)\n"
+            "        if payload_equal(_gt_flat, _pred_flat, _gt_t):\n"
+            "            s2b_exact.append(p)",
+        ),
+    ],
+    # -- §4e stage attribution: same key space, both comparisons ------------
+    "CODE_EVAL_STEP4": [
+        (
+            "from spancall.eval.toolcall.evaluator import payload_equal",
+            "import spancall.data.flatten as _flat\n"
+            "from spancall.eval.toolcall.evaluator import payload_equal",
+        ),
+        (
+            "            gt_t = next((t for t in s.tools if t.name == p[\"gt_tool\"]), None)\n"
+            "            partial_ok = payload_equal(p.get(\"gt_args\") or {}, p.get(\"payload_partial\") or {}, gt_t)\n"
+            "            if p.get(\"hit\") and payload_equal(p.get(\"gt_args\") or {}, p.get(\"payload\") or {}, gt_t):",
+            "            gt_t = next((t for t in s.tools if t.name == p[\"gt_tool\"]), None)\n"
+            "            # v2.7: both sides flattened into the declared object key space.\n"
+            "            # A nested GT vs dotted prediction would otherwise attribute a\n"
+            "            # reassembly-correct row to STEP2B (pointer rank miss).\n"
+            "            _paths = dict(getattr(gt_t, \"object_paths\", None) or {})\n"
+            "            _gt_flat = _flat.flatten_args(p.get(\"gt_args\") or {}, _paths)\n"
+            "            _part_flat = _flat.flatten_args(p.get(\"payload_partial\") or {}, _paths)\n"
+            "            partial_ok = payload_equal(_gt_flat, _part_flat, gt_t)\n"
+            "            if p.get(\"hit\") and payload_equal(\n"
+            "                _gt_flat, _flat.flatten_args(p.get(\"payload\") or {}, _paths), gt_t\n"
+            "            ):",
+        ),
+    ],
+    # -- §4f FP deep dive: self-contained + real schema + flat keys ---------
+    "CODE_EVAL_STEP5": [
+        (
+            "from spancall.eval.toolcall.evaluator import payload_equal",
+            "import spancall.data.flatten as _flat\n"
+            "from spancall.eval.toolcall.evaluator import payload_equal",
+        ),
+        (
+            "N_DUMP = 20  # number of FP rows to print in full\n\n"
+            "with open(PREDS_PATH) as fh:\n"
+            "    _preds = [json.loads(l) for l in fh if l.strip()]",
+            "N_DUMP = 20  # number of FP rows to print in full\n\n"
+            "# v2.7: self-contained. This cell used to close over PREDS_PATH and\n"
+            "# raw_map left behind by 4e, so running or re-running it alone raised\n"
+            "# NameError; and a stale PREDS_PATH from an earlier run silently scored\n"
+            "# the wrong file. Recompute both here, same precedence as 4e.\n"
+            'PREDS_PATH = os.path.join(RESULTS_DIR, "preds_eval_twostep.jsonl")\n'
+            "if not os.path.exists(PREDS_PATH):\n"
+            '    PREDS_PATH = os.path.join(RESULTS_DIR, "preds_eval.jsonl")\n'
+            'if not os.path.exists(PREDS_PATH):\n'
+            '    raise SystemExit(f"no predictions at {PREDS_PATH} - run 4c first.")\n'
+            "raw_map, subs = {}, {}\n"
+            "if os.path.exists(SUBSET_EVAL_PATH):\n"
+            "    with open(SUBSET_EVAL_PATH) as _fh:\n"
+            "        for _l in _fh:\n"
+            "            if not _l.strip():\n"
+            "                continue\n"
+            "            _d = json.loads(_l)\n"
+            "            raw_map[_d[\"sample_id\"]] = _d\n"
+            "            subs[_d[\"sample_id\"]] = UnifiedSample.from_dict(_d)\n"
+            "else:\n"
+            '    print(f"[!] no eval subset at {SUBSET_EVAL_PATH} - cohort filter skipped.")\n'
+            "\n"
+            "with open(PREDS_PATH) as fh:\n"
+            "    _preds = [json.loads(l) for l in fh if l.strip()]",
+        ),
+        (
+            "    if p.get(\"hit\") and payload_equal(p.get(\"gt_args\") or {}, p.get(\"payload\") or {}, None):\n"
+            "        continue\n"
+            "    # This row passed Step 0/1/2a but failed payload equality -> precision FP.",
+            "    # v2.7: pass the REAL tool schema (None skips optional-default\n"
+            "    # materialisation, so a correct row that simply omitted an optional\n"
+            "    # param was counted as a precision FP) and flatten both sides into the\n"
+            "    # declared object key space (nested GT vs dotted payload).\n"
+            "    _s = subs.get(sid)\n"
+            "    _gt_t = None\n"
+            "    if _s is not None:\n"
+            "        _gt_t = next((t for t in _s.tools if t.name == p.get(\"gt_tool\")), None)\n"
+            "    _paths = dict(getattr(_gt_t, \"object_paths\", None) or {})\n"
+            "    _gt_flat = _flat.flatten_args(p.get(\"gt_args\") or {}, _paths)\n"
+            "    p[\"_gt_flat\"] = _gt_flat  # flat GT, reused by the refusal sweep below\n"
+            "    if p.get(\"hit\") and payload_equal(\n"
+            "        _gt_flat, _flat.flatten_args(p.get(\"payload\") or {}, _paths), _gt_t\n"
+            "    ):\n"
+            "        continue\n"
+            "    # This row passed Step 0/1/2a but failed payload equality -> precision FP.",
+        ),
+        (
+            "    params = p.get(\"parameters\") or {}\n"
+            "    gt_args = p.get(\"gt_args\") or {}",
+            "    params = p.get(\"parameters\") or {}\n"
+            "    gt_args = p.get(\"_gt_flat\") or {}  # flat, so dotted leaves line up",
+        ),
+        (
+            "    print(f\"{p['sample_id']}  tool={p.get('tool_name')}  hit={p.get('hit')}  joint_margin={p.get('joint_margin'):.4f}\")",
+            "    print(f\"{p['sample_id']}  tool={p.get('tool_name')}  hit={p.get('hit')}  \"\n"
+            "          f\"joint_margin={float(p.get('joint_margin') or 0.0):.4f}\")",
+        ),
+        (
+            "        gt_v = (p.get(\"gt_args\") or {}).get(pn, \"<NOT_IN_GT>\")\n"
+            "        flag = \"OK\" if gt_v == pr.get(\"value\") else (\"NULL?\" if gt_v is None else \"WRONG\")",
+            "        gt_v = (p.get(\"_gt_flat\") or {}).get(pn, \"<NOT_IN_GT>\")\n"
+            "        flag = \"OK\" if gt_v == pr.get(\"value\") else (\"NULL?\" if gt_v is None else \"WRONG\")",
+        ),
+        (
+            "conf={pr.get('confidence'):.3f} margin={pr.get('margin'):.3f}",
+            "conf={float(pr.get('confidence') or 0.0):.3f} margin={float(pr.get('margin') or 0.0):.3f}",
+        ),
+        (
+            "            for p in fp_rows:\n"
+            "                gt_args = p.get(\"gt_args\") or {}",
+            "            for p in fp_rows:\n"
+            "                gt_args = p.get(\"_gt_flat\") or {}",
+        ),
+    ],
+}
 
 
 def _patch(name: str, src: str) -> str:
-    """Apply the version bump to one cell source.
+    """Apply the version bump and the v2.7 semantic fixes to one cell source.
 
-    Order matters: the stale-download block is swapped *first*, while its exact
-    text is still intact, and only then are the path tokens rewritten.
+    Order matters:
+    1. the stale-download block is swapped *first*, while its exact text is intact;
+    2. path tokens are bumped;
+    3. banner prose is rewritten and any remaining "v2.6" stamp normalised;
+    4. :data:`_V27_FIXES` runs **last**, so its needles match post-bump text and its
+       replacements keep intentional v2.6 comparisons ("v2.6-shaped labels") verbatim
+       instead of being rewritten by the step-3 regex.
     """
     out = src
     # 1. Drop the prebuilt-processed_v2 download (must see unmutated text).
@@ -345,6 +626,16 @@ def _patch(name: str, src: str) -> str:
         if old in out:
             out = out.replace(old, new)
     out = re.sub(r"v2\.6", "v2.7", out)
+    # 4. Per-cell semantic fixes. A needle that no longer matches means the v2.6
+    #    source moved underneath this builder - fail loudly rather than shipping a
+    #    notebook with a silently missing fix.
+    for old, new in _V27_FIXES.get(name, ()):
+        if old not in out:
+            raise SystemExit(
+                f"[_patch] v2.7 fix for {name} did not apply: needle not found\n"
+                f"--- needle ---\n{old[:400]}"
+            )
+        out = out.replace(old, new)
     return out
 
 
