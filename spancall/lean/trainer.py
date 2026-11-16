@@ -1319,15 +1319,35 @@ class LeanTrainer(BaseTrainer):
                     lr=f"{self.optimizer.param_groups[-1]['lr']:.1e}",
                 )
                 if steps % log_every == 0 or steps == total_steps:
+                    _lr_now = self.optimizer.param_groups[-1]["lr"]
+                    _elapsed_s = time.time() - t_start
                     self._log_event({
                         "event": "train",
                         "stage": stage,
                         "epoch": epoch,
                         "step": self.global_step,
-                        "lr": self.optimizer.param_groups[-1]["lr"],
-                        "elapsed_s": time.time() - t_start,
+                        "lr": _lr_now,
+                        "elapsed_s": _elapsed_s,
                         **losses,
                     })
+                    _ptr_l = losses.get("pointer")
+                    _tool_l = losses.get("tool")
+                    _bin_l = losses.get("tool_binary")
+                    _log_parts = [
+                        f"[lean-train:{stage}] ep={epoch}/{num_epochs}",
+                        f"step={steps}/{total_steps}",
+                        f"opt={self.global_step}",
+                        f"loss={losses.get('loss', float('nan')):.4f}",
+                    ]
+                    if _ptr_l is not None and math.isfinite(_ptr_l):
+                        _log_parts.append(f"ptr={_ptr_l:.4f}")
+                    if _tool_l is not None and math.isfinite(_tool_l):
+                        _log_parts.append(f"tool={_tool_l:.4f}")
+                    if _bin_l is not None and math.isfinite(_bin_l):
+                        _log_parts.append(f"tool_bin={_bin_l:.4f}")
+                    _log_parts.append(f"lr={_lr_now:.2e}")
+                    _log_parts.append(f"elapsed={_elapsed_s:.0f}s")
+                    tqdm.write(" ".join(_log_parts))
                     # Per-step train curves in W&B. Logged on the SAME cadence as
                     # `train_log.jsonl` (total_steps/100) so the two views agree;
                     # a per-micro-step push would make the run 100x chattier for
@@ -1380,6 +1400,7 @@ class LeanTrainer(BaseTrainer):
                         f"({_probe_split}, n={int(_probe_rec['n'])}): "
                         f"exact_call={_probe_rec['exact_call']:.4f} "
                         f"span_acc={_probe_rec['span_acc']:.4f} "
+                        f"tool_acc={_probe_rec['tool_acc']:.4f} "
                         f"loss={_probe_rec['eval_loss']:.4f}"
                     )
                     self.model.train()

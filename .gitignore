@@ -119,3 +119,5 @@ huggingface/
 
 
 research_paper
+notebooks/spancall_lean_v3_train_eval_colab.ipynb
+scripts/build_lean_v3_colab_notebook.py

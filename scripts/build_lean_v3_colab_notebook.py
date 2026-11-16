@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Generate notebooks/spancall_lean_v3_train_eval.ipynb via nbformat (valid JSON guaranteed).
 
-SpanCall Lean Flow **v3** — Two-Step-Only, Larger Stratified Eval, W&B + Probe Eval, HF Push
-=============================================================================================
+SpanCall Lean Flow **v3** — Two-Step-Only, Larger Stratified Eval, Probe Eval, HF Push
+=========================================================================================
 
 The architecture is unchanged from v2.7 (Hermes V1 + xLAM-60k 1-call subset,
 ``answerdotai/ModernBERT-large``, ``MAX_SEQ_LEN = 4096``, object-param
@@ -26,10 +26,9 @@ measures and how it reports it*:
    *dev* corpora and filtered to those that did **not** land in ``dev.jsonl``,
    so the probe is disjoint from dev and never touches the ``hermes_eval``
    slice the run is judged on.
-5. **Weights & Biases.** ``train/*``, ``probe/*`` and ``dev/<split>/*`` series
-   are logged from ``LeanTrainer`` when ``WANDB_API_KEY`` is present. Without a
-   key the trainer downgrades to ``mode="offline"``, so the notebook still runs
-   key-less.
+5. **Detailed training logs.** ``train/*`` step losses (total, pointer, tool,
+   LR, elapsed time) and ``probe_eval`` metrics are printed live during
+   training and summarized in §3b from ``train_log.jsonl``.
 6. **Guarded HF export/push (§7).** Writes a self-describing export directory
    and uploads it only when an HF token exists. ``LeanSpanCallModel`` is a plain
    ``nn.Module`` with **no** ``save_pretrained()``, so the artifact is a
@@ -122,7 +121,7 @@ _V3_REPLACEMENTS = [
 # --------------------------------------------------------------------------
 # v3 prose cells
 # --------------------------------------------------------------------------
-MARKDOWN_TITLE = """# SpanCall Lean Flow **v3** — Two-Step-Only, Larger Stratified Eval, W&B + Probe Eval, HF Push
+MARKDOWN_TITLE = """# SpanCall Lean Flow **v3** — Two-Step-Only, Larger Stratified Eval, Probe Eval, HF Push
 
 End-to-end training and evaluation notebook for the **v3** change set. The architecture is v2.7 (Hermes V1 + `Salesforce/xlam-function-calling-60k` 1-call subset, `answerdotai/ModernBERT-large`, `MAX_SEQ_LEN = 4096`, `object` params decomposed into dotted scalar leaves and reassembled by the resolver); what changes is **what this notebook measures and how it reports it**:
 
@@ -130,7 +129,7 @@ End-to-end training and evaluation notebook for the **v3** change set. The archi
 - **Larger, stratified evaluation.** `EVAL_LIMIT = 2000` (was 500) and `TEST_LIMIT = 600` (was 200). §4.0b prints the slice composition as **corpus × tool-count bucket**, and the new §5c pivots exact-match per `(split, bucket)` so behaviour against distractor-pool size is visible instead of being averaged across it.
 - **Corpus separation at the source.** `hermes_eval` and `xlam_eval` are scored as their own slices (§5, §5b, §5c). No blended number is used to support a Hermes-vs-xLAM claim.
 - **Mid-training probe eval.** A small fixed probe split (`PROBE_N = 300` rows, built from *dev* source rows that did **not** land in `dev.jsonl`, so it is disjoint from both `dev` and the `hermes_eval` slice) is scored every `PROBE_EVERY_STEPS = 1000` optimiser steps. The per-epoch dev eval is kept for train/val loss; the probe curve is what makes convergence and overfit visible *mid-run*.
-- **Weights & Biases.** `train/*` per log-step, `probe/*` per probe, `dev/<split>/*` per epoch. With no `WANDB_API_KEY` the trainer downgrades to `mode="offline"` — the notebook still runs key-less.
+- **Detailed training logs.** Step-level training losses (total, pointer, tool/tool_binary), learning rate, and elapsed time are logged to `train_log.jsonl`, printed live during training, and summarized in §3b.
 - **Guarded HF export/push (§7).** Writes a self-describing export directory (`model.pt` + tokenizer + `resolve_config.json` + provenance + auto-generated model card) and uploads it only when an HF token is available.
 
 **Path changes vs v2.7:** `data/tensorized_lean_v3` and `results_lean_v3`. The processed splits stay `data/processed_v2_7`: v3 changes evaluation protocol, not the grammar, so forcing a re-align would churn labels for no experimental reason."""
@@ -138,7 +137,7 @@ End-to-end training and evaluation notebook for the **v3** change set. The archi
 MARKDOWN_SETUP = """---
 ## 0. Setup & Configuration
 
-Clones or updates the SpanCall repository, installs dependencies in editable mode, and configures the v3 paths (`data/tensorized_lean_v3`, `results_lean_v3`), the mid-training probe knobs, the W&B project, the tool-count bucket edges, and the HF export target. Nothing here requires a key — the keyed steps (W&B online, HF push) are guarded later."""
+Clones or updates the SpanCall repository, installs dependencies in editable mode, and configures the v3 paths (`data/tensorized_lean_v3`, `results_lean_v3`), the mid-training probe knobs, the tool-count bucket edges, and the HF export target (prompted via `input()`). Nothing here requires a key — the HF push is guarded later."""
 
 MARKDOWN_TRAIN = """---
 ## 3. Training — Lean Flow (`scripts/train_lean.py`)
@@ -147,8 +146,45 @@ Trains `LeanSpanCallModel` (`ModernBERT-large` + `ToolSelectionHead` H1 + `LeanP
 
 v3 adds two things to the training loop itself, both configured here and implemented in `LeanTrainer.run_stage`:
 
-- **Mid-training probe eval.** A small probe split is scored every `PROBE_EVERY_STEPS` optimiser steps (`probe_percent` is the fallback cadence when no step count is set), written to `train_log.jsonl` as `event="probe_eval"` and to W&B under `probe/*`. It fires only on an accumulation-window boundary, so the weights being scored are exactly the ones the next micro-batch trains from — scoring mid-window would report a mix of stale and updated weights.
-- **W&B logging.** `train/*` on the same cadence as `train_log.jsonl` (`total_steps/100`), `probe/*` per probe, `dev/<split>/*` per epoch. No `WANDB_API_KEY` means `mode="offline"`, never a mid-run failure."""
+- **Mid-training probe eval.** A small probe split is scored every `PROBE_EVERY_STEPS` optimiser steps (`probe_percent` is the fallback cadence when no step count is set) and written to `train_log.jsonl` as `event="probe_eval"`. It fires only on an accumulation-window boundary, so the weights being scored are exactly the ones the next micro-batch trains from — scoring mid-window would report a mix of stale and updated weights.
+- **Detailed step logging.** `train` events (total loss, pointer loss, tool/tool_binary loss, LR, elapsed time) are written to `train_log.jsonl` and printed live every `total_steps // 100` steps, then summarized in §3b."""
+
+MARKDOWN_EVAL_STEP2 = """---
+### 4b. Step 2 in Isolation — Parameter Extraction (`H3`, Oracle Tool Given)
+
+Scores `H3` (`resolver.try_resolve(gt_tool, ...)`) under the two-step render (`T=1`) with **Oracle Candidates** (`protect_parity_spans=True`, gates OFF) on `F_func` to measure the pointer head's isolated ranking ceiling."""
+
+CODE_EVAL_STEP2 = '''import math
+from spancall.lean.eval_p1 import eval_param_extraction_lean
+from spancall.lean.resolver import LeanResolver
+
+def _fmt_p1(v):
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return "n/a"
+    return f"{v:.4f}" if isinstance(v, float) else str(v)
+
+# Lean v3: keep only 2b (Two-Step Render, Oracle Cands, protect=T, gates=OFF) on F_func
+# to cut Cell 4b from 10 passes down to 1 pass.
+_r_2b = LeanResolver(
+    model=model, encoder=encoder, tokenizer=tokenizer,
+    max_seq_len=cfg.model.max_seq_len, max_span_width=cfg.model.max_span_width,
+    max_calls=MAX_CALLS, call_min_prob=CALL_MIN_PROB, call_min_prob_ratio=CALL_MIN_PROB_RATIO,
+    min_joint_margin=0.0, collapse_guard=False, prevent_param_collapse=False,
+    resolve_mode="two_step",
+)
+_mf = eval_param_extraction_lean(
+    CLEAN_EVAL_PATH, resolver=_r_2b, data_dir=DATA_DIR, limit=None,
+    measure_candidate_parity=True, protect_parity_spans=True,
+    context_mode="single", stratum_filter="F", exclude_tools=["json_output"], quiet=True,
+)
+
+print("=== Step 2b: Oracle Cands (T=1, protect=T, gates=OFF, F_func) ===")
+print(f"{'Stage / Config':<44}{'Parity':>8}{'Prec':>8}{'Rec':>8}{'F1':>8}{'Coll_F':>8}{'Exact_F':>9}")
+print("-" * 93)
+print(f"{'2b. Oracle Cands (protect=T, gates=OFF)':<44}{_fmt_p1(_mf['candidate_parity']):>8}"
+      f"{_fmt_p1(_mf['extraction_precision']):>8}{_fmt_p1(_mf['extraction_recall']):>8}"
+      f"{_fmt_p1(_mf['extraction_f1']):>8}{_fmt_p1(_mf['pointer_collapse_rate_F']):>8}"
+      f"{_fmt_p1(_mf['exact_payload_match_F']):>9}")'''
 
 MARKDOWN_EVAL_STEP3 = """---
 ### 4c. Step 3 — Composed E2E (`two_step`), Stage Waterfall & Headline Table
@@ -372,8 +408,8 @@ print(f"[hf] export ready -> {HF_EXPORT_DIR}")
 for _fname in sorted(os.listdir(HF_EXPORT_DIR)):
     print(f"     {_fname}")
 
-# Guarded push: keys come from the environment / .env only, never from code.
-_hf_token = ENV.get("HUGGING_FACE_TOKEN") or ENV.get("HF_TOKEN") or os.environ.get("HF_TOKEN")
+# Guarded push: token comes from interactive input (HF_TOKEN) or os.environ.
+_hf_token = HF_TOKEN or os.environ.get("HF_TOKEN")
 if not _hf_token:
     print("[hf] no HF token (HUGGING_FACE_TOKEN / HF_TOKEN) -> push SKIPPED; export is local only.")
 elif not HF_REPO_ID:
@@ -400,8 +436,19 @@ else:
 # tokens and applied its own fixes) *after* the v3 path/prose rewrites, and must
 # not contain a token a later step would rewrite.
 _V3_FIXES: Dict[str, Any] = {
-    # -- §0b config: probe/W&B/HF/bucket knobs + a bigger eval slice ---------
+    # -- §0b config: probe/HF/bucket knobs + a bigger eval slice -------------
     "CODE_CONFIG": [
+        (
+            "from spancall.agent.backends.litellm_adapter import _load_dotenv_values\n"
+            "\n"
+            'ENV = {**_load_dotenv_values(PROJECT_ROOT / ".env"), **os.environ}\n'
+            'HF_DATASET_ID = ENV.get("DATASET_NAME", "convoicon/spancall")\n'
+            'HF_TOKEN      = ENV.get("HUGGING_FACE_TOKEN") or ENV.get("HF_TOKEN")\n'
+            "if HF_TOKEN:\n"
+            '    os.environ["HF_TOKEN"] = HF_TOKEN\n'
+            '    os.environ["HUGGING_FACE_HUB_TOKEN"] = HF_TOKEN',
+            'HF_DATASET_ID = "convoicon/spancall"',
+        ),
         # EVAL_LIMIT 500 -> 2000 answers "the evaluation set should be larger".
         # Both limits are top-of-notebook constants so the runtime cost stays
         # adjustable without touching a cell body.
@@ -424,15 +471,23 @@ _V3_FIXES: Dict[str, Any] = {
             "PROBE_LIMIT       = 300\n"
             'PROBE_SOURCES     = ["xlam_dev.jsonl", "hermes_dev.jsonl"]\n'
             "\n"
-            "# ---- Lean v3: Weights & Biases logging ------------------------------------\n"
-            "# Credentials come from the environment only. With no WANDB_API_KEY the\n"
-            '# trainer downgrades to mode="offline", so this never blocks a key-less run.\n'
-            'WANDB_PROJECT  = "spancall-lean-v3"\n'
-            'WANDB_RUN_NAME = f"{EXPERIMENT_NAME}-seed{SEED}"\n'
-            'WANDB_MODE     = "online"\n'
+            "# ---- Lean v3: Hugging Face Hub (interactive input) -----------------------\n"
+            "# Press Enter at any prompt to keep the default (or skip optional token).\n"
+            "# Non-interactive runs (e.g. nbconvert / CI) catch EOFError and use defaults.\n"
+            "def _prompt(label: str, default: str = \"\") -> str:\n"
+            '    suffix = f" [{default}]" if default else " [optional — Enter to skip]"\n'
+            "    try:\n"
+            '        val = input(f"{label}{suffix}: ").strip()\n'
+            "    except (EOFError, OSError):\n"
+            '        val = ""\n'
+            "    return val or default\n"
             "\n"
-            "# ---- Lean v3: Hugging Face Hub export/push --------------------------------\n"
-            'HF_REPO_ID      = "convoicon/spancall-lean-v3"\n'
+            'HF_TOKEN = _prompt("Hugging Face access token")\n'
+            "if HF_TOKEN:\n"
+            '    os.environ["HF_TOKEN"] = HF_TOKEN\n'
+            '    os.environ["HUGGING_FACE_HUB_TOKEN"] = HF_TOKEN\n'
+            "\n"
+            'HF_REPO_ID      = _prompt("HF model repo ID", "convoicon/spancall-lean-v3")\n'
             "HF_PUSH_PRIVATE = False\n"
             "\n"
             "# ---- Lean v3: tool-count buckets for the eval pivot ----------------------\n"
@@ -466,12 +521,24 @@ _V3_FIXES: Dict[str, Any] = {
             'print(f"EVAL_LIMIT        = {EVAL_LIMIT}  TEST_LIMIT = {TEST_LIMIT}")\n'
             'print(f"PROBE             = {PROBE_SPLIT} n={PROBE_N} every={PROBE_EVERY_STEPS} "\n'
             '      f"opt-steps (limit={PROBE_LIMIT})")\n'
-            'print(f"WANDB             = {WANDB_PROJECT} / {WANDB_RUN_NAME} (mode={WANDB_MODE})")\n'
             'print(f"HF_REPO_ID        = {HF_REPO_ID}  (push guarded on an HF token)")',
         ),
     ],
-    # -- §2 tensorizer: build the probe split, disjoint from dev -------------
+    # -- §2 tensorizer: PACK_TOOLS=6 (~4 tools/row mean) + disjoint probe ----
     "CODE_TENSORIZE": [
+        (
+            "PACK_TOOLS = 3\n"
+            "try:\n"
+            '    with open(os.path.join(str(PROJECT_ROOT), "configs", "default.yaml")) as _fh:\n'
+            "        _default_cfg = yaml.safe_load(_fh) or {}\n"
+            '    PACK_TOOLS = int((_default_cfg.get("data") or {}).get("pack_tools", 3) or 3)\n'
+            "except Exception as _exc:\n"
+            '    print(f"[!] configs/default.yaml unreadable ({_exc}); using PACK_TOOLS={PACK_TOOLS}")',
+            "# Lean v3: PACK_TOOLS = 6 with JITTER_PACK_TOOLS = True draws the per-row\n"
+            "# floor from [1, 6] (uniform mean 3.5; ~4.0 tools/row after native multi-tool\n"
+            "# rows), giving H1 harder distractor sets while keeping T=1 in-distribution.\n"
+            "PACK_TOOLS = 6",
+        ),
         (
             "finally:\n"
             "    if _shared_ex is not None:\n"
@@ -525,7 +592,7 @@ _V3_FIXES: Dict[str, Any] = {
             "        _shared_ex.shutdown(wait=True)",
         ),
     ],
-    # -- §3 trainer config: probe + W&B knobs into cfg["training"] ----------
+    # -- §3 trainer config: probe knobs into cfg["training"] ---------------
     "CODE_TRAIN_CFG_AND_RUN": [
         (
             'cfg["training"]["eval_splits"] = ["dev"]\n'
@@ -541,15 +608,7 @@ _V3_FIXES: Dict[str, Any] = {
             'cfg["training"]["probe_split"] = PROBE_SPLIT\n'
             'cfg["training"]["probe_every_steps"] = PROBE_EVERY_STEPS\n'
             'cfg["training"]["probe_percent"] = PROBE_PERCENT\n'
-            'cfg["training"]["probe_limit"] = PROBE_LIMIT\n'
-            "\n"
-            "# Lean v3: W&B. The trainer downgrades to \"offline\" when WANDB_API_KEY is\n"
-            "# absent, so this line never blocks a key-less run.\n"
-            'cfg["training"]["wandb_project"] = WANDB_PROJECT\n'
-            'cfg["training"]["wandb_run_name"] = WANDB_RUN_NAME\n'
-            'cfg["training"]["wandb_mode"] = WANDB_MODE\n'
-            'if WANDB_MODE == "online" and not (os.environ.get("WANDB_API_KEY") or ENV.get("WANDB_API_KEY")):\n'
-            '    print("[wandb] WANDB_API_KEY absent -> trainer will run wandb in \'offline\' mode")',
+            'cfg["training"]["probe_limit"] = PROBE_LIMIT',
         ),
     ],
     # -- §3b resolver: two_step at construction + probe curve ----------------
@@ -571,18 +630,43 @@ _V3_FIXES: Dict[str, Any] = {
         ),
         (
             'best_cp = os.path.join(exp_root, "best_checkpoint")',
-            "# Lean v3: mid-training probe curve. Read straight from the log so this\n"
-            "# cell stays self-contained -- re-running it alone must not depend on an\n"
-            "# earlier cell having left state behind.\n"
+            "# Lean v3: step-level training log + mid-training probe curve.\n"
+            "# Read straight from train_log.jsonl so this cell stays self-contained.\n"
             '_probe_log = os.path.join(exp_root, "train_log.jsonl")\n'
+            "_train_step_recs = []\n"
             "_probe_recs = []\n"
             "if os.path.exists(_probe_log):\n"
             "    with open(_probe_log) as _fh_pb:\n"
-            "        _probe_recs = [\n"
-            "            json.loads(_l) for _l in _fh_pb\n"
-            "            if _l.strip() and '\"probe_eval\"' in _l\n"
-            "        ]\n"
-            '    _probe_recs = [r for r in _probe_recs if r.get("event") == "probe_eval"]\n'
+            "        for _l in _fh_pb:\n"
+            "            if not _l.strip():\n"
+            "                continue\n"
+            "            _rec = json.loads(_l)\n"
+            '            _ev = _rec.get("event")\n'
+            '            if _ev == "train":\n'
+            "                _train_step_recs.append(_rec)\n"
+            '            elif _ev == "probe_eval":\n'
+            "                _probe_recs.append(_rec)\n"
+            "if _train_step_recs:\n"
+            '    print("\\n" + "=" * 84)\n'
+            '    print(f"TRAINING STEP LOG ({len(_train_step_recs)} logged checkpoints)")\n'
+            '    print("=" * 84)\n'
+            '    print(f"  {\'ep\':>3}{\'opt_step\':>10}{\'loss\':>10}{\'ptr\':>10}"\n'
+            '          f"{\'tool\':>10}{\'tool_bin\':>10}{\'lr\':>11}{\'elapsed\':>10}")\n'
+            "    _stride = max(len(_train_step_recs) // 30, 1)\n"
+            "    _shown = _train_step_recs[::_stride]\n"
+            "    if _train_step_recs[-1] is not _shown[-1]:\n"
+            "        _shown.append(_train_step_recs[-1])\n"
+            "    for _tr in _shown:\n"
+            '        _el = _num(_tr, "elapsed_s")\n'
+            '        _el_str = f"{_el:>9.0f}s" if _el is not None else f"{\'—\':>10}"\n'
+            '        print(f"  {_tr.get(\'epoch\', \'?\'):>3}"\n'
+            '              f"{int(_tr.get(\'step\') or 0):>10}"\n'
+            '              f"{_fmt_cell(_num(_tr, \'loss\'), 10, \'.4f\')}"\n'
+            '              f"{_fmt_cell(_num(_tr, \'pointer\'), 10, \'.4f\')}"\n'
+            '              f"{_fmt_cell(_num(_tr, \'tool\'), 10, \'.4f\')}"\n'
+            '              f"{_fmt_cell(_num(_tr, \'tool_binary\'), 10, \'.4f\')}"\n'
+            '              f"{_fmt_cell(_num(_tr, \'lr\'), 11, \'.2e\')}"\n'
+            '              f"{_el_str}")\n'
             "if _probe_recs:\n"
             '    print("\\n" + "=" * 84)\n'
             '    print(f"MID-TRAINING PROBE CURVE (\'{PROBE_SPLIT}\', n<={PROBE_LIMIT}, "\n'
@@ -876,7 +960,6 @@ _MARKDOWN: Dict[str, str] = {
         "MARKDOWN_TENSORIZE",
         "MARKDOWN_EVAL_SLICE",
         "MARKDOWN_EVAL_STEP1",
-        "MARKDOWN_EVAL_STEP2",
         "MARKDOWN_EVAL_STEP4",
         "MARKDOWN_EVAL_STEP5",
         "MARKDOWN_TEST",
@@ -906,8 +989,8 @@ cells = [
     new_code_cell(_patch("CODE_EVAL_SLICE", _V26_NS["CODE_EVAL_SLICE"])),
     new_markdown_cell(_MARKDOWN["MARKDOWN_EVAL_STEP1"]),
     new_code_cell(_patch("CODE_EVAL_STEP1", _V26_NS["CODE_EVAL_STEP1"])),
-    new_markdown_cell(_MARKDOWN["MARKDOWN_EVAL_STEP2"]),
-    new_code_cell(_patch("CODE_EVAL_STEP2", _V26_NS["CODE_EVAL_STEP2"])),
+    new_markdown_cell(MARKDOWN_EVAL_STEP2),
+    new_code_cell(CODE_EVAL_STEP2),
     new_markdown_cell(MARKDOWN_EVAL_STEP3),
     new_code_cell(_patch("CODE_EVAL_STEP3", _V26_NS["CODE_EVAL_STEP3"])),
     # v2.7 object-decomposition audit, kept ahead of the stage attribution so the
