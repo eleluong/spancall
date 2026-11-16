@@ -66,6 +66,7 @@ coverage.xml
 notebooks/*_llm_*.ipynb
 notebooks/*_hf_push*.ipynb
 notebooks/*_agentic*.ipynb
+notebooks/spancall_lean_v3_train_eval.ipynb
 
 # W&B local run dirs / offline sync cache
 wandb/
