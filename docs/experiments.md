@@ -2,6 +2,12 @@
 
 This document tracks hypotheses, configurations, verification gates, and decisions across all experimental phases.
 
+**Reading rule:** every section is a *reporting contract*, and a number is only
+comparable to another number produced under the same contract. §I covers the
+Lean Phases A–J upgrade; §II covers the Lean **v3** upgrade, which retires an
+arm rather than adding one. A v2.x `single_pass` number and a v3 `two_step`
+number are different experiments, not two readings of the same quantity.
+
 ## Experiment Tracker
 
 | Exp ID | Question | Hypothesis | Metric / Gate | Baseline | Status |
@@ -36,17 +42,25 @@ which definition moved.
 
 ### I.1 Where each number now lives
 
+**There is no `tensorize_stats.json`.** The tensorize pass accumulates a `stats`
+dict and the notebook *prints* it (`"Lean tensorize summary:"`); nothing writes
+it to disk. So the "Artifact" column below says **printed report** wherever that
+is the truth rather than inventing a filename. Verified against
+`spancall/lean/tensorize.py`, `spancall/lean/trainer.py`,
+`spancall/lean/eval_p1.py`, and the v2.2 builder that holds the notebook-side
+aggregation.
+
 | Quantity | Artifact | Key(s) |
 | --- | --- | --- |
-| Train prompt layout | `data_tensorized_lean/tensorize_stats.json` | `render_T_hist`, `render_T_t1_share`, `jittered_rows`, `jitter_pack_tools` |
-| Train H1 job size | same | `mean_n_candidates`, `n_candidates_hist`, `rows_without_h1_supervision` |
-| Train supervision losses | same | `dropped_over_length`, `tool_snap_misses`, `param_snap_misses`, `multi_call_ambiguous_anchors`; plus the drop-reason split — `param_drop_match_missed` / `param_drop_unresolved` / `param_drop_other` are **notebook-flattened** from the nested `param_drop_reasons` dict (the JSON artifact keeps the nested form) |
-| Train recent-context budget | same | `n_recent_rows`, `recent_truncated_rows` |
-| Part 1 param extraction | `p1_metrics` (in-notebook) | `extraction_recall/precision/f1`, `fast_path_param_coverage`, `fast_path_call_coverage`, `mean_render_T`, `render_T_hist`, `render_T_t1_share`, `recent_budget_effective` |
+| Train prompt layout | **printed report** — `stats` dict built in `spancall/lean/tensorize.py` | `render_T_hist`, `render_T_sum`, `render_T_rows`, `jittered_rows`, `jitter_draw_hist`. Note `render_T_t1_share` is **not** a tensorize key — it is computed in `eval_p1.py`; the notebook derives its own share from `render_T_hist` |
+| Train H1 job size | **split two ways** | `mean_n_candidates` comes from `LeanTrainer.evaluate` (`trainer.py`); `n_candidates_hist` and `rows_with_h1_supervision` / `rows_without_h1_supervision` are **notebook-computed** in the v2.2/v2.4 builders and are **absent from the v3 notebook**, which no longer builds that histogram |
+| Train supervision losses | **printed report** | `dropped_over_length`, `tool_snap_misses`, `param_snap_misses`, `multi_call_ambiguous_anchors`, `multi_call_anchor_missing_calls`, `tool_truncated_rows`, `abstain_rows`. The drop-reason split lives under the nested `param_drop_reasons` dict whose **actual values** are `unresolved_target` / `unaligned_target` / `null_slot_missing` / `absent_from_gt` / `match_missed`; the flat `param_drop_match_missed` / `param_drop_unresolved` / `param_drop_other` names are a **notebook-side regrouping** of those five, not keys any module emits |
+| Train recent-context budget | **printed report** | `n_recent_rows`, `recent_truncated_rows` |
+| Part 1 param extraction | `p1_metrics` (in-notebook dict) | `extraction_recall` / `extraction_precision` / `extraction_f1`, `fast_path_param_coverage`, `fast_path_call_coverage`, `mean_render_T`, `render_T_hist`, `render_T_t1_share`, `recent_budget_effective` |
 | Part 1 call axis (J6) | `p1_metrics` | `call_exact_set_match`, `call_exact_set_match_F`, `call_count_acc`, `n_calls_hist`, `pred_n_calls_hist`, `n_multi_call_samples` |
 | Part 2 H1 | printed report | Top-1 tool accuracy, `mean_n_candidates` + histogram, `mean_n_candidates`-vs-1.5 vacuity warning |
-| Part 3 end-to-end | `results_lean/toolcall_metrics_{split}_lean.json` | `exact_payload_match`, `hit_rate`, `param_f1`, `metrics_by_stratum.F.*` |
-| Part 3 call axis (J6) | same file | `call_exact_set_match`, `call_count_acc`, `n_calls_hist`, `pred_n_calls_hist`, `metrics_by_stratum.F.call_exact_set_match`, `metrics_by_stratum.F.call_count_acc`, per-row `n_gt_calls` / `n_pred_calls` / `call_set_equal` / `call_count_equal` in `errors_by_sample`-adjacent rows |
+| Part 3 end-to-end | **v3:** `results_lean_v3/toolcall_metrics_{split}_{bucket}_{system}.json` — **v2.x:** `results_lean/toolcall_metrics_{split}_lean.json`. The v3 lean arm is named `lean_twostep`, since `single_pass` is retired | `exact_payload_match`, `hit_rate`, `param_f1`, `metrics_by_stratum.F.*`, `errors_by_sample` |
+| Part 3 call axis (J6) | same file | `call_exact_set_match`, `call_count_acc`, `n_calls_hist`, `pred_n_calls_hist`, `metrics_by_stratum.F.call_exact_set_match`, `metrics_by_stratum.F.call_count_acc`, plus per-row `n_gt_calls` / `n_pred_calls` / `call_set_equal` / `call_count_equal` in the scored row set |
 | Part 3 latency | per-row `latency_ms` in `preds_eval.jsonl` | now **additive** across stages (R5) |
 
 ### I.2 What each change does to the number
@@ -101,6 +115,90 @@ rows below once a post-upgrade run exists.
 | Run ID | Date | Split(s) | Part 1 recall / coverage | Part 1 set-exact / count-acc | Part 2 tool acc (cands/row) | Part 3 exact / set-exact / count-acc | train T=1 share | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | _(pending)_ | | | | | | | | run the notebook end-to-end and fill from the printed report |
+
+---
+
+## Metrics Delta — Lean v3 Upgrade (Two-Step-Only, Stratified Eval, W&B, Three-Mode Agentic)
+
+v3 differs from the A–J upgrade in kind. A–J changed **what was measured** while
+keeping one resolution arm. v3 **deletes an arm** (`single_pass`), **changes the
+eval design** (per-corpus, per-tool-count-bucket instead of one aggregate),
+**changes eval cadence** (every 1000 optimiser steps on a small disjoint probe,
+not once per epoch), and **adds a serving comparison** (three agentic modes).
+Any of the four alone breaks comparability; together they make v2.x and v3
+different experiments.
+
+### II.1 Where each number now lives
+
+| Quantity | Artifact | Key(s) |
+| --- | --- | --- |
+| Resolution arm | `resolve_config.json` (HF export) | `resolve_mode` must be `two_step`; `single_pass` is retired. `LeanResolver.__init__` still defaults to `single_pass`, so a run that did not pin the arm is a `single_pass` run regardless of what it is called |
+| Pointer-head geometry | `resolve_config.json` | `head_dim`, `max_span_width`, `max_calls` — a consumer rebuilding without `head_dim` silently gets the 256 default |
+| Mid-training probe curve (trainer) | `train_log.jsonl` in the run's `exp_root` | records with `event == "probe_eval"`; also `LeanTrainer.history["probe_eval"]` |
+| Mid-training probe curve (W&B) | W&B run (`WANDB_PROJECT`) | `probe/eval_loss`, `probe/exact_call`, `probe/span_acc`, `probe/tool_acc`, `probe/epoch` — logged every `probe_every_steps` (1000) **optimiser** steps. Note the W&B names are `exact_call` / `span_acc`, not `exact_payload` / `hit_rate` |
+| Probe-set integrity | printed by the probe-build cell | `overlap_with_dev` (printed, not asserted — must be 0 to trust the curve), `PROBE_SOURCES`, `PROBE_N`, `PROBE_PERCENT` (fallback cadence when no step count is set) |
+| Train/val loss curves | W&B, distinct from `probe/*` | `train/*` at log cadence, `dev/<split>/*` per **epoch** — `probe/` and `dev/` must not share an axis |
+| Per-corpus metrics | **separate eval runs per split** | corpus separation is at the *file* level, not a nested key: `hermes_eval` and `xlam_eval` are scored independently (`results_lean_v3/toolcall_metrics_<split>_*.json`). There is no `by_corpus` dict to read |
+| Per-tool-count metrics | `results_lean_v3/toolcall_metrics_<split>_<bucket>_<system>.json` | bucket is in the **filename** (`1-2`, `3-5`, `6-10`, `11+`); metrics under `metrics_by_stratum.F` (`n`, `exact_payload_match`, `hit_rate`, `param_f1`) |
+| Eval-set composition | notebook §4.0b printed table | corpus × bucket **row counts**. Read before any metric table: an `exact_F` that moved because the slice gained 20-distractor-tool rows is not a model improvement. Empty buckets are named explicitly |
+| Corpus × bucket pivot | notebook §5c printed table | `split × corpus × bucket × system`; a bucket absent from a split is **skipped**, not reported as 0 |
+| LLM vs SpanCall parity | `scripts/compare_llm_spancall.py` stdout + `--out` JSON (default `results/llm_parity.json`) | four arms: `llm_only`, `lean_fast_path`, `lean_plus_fallback` (SpanCall with LLM backfill), `b1a_regex`. Per arm `exact_payload_match`, `hit_rate`, `param_f1`, `call_exact_set_match`, plus cost (`fallback_rate`, `usd`) and a `pivot` keyed `"<corpus>|<bucket>"` → `exact_payload_match` |
+| Agentic mode comparison | `results_lean_v3/agentic/agentic_mode_table.json` → `rows` | per (`suite`, `mode`): `success`, `turns_per_task`, `spancall_hit_rate`, `wrong_hit_rate`, `llm_calls`, `delta_llm_calls`, `tok_in`, `tok_out`, `delta_tokens`, `wall_ms`, `usd`, `decisions` histogram. Envelope also records `resolver`, `backend`, `llm_model_id`, `num_seeds`, `max_turns` |
+| Agentic honesty flag | same file → `resolver.kind`, `backend` | `resolver.kind != "lean"` means modes 2–3 abstained every turn and are indistinguishable from mode 1 by construction; `backend == "deterministic"` means the LLM arm tests plumbing, not LLM quality. Both cases print a caveat beside the table |
+| Agentic hybrid-fill behavior | same → `decisions` histogram | `HYBRID_FILL` count, params filled vs resolved; a fill that fails schema validation must appear as a full `LLM_FALLBACK`, never as a partial payload |
+
+### II.2 What each change does to the number
+
+- **`single_pass` → `two_step` (retired arm).** This is not a tuning
+  preference. The two arms produce *different predictions on the same input*,
+  so pre-v3 numbers cannot be reused as a baseline column and must be
+  re-measured. `LeanResolver.__init__` still defaults to `single_pass`, so a
+  number produced by a consumer that forgot to pin `two_step` is a
+  **`single_pass` number mislabelled as v3** — the train/eval notebook, the
+  agentic rebuild, and `resolve_config.json` all pin it, and
+  [`tests/test_notebook_v3_fixes.py`](tests/test_notebook_v3_fixes.py) fails if
+  a fourth site appears.
+- **Eval cadence: per-epoch → per-1000-optimiser-steps.** The probe curve is
+  more informative *and* less final: it is measured on 300 rows drawn from
+  `PROBE_SOURCES` with dev `sample_id`s removed, so it can move on a
+  comparatively small sample. Read it as a **trend**, and check the printed
+  `overlap_with_dev` first — it is **reported, not asserted**, so a non-zero
+  value will not fail the run; it means the curve is tracking the dev set and
+  the early-stopping signal is contaminated. Probe eval fires only on an
+  accumulation-window boundary, so the weights scored are exactly the ones the
+  next micro-batch trains from.
+- **Stratification: aggregate → corpus × bucket.** Aggregate exact-payload can
+  be unchanged while `11+` degrades and `1-2` improves, because the aggregate
+  weights by sample count. A bucket with fewer than a handful of samples
+  reports `n` beside every metric; do not quote a bucket whose `n` is in the
+  noise floor. The pivot is the point: it is the only view in which a
+  bucket-specific regression is visible at all.
+- **LLM parity: separate evaluations → same-sample comparison.** The parity
+  script scores both systems with the same `ToolCallEvaluator` on the same
+  `sample_id` set, so a difference is a difference in prediction quality, not a
+  difference in scoring. The `lean_plus_fallback` arm answers the serving
+  question the pure arms cannot: what the *deployed* system's payload accuracy
+  is once abstains are backfilled.
+- **Three agentic modes: `LLM_ONLY` / `ROUTER` / `HYBRID_FILL`.** `ROUTER` moves
+  the whole call between SpanCall and the LLM; `HYBRID_FILL` splits a single
+  call — SpanCall commits the tool and the resolvable arguments, the LLM fills
+  only `unresolved_param_names`, and `merge_filled_arguments` never overwrites a
+  resolved value. So `HYBRID_FILL` cuts LLM tokens **and** is the mode where a
+  wrong SpanCall argument is guaranteed to survive into the payload; its
+  success rate is a direct measure of SpanCall argument precision, not a
+  measure of the LLM's ability to recover. A scripted/`DeterministicBackend`
+  run measures **mode wiring only** and prints that caveat next to its numbers.
+- **`selected_tool` is a hypothesis, not a fact.** `ToolCallRouter` records the
+  tool it would use even on `LLM_FALLBACK`, so per-turn accuracy must be read
+  off `tool_output is not None` (the call actually executed) — the agentic
+  table keys on that, and a mode that reports high accuracy with low executions
+  is reporting hypotheses.
+
+### II.3 Post-v3 run log
+
+| Run ID | Date | Arm pinned | Probe every | Probe overlap w/ dev | Eval slice (corpus rows / empty buckets) | Part 3 exact / set-exact / count-acc | LLM parity (Δ exact on `lean_plus_fallback`) | Agentic: mode1 / mode2 / mode3 success | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| _(pending)_ | | `two_step` | 1000 optimiser steps | must be 0 | from §4.0b (2 splits × 4 buckets, empty skipped) | | | | run [`notebooks/spancall_lean_v3_train_eval.ipynb`](notebooks/spancall_lean_v3_train_eval.ipynb), then [`scripts/compare_llm_spancall.py`](scripts/compare_llm_spancall.py), then the agentic notebook |
 
 ---
 

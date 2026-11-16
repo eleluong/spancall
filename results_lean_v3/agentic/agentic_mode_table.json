@@ -1,0 +1,126 @@
+{
+  "resolver": {
+    "kind": "noop",
+    "reason": "model artifact unavailable"
+  },
+  "backend": "deterministic",
+  "llm_model_id": "qwen3.8-flash",
+  "num_seeds": 1,
+  "max_turns": 8,
+  "rows": [
+    {
+      "suite": "canonical",
+      "mode": "mode1_llm_only",
+      "tasks": 3,
+      "success": 1.0,
+      "turns_per_task": 1.6666666666666667,
+      "spancall_hit_rate": 0.0,
+      "wrong_hit_rate": 0.0,
+      "llm_calls": 5,
+      "delta_llm_calls": 0,
+      "tok_in": 0,
+      "tok_out": 0,
+      "delta_tokens": 0,
+      "wall_ms": 0.40637500933371484,
+      "usd": null,
+      "decisions": {
+        "llm_fallback": 5
+      }
+    },
+    {
+      "suite": "canonical",
+      "mode": "mode2_fallback",
+      "tasks": 3,
+      "success": 1.0,
+      "turns_per_task": 1.6666666666666667,
+      "spancall_hit_rate": 0.0,
+      "wrong_hit_rate": 0.0,
+      "llm_calls": 5,
+      "delta_llm_calls": 0,
+      "tok_in": 0,
+      "tok_out": 0,
+      "delta_tokens": 0,
+      "wall_ms": 0.39470699266530573,
+      "usd": null,
+      "decisions": {
+        "llm_fallback": 5
+      }
+    },
+    {
+      "suite": "canonical",
+      "mode": "mode3_hybrid_fill",
+      "tasks": 3,
+      "success": 1.0,
+      "turns_per_task": 1.6666666666666667,
+      "spancall_hit_rate": 0.0,
+      "wrong_hit_rate": 0.0,
+      "llm_calls": 5,
+      "delta_llm_calls": 0,
+      "tok_in": 0,
+      "tok_out": 0,
+      "delta_tokens": 0,
+      "wall_ms": 0.39462497807107866,
+      "usd": null,
+      "decisions": {
+        "llm_fallback": 5
+      }
+    },
+    {
+      "suite": "long_trajectory",
+      "mode": "mode1_llm_only",
+      "tasks": 4,
+      "success": 1.0,
+      "turns_per_task": 1.75,
+      "spancall_hit_rate": 0.0,
+      "wrong_hit_rate": 0.0,
+      "llm_calls": 7,
+      "delta_llm_calls": 0,
+      "tok_in": 0,
+      "tok_out": 0,
+      "delta_tokens": 0,
+      "wall_ms": 0.5463749985210598,
+      "usd": null,
+      "decisions": {
+        "llm_fallback": 7
+      }
+    },
+    {
+      "suite": "long_trajectory",
+      "mode": "mode2_fallback",
+      "tasks": 4,
+      "success": 1.0,
+      "turns_per_task": 1.75,
+      "spancall_hit_rate": 0.0,
+      "wrong_hit_rate": 0.0,
+      "llm_calls": 7,
+      "delta_llm_calls": 0,
+      "tok_in": 0,
+      "tok_out": 0,
+      "delta_tokens": 0,
+      "wall_ms": 0.5592070519924164,
+      "usd": null,
+      "decisions": {
+        "llm_fallback": 7
+      }
+    },
+    {
+      "suite": "long_trajectory",
+      "mode": "mode3_hybrid_fill",
+      "tasks": 4,
+      "success": 1.0,
+      "turns_per_task": 1.75,
+      "spancall_hit_rate": 0.0,
+      "wrong_hit_rate": 0.0,
+      "llm_calls": 7,
+      "delta_llm_calls": 0,
+      "tok_in": 0,
+      "tok_out": 0,
+      "delta_tokens": 0,
+      "wall_ms": 0.5654150154441595,
+      "usd": null,
+      "decisions": {
+        "llm_fallback": 7
+      }
+    }
+  ]
+}

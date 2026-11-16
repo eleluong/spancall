@@ -3,7 +3,7 @@
 Ref: docs/mechanism.md §11.
 Orchestrates speculative fast path before falling back to the LLM.
 Supports:
-- Modes: LLM_ONLY, SPANCALL_ONLY, ROUTER, SHADOW
+- Modes: LLM_ONLY, SPANCALL_ONLY, ROUTER, HYBRID_FILL, SHADOW
 - Integration variants: S_SKIP, S_INJECT, S_HINT
 """
 
@@ -26,6 +26,7 @@ class RouterMode(str, Enum):
     LLM_ONLY = "llm_only"             # Baseline B0 (Normal Agent)
     SPANCALL_ONLY = "spancall_only"   # Fast-path only (diagnostic)
     ROUTER = "router"                 # Speculative fast path with fallback (System S)
+    HYBRID_FILL = "hybrid_fill"       # SpanCall skeleton + LLM fills ONLY missing params
     SHADOW = "shadow"                 # LLM answers, SpanCall runs & logs comparisons
 
 
@@ -52,11 +53,16 @@ class ToolCallRouter:
         llm_backend: BaseLLMBackend,
         mode: RouterMode = RouterMode.ROUTER,
         variant: IntegrationVariant = IntegrationVariant.S_SKIP,
+        hybrid_fill_optional: bool = False,
     ) -> None:
         self.resolver = resolver
         self.llm_backend = llm_backend
         self.mode = mode
         self.variant = variant
+        # HYBRID_FILL asks the LLM about unresolved REQUIRED params by default.
+        # Optional params are frequently absent from the utterance by design, so
+        # asking for them invites hallucinated values; opt in only to measure it.
+        self.hybrid_fill_optional = bool(hybrid_fill_optional)
 
     def route_turn(
         self,
@@ -117,6 +123,10 @@ class ToolCallRouter:
                 trace,
             )
 
+        # ---- HYBRID_FILL: SpanCall skeleton + LLM fills the gaps only ------ #
+        if mode == RouterMode.HYBRID_FILL:
+            return self._route_hybrid_fill(utterance, messages, available_tools, res, t0)
+
         # ---- SHADOW: LLM answers, SpanCall runs + logs comparison ---------- #
         if mode == RouterMode.SHADOW:
             llm_res = self._llm_call(messages, available_tools, t0)
@@ -151,6 +161,127 @@ class ToolCallRouter:
         llm_res = self._llm_call(messages, available_tools, t0)
         trace = self._trace(t0, utterance, RoutingDecision.LLM_FALLBACK, res, llm_res)
         return self._llm_result(llm_res, t0, res), trace
+
+    # ------------------------------------------------------------------ #
+    # Mode 3: HYBRID_FILL
+    # ------------------------------------------------------------------ #
+    def _route_hybrid_fill(
+        self,
+        utterance: str,
+        messages: List[Dict[str, Any]],
+        available_tools: List[ToolDefinition],
+        res: ResolveResult,
+        t0: float,
+    ) -> Tuple[Dict[str, Any], Optional[StepTrace]]:
+        """SpanCall predicts the call skeleton; the LLM fills ONLY the gaps.
+
+        Three outcomes, in order:
+
+        1. **SpanCall abstained with no tool** -> nothing to build on, so this
+           degenerates to the ordinary LLM fallback (mode 2 behaviour).
+        2. **SpanCall hit cleanly** -> the LLM is never called.
+        3. **Partial**: SpanCall named the tool and grounded some params, but at
+           least one required param is unresolved. The LLM is asked *only* for
+           those params (see :mod:`spancall.agent.fill`), and its answer is
+           merged conservatively: resolved values are never overwritten and
+           anything outside the requested set is dropped. The merged argument
+           dict then goes through the same schema validation a full SpanCall hit
+           would face; if it still fails, we fall back to the ordinary LLM call
+           rather than shipping a half-filled payload.
+
+        Asking for a handful of params instead of a whole call is the point: it
+        is a shorter completion (fewer tokens, lower latency) and it cannot
+        damage the arguments SpanCall already grounded.
+        """
+        from spancall.agent.fill import (
+            build_fill_messages,
+            merge_filled_arguments,
+            restrict_tool_to_params,
+            unresolved_param_names,
+        )
+
+        # ---- 1. no skeleton at all ----------------------------------------- #
+        if not res.tool_name:
+            llm_res = self._llm_call(messages, available_tools, t0)
+            trace = self._trace(t0, utterance, RoutingDecision.LLM_FALLBACK, res, llm_res)
+            return self._llm_result(llm_res, t0, res), trace
+
+        schema = next((t for t in available_tools if t.name == res.tool_name), None)
+        if schema is None:
+            llm_res = self._llm_call(messages, available_tools, t0)
+            trace = self._trace(t0, utterance, RoutingDecision.LLM_FALLBACK, res, llm_res)
+            return self._llm_result(llm_res, t0, res), trace
+
+        # ---- 2. clean SpanCall hit: LLM not needed -------------------------- #
+        if res.hit:
+            trace = self._trace(t0, utterance, RoutingDecision.SPANCALL_HIT, res)
+            return (
+                {"hit": True, "tool_name": res.tool_name, "arguments": res.payload,
+                 "payload": res.payload, "spancall": True, "hybrid_fill": False,
+                 "filled_params": [], "joint_margin": res.joint_margin,
+                 "accept_score": res.accept_score, "features": dict(res.features or {})},
+                trace,
+            )
+
+        known = dict(getattr(res, "payload_partial", None) or {})
+        # Only REQUIRED gaps are worth an LLM round trip by default: an optional
+        # param SpanCall declined to emit is often genuinely absent from the
+        # utterance, and asking for it invents values.
+        missing = unresolved_param_names(
+            schema,
+            known,
+            getattr(res, "missing_required", None),
+            (getattr(res, "missing_optional", None) if self.hybrid_fill_optional else None),
+        )
+        missing = [m for m in missing if m not in known]
+
+        # ---- 3a. tool known but the failure is a gate, not a param gap ----- #
+        if not missing:
+            llm_res = self._llm_call(messages, available_tools, t0)
+            trace = self._trace(t0, utterance, RoutingDecision.LLM_FALLBACK, res, llm_res)
+            return self._llm_result(llm_res, t0, res), trace
+
+        # ---- 3b. ask the LLM for the gaps only ------------------------------ #
+        restricted = restrict_tool_to_params(schema, missing)
+        fill_messages = build_fill_messages(messages, schema.name, known, missing)
+        fill_res = self._llm_call(fill_messages, [restricted], t0)
+        merged = merge_filled_arguments(known, fill_res.get("arguments"), missing)
+        newly_filled = [k for k in merged if k not in known]
+
+        from spancall.infer.cast import SchemaValidator
+
+        valid, reason = SchemaValidator().validate(merged, schema)
+        if not valid or not newly_filled:
+            # A fill that changed nothing, or one that leaves the payload
+            # invalid, means the hybrid path contributed nothing. Fall back to
+            # the unmodified full LLM call instead of shipping it.
+            llm_res = self._llm_call(messages, available_tools, t0)
+            trace = self._trace(t0, utterance, RoutingDecision.LLM_FALLBACK, res, llm_res)
+            out = self._llm_result(llm_res, t0, res)
+            out["hybrid_fill_attempt"] = {
+                "missing": list(missing),
+                "merged": dict(merged),
+                "reason": reason or "nothing_filled",
+            }
+            return out, trace
+
+        trace = self._trace(t0, utterance, RoutingDecision.HYBRID_FILL, res, fill_res)
+        trace.tool_arguments = dict(merged)
+        trace.spancall_features.update({
+            "hybrid_fill": True,
+            "filled_params": list(newly_filled),
+            "requested_params": list(missing),
+            "known_params": sorted(known),
+        })
+        return (
+            {"hit": True, "tool_name": schema.name, "arguments": dict(merged),
+             "payload": dict(merged), "spancall": True, "hybrid_fill": True,
+             "filled_params": list(newly_filled),
+             "requested_params": list(missing),
+             "features": dict(res.features or {}),
+             "usage": fill_res.get("usage", {})},
+            trace,
+        )
 
     # ------------------------------------------------------------------ #
     # History synthesis for s_inject (Q9.1 byte-identical formats)

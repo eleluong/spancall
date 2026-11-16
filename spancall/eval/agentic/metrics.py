@@ -78,14 +78,22 @@ def aggregate_metrics(traces: List[ExecutionTrace]) -> AgentMetrics:
     )
 
     # --- fast-path utilization ----------------------------------------------- #
+    # HYBRID_FILL counts as eligible AND as a hit: the fast path produced the
+    # executed tool and the majority of its arguments, which is exactly what this
+    # rate is meant to measure. Leaving it out would report a mode-3 run as
+    # having a lower fast-path hit rate than the mode it replaces.
     spancall_eligible = 0
     spancall_hits = 0
     for t in traces:
         for step in t.steps:
             d = step.decision
-            if d in (RoutingDecision.SPANCALL_HIT, RoutingDecision.SPANCALL_ABSTAIN):
+            if d in (
+                RoutingDecision.SPANCALL_HIT,
+                RoutingDecision.SPANCALL_ABSTAIN,
+                RoutingDecision.HYBRID_FILL,
+            ):
                 spancall_eligible += 1
-                if d == RoutingDecision.SPANCALL_HIT:
+                if d in (RoutingDecision.SPANCALL_HIT, RoutingDecision.HYBRID_FILL):
                     spancall_hits += 1
     m.spancall_hit_rate = spancall_hits / spancall_eligible if spancall_eligible else 0.0
 
@@ -93,7 +101,7 @@ def aggregate_metrics(traces: List[ExecutionTrace]) -> AgentMetrics:
         1
         for t in traces
         for step in t.steps
-        if step.decision == RoutingDecision.SPANCALL_HIT
+        if step.decision in (RoutingDecision.SPANCALL_HIT, RoutingDecision.HYBRID_FILL)
         and not step.tool_execution_success
     )
     m.wrong_hit_rate = wrong_hits / spancall_hits if spancall_hits else 0.0

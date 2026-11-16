@@ -326,7 +326,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--calib_thresholds", type=str, default=None)
     parser.add_argument("--num_seeds", type=int, default=3)
     parser.add_argument("--variant", type=str, default="s_skip", choices=["s_skip", "s_inject"])
-    parser.add_argument("--mode", type=str, default="router", choices=["router", "spancall_only", "shadow"])
+    # ``llm_only`` and ``hybrid_fill`` are listed alongside the original three so
+    # the CLI can drive every mode the router actually implements. Previously
+    # ``hybrid_fill`` was reachable only from Python, which meant the notebook /
+    # CLI comparison silently could not reproduce it.
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="router",
+        choices=["router", "spancall_only", "shadow", "llm_only", "hybrid_fill"],
+    )
     parser.add_argument("--max_turns", type=int, default=8)
     parser.add_argument("--max_context_tokens", type=int, default=32768)
     parser.add_argument("--keep_last_tool_turns", type=int, default=8)
@@ -428,6 +437,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                     "spancall_hits": 0,
                     "spancall_abstains": 0,
                     "llm_fallbacks": 0,
+                    # Kept separate from ``spancall_hits`` on purpose: a hybrid
+                    # fill DID call the LLM, so folding it into the hit count
+                    # would report a mode-3 run as having a strictly higher
+                    # fast-path hit rate than the mode it replaces.
+                    "hybrid_fills": 0,
                     "n_recent_rows_sum": 0,
                     "recent_tokens_sum": 0,
                     "context_trimmed_sum": 0,
@@ -437,6 +451,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 per_turn_stats[t_key]["spancall_hits"] += 1
             elif st.decision == RoutingDecision.SPANCALL_ABSTAIN:
                 per_turn_stats[t_key]["spancall_abstains"] += 1
+            elif st.decision == RoutingDecision.HYBRID_FILL:
+                per_turn_stats[t_key]["hybrid_fills"] += 1
             elif st.decision in (RoutingDecision.LLM_FALLBACK, RoutingDecision.SHADOW_COMPARISON):
                 per_turn_stats[t_key]["llm_fallbacks"] += 1
 

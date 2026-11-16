@@ -303,7 +303,7 @@ class LeanResolver(BaseResolver):
         min_joint_margin: Optional[float] = None,
         tool_objective: str = "ce",
         tool_call_threshold: float = 0.5,
-        resolve_mode: str = "single_pass",
+        resolve_mode: str = "two_step",
         collapse_guard: bool = False,
         prevent_param_collapse: bool = False,
         list_decode: bool = True,
@@ -418,7 +418,11 @@ class LeanResolver(BaseResolver):
             raise ValueError(f"tool_objective must be 'ce' or 'binary', got {tool_objective!r}")
         self.tool_objective = obj
         self.tool_call_threshold = float(tool_call_threshold)
-        rmode = str(resolve_mode or "single_pass").lower()
+        # Lean v3: ``two_step`` is the protocol, so it is the default. ``single_pass``
+        # is retired but still constructible for reproducing pre-v3 numbers, which
+        # must now be requested by name -- inheriting it by omission is the bug this
+        # default exists to prevent.
+        rmode = str(resolve_mode or "two_step").lower()
         if rmode not in ("single_pass", "two_step"):
             raise ValueError(f"resolve_mode must be 'single_pass' or 'two_step', got {resolve_mode!r}")
         self.resolve_mode = rmode
@@ -700,7 +704,7 @@ class LeanResolver(BaseResolver):
         resolve_mode: Optional[str] = None,
     ) -> LeanResolveResult:
         """Score candidate tools via H1 and resolve the top tool."""
-        mode = str(resolve_mode or getattr(self, "resolve_mode", "single_pass") or "single_pass").lower()
+        mode = str(resolve_mode or getattr(self, "resolve_mode", "two_step") or "two_step").lower()
         if mode not in ("single_pass", "two_step"):
             raise ValueError(f"resolve_mode must be 'single_pass' or 'two_step', got {mode!r}")
         if not candidate_schemas:

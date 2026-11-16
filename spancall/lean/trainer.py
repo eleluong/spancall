@@ -12,6 +12,7 @@ from __future__ import annotations
 import gc
 import json
 import math
+import os
 import random
 import time
 from contextlib import nullcontext
@@ -398,9 +399,76 @@ class LeanTrainer(BaseTrainer):
             self.loss_container.tool_objective = "binary"
         elif getattr(self.loss_container, "tool_objective", "ce") == "binary":
             self.loss_container.tool_objective = "ce"
-        self.history: Dict[str, Any] = {"train_loss": [], "dev": {}, "epoch_eval": []}
+        # `probe_eval` is separate from `epoch_eval`: the probe split is SMALL and
+        # scored many times per epoch, while the epoch eval is the large held-out
+        # number. Mixing them into one list would make the per-epoch curve
+        # unreadable (the x axis is a step count for one and an epoch for the other).
+        self.history: Dict[str, Any] = {
+            "train_loss": [], "dev": {}, "epoch_eval": [], "probe_eval": [],
+        }
         self._rng = random.Random(int(getattr(config, "seed", 42) or 42))
         self.collator = LeanBatchCollate()
+        self._wandb = self._init_wandb()
+
+    # ------------------------------------------------------------------ #
+    # W&B (Lean v3, T13)
+    # ------------------------------------------------------------------ #
+    def _init_wandb(self) -> Any:
+        """Return a wandb run, or ``None`` when logging is not configured.
+
+        Three independent gates keep this a no-op for every existing caller:
+        no ``wandb_project`` -> never import wandb; no credentials ->
+        ``mode="offline"`` so a key-less notebook still produces local logs
+        instead of raising mid-training; and any import/setup error is reported
+        and swallowed, because telemetry must never abort a training run.
+        """
+        project = str(getattr(self.config, "wandb_project", "") or "") if self.config else ""
+        if not project:
+            return None
+        try:
+            import wandb  # noqa: PLC0415 - optional dependency, imported lazily
+        except Exception as exc:  # noqa: BLE001
+            print(f"[lean-train] wandb unavailable ({type(exc).__name__}: {exc}); continuing without it")
+            return None
+        mode = str(getattr(self.config, "wandb_mode", "online") or "online")
+        if mode != "disabled" and not (
+            os.environ.get("WANDB_API_KEY") or os.environ.get("WANDB_MODE") == "offline"
+        ):
+            # No key: an "online" run would fail on the first network call, i.e.
+            # in the middle of training. Downgrade to offline and say so.
+            mode = "offline"
+            os.environ["WANDB_MODE"] = "offline"
+            print("[lean-train] WANDB_API_KEY not set -> wandb mode='offline' (logs stay local)")
+        try:
+            run = wandb.init(
+                project=project,
+                name=str(getattr(self.config, "wandb_run_name", "") or "") or None,
+                mode=mode,
+                config={
+                    "backbone": getattr(getattr(self.config, "model", None), "backbone_name", None),
+                    "seed": getattr(self.config, "seed", None),
+                    "experiment_name": getattr(self.config, "experiment_name", None),
+                    "batch_size": getattr(getattr(self.config, "optimization", None), "batch_size", None),
+                    "effective_batch_size": self.effective_batch_size,
+                    "num_epochs": getattr(getattr(self.config, "optimization", None), "num_epochs", None),
+                    "probe_split": getattr(self.config, "probe_split", ""),
+                    "probe_every_steps": getattr(self.config, "probe_every_steps", 0),
+                },
+            )
+            print(f"[lean-train] wandb run: {getattr(run, 'name', '?')} (mode={mode})")
+            return run
+        except Exception as exc:  # noqa: BLE001
+            print(f"[lean-train] wandb.init failed ({type(exc).__name__}: {exc}); continuing without it")
+            return None
+
+    def _wandb_log(self, payload: Dict[str, Any], step: Optional[int] = None) -> None:
+        """Log a dict to W&B when a run exists. Never raises."""
+        if getattr(self, "_wandb", None) is None:
+            return
+        try:
+            self._wandb.log(payload, step=step)
+        except Exception:  # noqa: BLE001 - telemetry must never break training
+            pass
 
     def _build_optimizer(self, groups: List[Dict[str, Any]]) -> torch.optim.Optimizer:
         """Build the optimizer named by ``optimization.optimizer``.
@@ -1178,6 +1246,29 @@ class LeanTrainer(BaseTrainer):
             kind=_kind,
         )
 
+        # --- Lean v3 probe-eval cadence (T13) ---------------------------------
+        # Counted in OPTIMISER steps (not micro-steps) because the user-facing
+        # ask was "every 1k", and an optimiser step is the unit that actually
+        # changes the weights -- a micro-step cadence would fire `accum` times
+        # more often and score the same weights repeatedly.
+        _probe_split = str(getattr(self.config, "probe_split", "") or "") if self.config else ""
+        _probe_limit = int(getattr(self.config, "probe_limit", 300) or 300) if self.config else 300
+        _probe_every = int(getattr(self.config, "probe_every_steps", 0) or 0) if self.config else 0
+        if _probe_split and _probe_every <= 0:
+            _pct = float(getattr(self.config, "probe_percent", 0.0) or 0.0) if self.config else 0.0
+            # Fallback cadence: "every 10% of training" when a step count is not
+            # configured. sqrt-free floor keeps it >= 1 so the probe cannot be
+            # silently switched off by a tiny run.
+            _probe_every = max(int(round(opt_total_steps * _pct)), 1) if _pct > 0 else 0
+        _probe_next = _probe_every if (_probe_split and _probe_every > 0) else 0
+        if _probe_split:
+            print(
+                f"[lean-train:{stage}] probe eval on '{_probe_split}' every "
+                f"{_probe_every or 'n/a'} opt-steps (limit={_probe_limit})"
+                + ("" if _probe_every else " -- DISABLED: set probe_every_steps or probe_percent"),
+                flush=True,
+            )
+
         log_every = max(total_steps // 100, 1)
         t_start = time.time()
         self._accum_i = 0
@@ -1237,6 +1328,61 @@ class LeanTrainer(BaseTrainer):
                         "elapsed_s": time.time() - t_start,
                         **losses,
                     })
+                    # Per-step train curves in W&B. Logged on the SAME cadence as
+                    # `train_log.jsonl` (total_steps/100) so the two views agree;
+                    # a per-micro-step push would make the run 100x chattier for
+                    # no extra resolution (these are micro-batch losses).
+                    self._wandb_log({
+                        "train/loss": losses.get("loss"),
+                        "train/pointer_loss": losses.get("pointer"),
+                        "train/tool_loss": losses.get("tool"),
+                        "train/tool_binary_loss": losses.get("tool_binary"),
+                        "train/lr": self.optimizer.param_groups[-1]["lr"],
+                        "train/epoch": epoch,
+                    }, step=int(self.global_step))
+
+                # --- Lean v3 mid-training probe eval (T13) --------------------
+                # Fires only on an OPTIMISER-step boundary inside the micro-step
+                # loop. `self._accum_i == 0` means the just-finished micro-batch
+                # closed an accumulation window, so the weights being scored are
+                # the ones the NEXT micro-batch will train from -- scoring mid
+                # window would report a mix of stale and updated weights.
+                if _probe_next and self._accum_i == 0 and self.global_step >= _probe_next:
+                    while _probe_next and self.global_step >= _probe_next:
+                        _probe_next += _probe_every
+                    _probe_res = self.evaluate(_probe_split, limit=_probe_limit)
+                    _probe_rec = {
+                        "stage": stage,
+                        "epoch": epoch,
+                        "global_step": int(self.global_step),
+                        "split": _probe_split,
+                        "exact_call": float(_probe_res.get("exact_call", float("nan"))),
+                        "span_acc": float(_probe_res.get("span_acc", float("nan"))),
+                        "tool_acc": float(_probe_res.get("tool_acc", float("nan"))),
+                        "eval_loss": float(_probe_res.get("eval_loss", float("nan"))),
+                        "n": float(_probe_res.get("n", 0.0)),
+                    }
+                    self.history["probe_eval"].append(_probe_rec)
+                    self._log_event({"event": "probe_eval", **_probe_rec})
+                    # Named under `probe/` so the W&B UI keeps it on a separate
+                    # axis from `dev/` -- the probe set is small and re-scored
+                    # many times per epoch, so overlaying the two curves would
+                    # invite reading probe noise as held-out performance.
+                    self._wandb_log({
+                        "probe/exact_call": _probe_rec["exact_call"],
+                        "probe/span_acc": _probe_rec["span_acc"],
+                        "probe/tool_acc": _probe_rec["tool_acc"],
+                        "probe/eval_loss": _probe_rec["eval_loss"],
+                        "probe/epoch": epoch,
+                    }, step=int(self.global_step))
+                    tqdm.write(
+                        f"[lean-train:{stage}] probe @ opt-step {self.global_step} "
+                        f"({_probe_split}, n={int(_probe_rec['n'])}): "
+                        f"exact_call={_probe_rec['exact_call']:.4f} "
+                        f"span_acc={_probe_rec['span_acc']:.4f} "
+                        f"loss={_probe_rec['eval_loss']:.4f}"
+                    )
+                    self.model.train()
 
             batch_mean_loss = ep_sum / max(ep_n, 1)
 
@@ -1337,6 +1483,17 @@ class LeanTrainer(BaseTrainer):
                 }
                 self.history["epoch_eval"].append(ep_rec)
                 self._log_event({"event": "epoch_eval", **ep_rec})
+                # `dev/` namespace: this is the LARGE held-out split scored once
+                # per epoch, so it must not share an axis with `probe/`.
+                self._wandb_log({
+                    f"dev/{es}/eval_loss": ep_rec["eval_loss"],
+                    f"dev/{es}/span_acc": ep_rec["span_acc"],
+                    f"dev/{es}/exact_call": ep_rec["exact_call"],
+                    f"dev/{es}/exact_params_only": ep_rec["exact_params_only"],
+                    f"dev/{es}/tool_acc": ep_rec["tool_acc"],
+                    "train/mean_loss_epoch": mean_loss,
+                    "train/epoch": epoch,
+                }, step=int(self.global_step))
 
                 cur_metric = _f("exact_call")
                 # A NaN metric (empty split / nothing supervised) must not win the
@@ -1425,6 +1582,16 @@ class LeanTrainer(BaseTrainer):
         gc.collect()
         if self.device.startswith("cuda") and torch.cuda.is_available():
             torch.cuda.empty_cache()
+        # Close the W&B run for this stage so a multi-stage run gets one run per
+        # stage instead of one giant merged plot. `finish` is safe to call when no
+        # run exists (guarded) and must never raise.
+        if getattr(self, "_wandb", None) is not None:
+            try:
+                self._wandb.finish()
+            except Exception:  # noqa: BLE001
+                pass
+            self._wandb = None
+
         if not steps:
             return {"loss": float("nan"), "steps": 0.0}
         # `loss` = last epoch's slot-weighted mean (same definition as eval_loss).

@@ -99,6 +99,47 @@ def test_resolver_rejects_unknown_resolve_mode() -> None:
         LeanResolver(model=_model(), max_seq_len=512, resolve_mode="three_step")
 
 
+def test_resolver_defaults_to_two_step_not_the_retired_arm() -> None:
+    """Lean v3: an unpinned resolver must not inherit the retired ``single_pass``.
+
+    ``single_pass`` stays constructible so pre-v3 numbers remain reproducible,
+    but it must be requested by name. Inheriting it by omission is the bug this
+    default exists to prevent: a consumer that forgets the argument would
+    otherwise silently score a different protocol than the one it reports.
+    """
+    r = LeanResolver(model=_model(), max_seq_len=512)
+    assert r.resolve_mode == "two_step"
+
+    # Still explicitly selectable, so old checkpoints stay reproducible.
+    r_old = LeanResolver(model=_model(), max_seq_len=512, resolve_mode="single_pass")
+    assert r_old.resolve_mode == "single_pass"
+
+    # An empty value must fall back to the protocol, not to the retired arm.
+    assert LeanResolver(
+        model=_model(), max_seq_len=512, resolve_mode=""
+    ).resolve_mode == "two_step"
+
+
+def test_unpinned_resolver_resolves_in_two_step() -> None:
+    """Behavioural proof, not just the attribute: the telemetry must show two_step."""
+    model = _model()
+    model.tool_head_binary = _ConstantToolHead([5.0, -5.0])
+    r = LeanResolver(
+        model=model,
+        max_seq_len=512,
+        tool_objective="binary",
+        tool_call_threshold=0.5,
+    )
+    res = r.try_resolve_candidates(
+        [_weather_schema(), _search_schema()],
+        utterance="weather in Tokyo Japan",
+    )
+    assert res.features["resolve_mode"] == "two_step"
+    assert res.features["step1_render_T"] == 2, (
+        "an unpinned resolver ran the one-pass protocol"
+    )
+
+
 def test_two_step_mode_rerenders_t1_and_preserves_step_clocks() -> None:
     model = _model()
     model.tool_head_binary = _ConstantToolHead([5.0, -5.0])

@@ -11,6 +11,11 @@ class RoutingDecision(str, Enum):
     SPANCALL_HIT = "spancall_hit"
     SPANCALL_ABSTAIN = "spancall_abstain"
     LLM_FALLBACK = "llm_fallback"
+    # Mode 3 (hybrid fill): SpanCall produced the tool + most params, the LLM
+    # filled only the unresolved ones. Distinct from LLM_FALLBACK because the
+    # executed arguments are NOT purely LLM output -- metrics that count "LLM
+    # produced this call" must not lump the two together.
+    HYBRID_FILL = "hybrid_fill"
     SHADOW_COMPARISON = "shadow_comparison"
 
 

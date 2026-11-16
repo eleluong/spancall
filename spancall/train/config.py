@@ -217,6 +217,21 @@ class TrainingConfig:
     freeze_encoder_stages: List[str] = field(default_factory=list)  # e.g. ["T0", "T1"]
     eval_splits: List[str] = field(default_factory=list)  # A6: per-epoch held-out evaluation splits
     eval_limit: int = 500                  # row cap per eval split to keep epoch wall-time bounded
+    # ---- Lean v3: mid-training probe eval (T13) -----------------------------
+    # Per-epoch scoring gives 3 points for a 3-epoch run, so the overfit knee
+    # between two of them is invisible. A SMALL probe split (disjoint from the
+    # large evaluation set, which is scored once at the end) sampled every
+    # `probe_every_steps` optimiser steps turns that into a curve.
+    probe_split: str = ""                  # tensorized split to score (e.g. "probe"); "" disables
+    probe_every_steps: int = 0             # cadence in OPTIMISER steps; 0 => use probe_percent
+    probe_percent: float = 0.0             # fallback cadence: fraction of total optimiser steps
+    probe_limit: int = 300                 # row cap per probe pass (must stay small)
+    # ---- Lean v3: W&B logging (T13) ----------------------------------------
+    # Empty project => wandb is never imported, so the trainer stays
+    # bit-identical and key-free for every existing caller.
+    wandb_project: str = ""
+    wandb_run_name: str = ""
+    wandb_mode: str = "online"             # "online" | "offline" | "disabled"
     # ---- LoRA ablation (T10; default OFF so nothing changes unless asked) -----
     # Motivation (investigation §10.3): at the 0.2 data fraction only the two
     # heads were effectively being trained and the frozen encoder could never
@@ -283,6 +298,18 @@ class TrainingConfig:
                 or cfg.eval_splits
             ),
             eval_limit=int(training.get("eval_limit", cfg.eval_limit)),
+            probe_split=str(training.get("probe_split", cfg.probe_split) or ""),
+            probe_every_steps=int(training.get("probe_every_steps", cfg.probe_every_steps)),
+            probe_percent=float(training.get("probe_percent", cfg.probe_percent)),
+            probe_limit=int(training.get("probe_limit", cfg.probe_limit)),
+            wandb_project=str(
+                training.get("wandb_project")
+                or (data.get("wandb") or {}).get("project")
+                or cfg.wandb_project
+                or ""
+            ),
+            wandb_run_name=str(training.get("wandb_run_name", cfg.wandb_run_name) or ""),
+            wandb_mode=str(training.get("wandb_mode", cfg.wandb_mode) or "online"),
             use_lora=bool(training.get("use_lora", cfg.use_lora)),
             lora_r=int(training.get("lora_r", cfg.lora_r)),
             lora_alpha=int(training.get("lora_alpha", cfg.lora_alpha)),

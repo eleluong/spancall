@@ -58,6 +58,17 @@ coverage.xml
 # Jupyter Notebooks & Colab
 .ipynb_checkpoints
 *-checkpoint.ipynb
+
+# Notebooks that REQUIRE external API keys / credentials (never committed):
+# they call an LLM API, push to the Hugging Face Hub, or log to W&B. Their
+# generators (scripts/build_*_notebook.py) ARE committed, so the content stays
+# version-controlled while the runnable, key-bearing artifact does not.
+notebooks/*_llm_*.ipynb
+notebooks/*_hf_push*.ipynb
+notebooks/*_agentic*.ipynb
+
+# W&B local run dirs / offline sync cache
+wandb/
 .jupyter/
 
 # Editors & IDEs

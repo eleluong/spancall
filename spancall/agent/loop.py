@@ -201,9 +201,18 @@ class ReActAgentLoop(BaseAgentLoop):
                 messages.append({"role": "assistant", "content": str(text)})
 
             trace.steps.append(step)
+            # HYBRID_FILL DID call the LLM (for the gaps), so it counts toward
+            # the LLM-call total -- but it also counts as a SpanCall step, since
+            # the tool and most arguments came from the fast path. Counting it in
+            # only one bucket would silently inflate or deflate the savings
+            # metric depending on which one a reader looks at.
             trace.total_llm_calls += 1 if step.decision in (
-                RoutingDecision.LLM_FALLBACK, RoutingDecision.SHADOW_COMPARISON) else 0
-            if step.decision in (RoutingDecision.SPANCALL_HIT, RoutingDecision.SPANCALL_ABSTAIN):
+                RoutingDecision.LLM_FALLBACK, RoutingDecision.SHADOW_COMPARISON,
+                RoutingDecision.HYBRID_FILL) else 0
+            if step.decision in (
+                RoutingDecision.SPANCALL_HIT, RoutingDecision.SPANCALL_ABSTAIN,
+                RoutingDecision.HYBRID_FILL,
+            ):
                 trace.total_spancall_calls += 1
             trace.total_latency_ms += step.latency_ms
             trace.total_tokens_prompt += step.llm_tokens_in
