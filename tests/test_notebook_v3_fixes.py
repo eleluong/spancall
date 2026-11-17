@@ -315,16 +315,37 @@ def test_agentic_aborts_on_head_load_gap(agent_nb: None) -> None:
         def eval(self):
             return self
 
+    class _FakeEncoder:
+        """Enough of the encoder contract for the reload path to run.
+
+        ``add_marker_tokens`` returns 0 — the checkpoint tokenizer already holds
+        the markers — and ``backbone.get_input_embeddings()`` reports a matrix
+        already reconciled with the tokenizer, so the size guard passes and the
+        head-gap check is what actually fires.
+        """
+
+        hidden_dim = 1024
+
+        def __init__(self) -> None:
+            self.backbone = SimpleNamespace(
+                get_input_embeddings=lambda: SimpleNamespace(num_embeddings=48)
+            )
+
+        def add_marker_tokens(self, _toks):
+            return 0
+
+    class _FakeTokenizer:
+        def __len__(self) -> int:
+            return 48
+
     build = _resolve(
         AGENT_NB,
         "_build_model",
         {
             "LeanSpanCallModel": lambda **kw: _FakeModel(),
-            "SpanCallTransformerEncoder": lambda **kw: SimpleNamespace(
-                add_marker_tokens=lambda toks: 0, hidden_dim=1024
-            ),
+            "SpanCallTransformerEncoder": lambda **kw: _FakeEncoder(),
             "AutoTokenizer": SimpleNamespace(
-                from_pretrained=lambda *a, **kw: SimpleNamespace()
+                from_pretrained=lambda *a, **kw: _FakeTokenizer()
             ),
             "torch": SimpleNamespace(
                 load=lambda *a, **kw: _FakeState(),

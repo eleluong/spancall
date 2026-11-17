@@ -159,3 +159,112 @@ def test_encoder_syncs_tokenizer_model_max_length() -> None:
     tok = SimpleNamespace(model_max_length=int(1e30))
     SpanCallTransformerEncoder(tokenizer=tok, backbone=_BB(), bidirectional=False)
     assert tok.model_max_length == 32768
+
+
+# ---------------------------------------------------------------------------
+# Marker-token resize: the inference-rebuild regression
+# ---------------------------------------------------------------------------
+class _ResizableBackbone(nn.Module):
+    """Backbone whose embedding matrix can be resized, like a real HF model."""
+
+    def __init__(self, hidden: int = 8, vocab: int = 20) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(hidden_size=hidden)
+        self.emb = nn.Embedding(vocab, hidden)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.emb
+
+    def resize_token_embeddings(self, new_num: int) -> nn.Embedding:
+        old = self.emb
+        self.emb = nn.Embedding(new_num, old.embedding_dim)
+        keep = min(int(old.num_embeddings), int(new_num))
+        with torch.no_grad():
+            self.emb.weight[:keep] = old.weight[:keep]
+        return self.emb
+
+
+class _TokenizerWithMarkers:
+    """A checkpoint-style tokenizer that can already hold some markers.
+
+    This is the case that broke loading the v3.2 Hub export. The repo ships a
+    ``tokenizer.json`` with the 15 markers, so ``add_special_tokens`` reports
+    ``added == 0`` — while the backbone was just built from base ModernBERT,
+    whose embedding matrix is 15 rows shorter.
+
+    ``present`` names the markers already registered at construction; they are
+    included in ``len()`` exactly as a real checkpoint tokenizer would include
+    them.
+    """
+
+    def __init__(self, base_vocab: int = 20, present: tuple = ()) -> None:
+        self._base = list(range(base_vocab))
+        self._present = list(present)
+        self.model_max_length = 4096
+
+    def __len__(self) -> int:
+        return len(self._base) + len(self._present)
+
+    def add_special_tokens(self, mapping: dict) -> int:
+        wanted = list(mapping.get("additional_special_tokens", []))
+        new = [t for t in wanted if t not in self._present]
+        self._present.extend(new)
+        return len(new)
+
+
+def test_marker_resize_when_tokenizer_already_holds_them() -> None:
+    """``added == 0`` must still resize, or load_state_dict fails on tok_embeddings.
+
+    Regression for::
+
+        size mismatch for backbone.backbone.embeddings.tok_embeddings.weight:
+        copying a param with shape torch.Size([50383, 1024]) from checkpoint,
+        the shape in current model is torch.Size([50368, 1024]).
+
+    Gating the resize on the tokenizer's "how many did I add" count skipped it
+    for an inference rebuild, because a checkpoint tokenizer already lists the
+    markers. The invariant is ``num_embeddings == len(tokenizer)``.
+    """
+    # Base backbone: 20 rows. Checkpoint tokenizer: 20 + 15 markers = 35 entries.
+    markers = tuple(f"<|m{i}|>" for i in range(15))
+    backbone = _ResizableBackbone(hidden=8, vocab=20)
+    tok = _TokenizerWithMarkers(base_vocab=20, present=markers)
+    enc = SpanCallTransformerEncoder(backbone=backbone, tokenizer=tok, bidirectional=False)
+
+    added = enc.add_marker_tokens(list(markers))
+    assert added == 0, "sanity: every marker is already registered"
+
+    rows = int(enc.backbone.get_input_embeddings().num_embeddings)
+    assert rows == len(tok) == 35, (
+        f"embeddings still {rows} rows vs tokenizer {len(tok)}; "
+        "a checkpoint state_dict would fail to load"
+    )
+
+
+def test_marker_resize_preserves_trained_rows_and_is_idempotent() -> None:
+    """Only the appended rows are initialised; a second call is a no-op."""
+    backbone = _ResizableBackbone(hidden=8, vocab=20)
+    tok = _TokenizerWithMarkers(base_vocab=20, present=("<|cls|>",))
+    enc = SpanCallTransformerEncoder(backbone=backbone, tokenizer=tok, bidirectional=False)
+    before = enc.backbone.get_input_embeddings().weight[:20].clone()
+
+    enc.add_marker_tokens(["<|cls|>"])
+    after = enc.backbone.get_input_embeddings().weight
+    assert after.shape[0] == 21
+    assert torch.equal(after[:20], before), "pre-existing (trained) rows were overwritten"
+
+    rows_before_second = int(after.shape[0])
+    enc.add_marker_tokens(["<|cls|>"])
+    assert int(enc.backbone.get_input_embeddings().num_embeddings) == rows_before_second, (
+        "a repeat call resized the embeddings again"
+    )
+
+
+def test_marker_resize_shrinks_when_tokenizer_is_smaller() -> None:
+    """A tokenizer shorter than the base vocab is honoured too (no silent mismatch)."""
+    backbone = _ResizableBackbone(hidden=8, vocab=30)
+    tok = _TokenizerWithMarkers(base_vocab=22, present=("<|cls|>",))
+    enc = SpanCallTransformerEncoder(backbone=backbone, tokenizer=tok, bidirectional=False)
+
+    enc.add_marker_tokens(["<|cls|>"])
+    assert int(enc.backbone.get_input_embeddings().num_embeddings) == 23

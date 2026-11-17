@@ -177,17 +177,34 @@ class SpanCallTransformerEncoder(BaseEncoder, nn.Module):
     # Marker-token registration
     # ------------------------------------------------------------------ #
     def add_marker_tokens(self, tokens: List[str]) -> int:
-        """Register marker tokens, resize embeddings, init new rows to mean+std.
+        """Register marker tokens and reconcile the embedding matrix with them.
 
         Steps (plan §3.2.1):
         1. ``tokenizer.add_special_tokens`` (deduplicated by the tokenizer).
-        2. ``backbone.resize_token_embeddings(len(tokenizer))``.
-        3. Initialize the newly inserted embedding rows with
+        2. Resize the embeddings so ``num_embeddings == len(tokenizer)``.
+        3. Initialize only the newly inserted rows with
            ``randn * std(existing) + mean(existing)`` so marker embeddings do
            not start at the (uninformative) default init.
 
-        Returns the number of *new* tokens actually added (0 if all markers
-        were already present).
+        The resize is driven by a **size comparison**, not by the tokenizer's
+        "how many did I add" count. Those differ for an inference rebuild: a
+        checkpoint ships a ``tokenizer.json`` that already lists the markers, so
+        ``add_special_tokens`` reports ``added == 0``, while the backbone was
+        just built from the *base* model, whose vocabulary is 15 rows shorter
+        (ModernBERT: 50368 vs 50383). Gating on ``added > 0`` therefore leaves
+        the embedding matrix the wrong size and ``load_state_dict`` fails with::
+
+            size mismatch for backbone.backbone.embeddings.tok_embeddings.weight:
+            copying a param with shape torch.Size([50383, 1024]) from checkpoint,
+            the shape in current model is torch.Size([50368, 1024]).
+
+        Matching on size is also what makes the call safe to re-enter: a second
+        call finds the sizes already equal and does no work.
+
+        Returns the number of *new tokens* the tokenizer actually registered
+        (0 when the markers were already in the vocabulary) — which is the
+        answer callers want to log, even though a resize may still have
+        happened here.
         """
         if self.tokenizer is None:
             raise ValueError(
@@ -198,23 +215,27 @@ class SpanCallTransformerEncoder(BaseEncoder, nn.Module):
         added = self.tokenizer.add_special_tokens(
             {"additional_special_tokens": list(tokens)}
         )
-        if added > 0:
-            emb = self.backbone.get_input_embeddings()
-            old_num = int(emb.num_embeddings)
-            # resize_token_embeddings return value varies across transformers
-            # versions; read the resized embedding size back instead.
-            self.backbone.resize_token_embeddings(len(self.tokenizer))
-            emb = self.backbone.get_input_embeddings()
-            new_num = int(emb.num_embeddings)
-            if new_num > old_num:
-                with torch.no_grad():
-                    mean = emb.weight[:old_num].mean(dim=0)
-                    std = emb.weight[:old_num].std(dim=0)
-                    noise = torch.randn(
-                        new_num - old_num,
-                        emb.weight.size(1),
-                        device=emb.weight.device,
-                        dtype=emb.weight.dtype,
-                    )
-                    emb.weight[old_num:new_num] = noise * std + mean
+
+        emb = self.backbone.get_input_embeddings()
+        old_num = int(emb.num_embeddings)
+        want = len(self.tokenizer)
+        if want == old_num:
+            return added
+
+        # resize_token_embeddings return value varies across transformers
+        # versions; read the resized embedding size back instead.
+        self.backbone.resize_token_embeddings(want)
+        emb = self.backbone.get_input_embeddings()
+        new_num = int(emb.num_embeddings)
+        if new_num > old_num:
+            with torch.no_grad():
+                mean = emb.weight[:old_num].mean(dim=0)
+                std = emb.weight[:old_num].std(dim=0)
+                noise = torch.randn(
+                    new_num - old_num,
+                    emb.weight.size(1),
+                    device=emb.weight.device,
+                    dtype=emb.weight.dtype,
+                )
+                emb.weight[old_num:new_num] = noise * std + mean
         return added

@@ -378,9 +378,21 @@ def _build_model(cfg, local_dir):
         model_name_or_path=backbone_name,
         tokenizer=tokenizer,
     )
-    # Idempotent: the exported tokenizer already carries the markers, so this
-    # adds 0 rows and only guarantees the order matches the checkpoint.
-    encoder.add_marker_tokens(list(SPECIAL_MARKER_TOKENS))
+    # The exported tokenizer already carries the 15 markers (50383 entries), while
+    # the backbone just built from base ModernBERT has 50368 embedding rows. This
+    # call reconciles the two by comparing sizes, so `load_state_dict` below sees
+    # a `tok_embeddings.weight` of the checkpoint's shape. It reports 0 *new*
+    # tokens here (they were already registered) - the resize still happens, and
+    # that distinction is exactly what used to break the load.
+    _added = encoder.add_marker_tokens(list(SPECIAL_MARKER_TOKENS))
+    _rows = int(encoder.backbone.get_input_embeddings().num_embeddings)
+    print(f"[model] markers newly registered={_added}  embedding_rows={_rows}  "
+          f"tokenizer_len={len(tokenizer)}")
+    if _rows != len(tokenizer):
+        raise SystemExit(
+            f"embedding rows ({_rows}) != tokenizer length ({len(tokenizer)}); "
+            f"the checkpoint state_dict cannot load into this model."
+        )
     model = LeanSpanCallModel(
         encoder=encoder,
         head_dim=head_dim,

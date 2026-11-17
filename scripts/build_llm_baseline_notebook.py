@@ -466,8 +466,13 @@ def load_resolver(verbose: bool = True):
         print(f"[model] backbone={backbone} device={device} "
               f"max_seq_len={max_seq_len} head_dim={head_dim}")
 
-    # The tokenizer ships in the checkpoint repo, so the marker tokens are already
-    # in its vocabulary; `add_marker_tokens` is idempotent and re-checks anyway.
+    # The tokenizer ships in the checkpoint repo, so its vocabulary ALREADY holds
+    # the 15 marker tokens (50383 entries) while the backbone we just built from
+    # base ModernBERT has 50368 embedding rows. `add_marker_tokens` reconciles the
+    # two by comparing sizes rather than by counting how many tokens the
+    # tokenizer newly registered - that count is 0 here, and gating the resize on
+    # it left the matrix 15 rows short and made `load_state_dict` fail with a
+    # `tok_embeddings.weight` size mismatch.
     tokenizer = AutoTokenizer.from_pretrained(
         HF_REPO_ID, cache_dir=HF_CACHE_DIR, use_fast=True, token=HF_TOKEN or None)
     encoder = SpanCallTransformerEncoder(
@@ -475,7 +480,16 @@ def load_resolver(verbose: bool = True):
         hidden_dropout_prob=0.1,
         tokenizer=tokenizer,
     )
-    encoder.add_marker_tokens(list(SPECIAL_MARKER_TOKENS))
+    _added = encoder.add_marker_tokens(list(SPECIAL_MARKER_TOKENS))
+    _rows = int(encoder.backbone.get_input_embeddings().num_embeddings)
+    if verbose:
+        print(f"[model] markers newly registered={_added}  "
+              f"embedding_rows={_rows}  tokenizer_len={len(tokenizer)}")
+    if _rows != len(tokenizer):
+        raise SystemExit(
+            f"embedding rows ({_rows}) != tokenizer length ({len(tokenizer)}); "
+            f"the checkpoint state_dict cannot load into this model."
+        )
 
     model = LeanSpanCallModel(
         encoder=encoder,
