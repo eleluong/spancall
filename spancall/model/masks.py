@@ -27,6 +27,7 @@ from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from spancall.data.flatten import iter_balanced_spans
 from spancall.data.schema import ParameterSchema
 
 # ---------------------------------------------------------------------------
@@ -524,6 +525,93 @@ class CandidateMaskBuilder:
             cands.extend(self._null_candidates(ctx_null, eidx, tok_by_entry, param_schema))
             return self._pack(cands, max_cands)
 
+        # --- object (balanced {...} literals in utterance/recent) ------------
+        if ptype == "object":
+            cands.extend(self._balanced_block_candidates(
+                "{", "}", utterance_text, token_offsets, eidx,
+                recent_vals=recent_vals, char_bounds=u_bounds, max_tok=max_tok,
+            ))
+            cands.extend(self._null_candidates(ctx_null, eidx, tok_by_entry, param_schema))
+            return self._pack(cands, max_cands)
+
+        # --- array (dual-mode: whole-list [...] + items_type element spans) --
+        if ptype == "array":
+            bracket_cands = self._balanced_block_candidates(
+                "[", "]", utterance_text, token_offsets, eidx,
+                recent_vals=recent_vals, char_bounds=u_bounds, max_tok=max_tok,
+            )
+            cands.extend(bracket_cands)
+            items_type = (getattr(param_schema, "items_type", None) or "string").strip().lower()
+            null_cands = self._null_candidates(ctx_null, eidx, tok_by_entry, param_schema)
+
+            if enum_vals is not None:
+                for e in ctx_enum:
+                    if e.value not in enum_vals:
+                        continue
+                    r = tok_by_entry.get(id(e))
+                    if r is not None:
+                        cands.append(Candidate(
+                            r[0], r[1], e.char_start, e.char_end, "enum", e.value, eidx.of(e)))
+            if items_type == "boolean":
+                for e in ctx_bool:
+                    r = tok_by_entry.get(id(e))
+                    if r is not None:
+                        cands.append(Candidate(
+                            r[0], r[1], e.char_start, e.char_end, "bool", str(e.value).lower(), eidx.of(e)))
+            elif items_type in ("integer", "number"):
+                cands.extend(self._regex_candidates(
+                    _NUMERIC_RE, utterance_text, token_offsets, "utterance", "numeric",
+                    char_bounds=u_bounds, max_tok=max_tok))
+                for e in recent_vals:
+                    if self._looks_numeric(e.value):
+                        r = tok_by_entry.get(id(e))
+                        if r is not None:
+                            cands.append(Candidate(
+                                r[0], r[1], e.char_start, e.char_end, "recent", e.value, eidx.of(e)))
+                cands.extend(self._recent_regex_candidates(
+                    _NUMERIC_RE, recent_vals, utterance_text, token_offsets, eidx,
+                    existing=cands, max_tok=max_tok))
+            elif items_type in ("date", "datetime", "time"):
+                for e in ctx_time:
+                    r = tok_by_entry.get(id(e))
+                    if r is not None:
+                        cands.append(Candidate(
+                            r[0], r[1], e.char_start, e.char_end, "time", e.value, eidx.of(e)))
+                cands.extend(self._regex_candidates(
+                    _DATE_RE, utterance_text, token_offsets, "utterance", "time",
+                    char_bounds=u_bounds, max_tok=max_tok))
+                cands.extend(self._recent_regex_candidates(
+                    _DATE_RE, recent_vals, utterance_text, token_offsets, eidx,
+                    existing=cands, max_tok=max_tok))
+            else:
+                recent_cands_arr: List[Candidate] = []
+                for e in reversed(recent_vals):
+                    r = tok_by_entry.get(id(e))
+                    if r is not None:
+                        recent_cands_arr.append(Candidate(
+                            r[0], r[1], e.char_start, e.char_end, "recent", e.value, eidx.of(e)))
+                free_recent_arr = self._free_recent_spans(
+                    list(reversed(recent_vals)), token_offsets, eidx, utterance_text,
+                    existing=recent_cands_arr, max_tok=max_tok, tindex=ctx.tindex)
+                if max_cands is None:
+                    remain_arr = None
+                else:
+                    cap_int = int(max_cands)
+                    recent_budget = min(len(recent_cands_arr) + len(free_recent_arr), max(cap_int // 4, 32))
+                    reserved_tail = len(null_cands) + recent_budget + len(bracket_cands)
+                    remain_arr = max(0, cap_int - len(cands) - reserved_tail)
+                _prot = getattr(self, "pack_protected", None) or set()
+                protect_starts = {ts for ts, _te in _prot} if _prot else None
+                cands.extend(self._free_utterance_spans(
+                    utterance_entries, tok_by_entry, token_offsets, eidx, utterance_text,
+                    max_tok=max_tok, cap=remain_arr, tindex=ctx.tindex,
+                    protect_starts=protect_starts))
+                cands.extend(recent_cands_arr)
+                cands.extend(free_recent_arr)
+
+            cands.extend(null_cands)
+            return self._pack(cands, max_cands)
+
         # --- free string (windowed utterance spans ∪ recent interiors & sub-spans) ---
         recent_cands: List[Candidate] = []
         for e in reversed(recent_vals):
@@ -688,6 +776,61 @@ class CandidateMaskBuilder:
                 continue
             out.append(Candidate(
                 r[0], r[1], e.char_start, e.char_end, "null", None, eidx.of(e)))
+        return out
+
+    def _balanced_block_candidates(
+        self,
+        open_ch: str,
+        close_ch: str,
+        text: str,
+        token_offsets: Sequence[Tuple[int, int]],
+        eidx: EntryIndex,
+        recent_vals: Optional[List[Any]] = None,
+        char_bounds: Optional[Tuple[int, int]] = None,
+        max_tok: Optional[int] = None,
+    ) -> List[Candidate]:
+        """Extract balanced ``{...}`` or ``[...]`` spans in utterance/recent without width cap."""
+        out: List[Candidate] = []
+        if not text:
+            return out
+        if max_tok is None:
+            max_tok = self._effective_max_seq_len(token_offsets)
+        s_lo = char_bounds[0] if char_bounds is not None else 0
+        s_hi = min(char_bounds[1], len(text)) if char_bounds is not None else len(text)
+        seen: set = set()
+        if s_hi > s_lo:
+            sub = text[s_lo:s_hi]
+            for rs, re_ in iter_balanced_spans(sub, open_ch, close_ch):
+                cs, ce = s_lo + rs, s_lo + re_
+                r = _char_range_to_tokens(cs, ce, token_offsets, max_tok)
+                if r is None:
+                    continue
+                key = (r[0], r[1], "utterance")
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(Candidate(r[0], r[1], cs, ce, "utterance", text[cs:ce], eidx.for_char(cs)))
+        for e in (recent_vals or ()):
+            if e.char_end <= e.char_start:
+                continue
+            entry_slice = (
+                text[e.char_start:e.char_end]
+                if len(text) >= e.char_end
+                else str(e.value or "")
+            )
+            if not entry_slice:
+                continue
+            e_idx = eidx.of(e)
+            for rs, re_ in iter_balanced_spans(entry_slice, open_ch, close_ch):
+                cs, ce = e.char_start + rs, e.char_start + re_
+                r = _char_range_to_tokens(cs, ce, token_offsets, max_tok)
+                if r is None:
+                    continue
+                key = (r[0], r[1], "recent")
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(Candidate(r[0], r[1], cs, ce, "recent", entry_slice[rs:re_], e_idx))
         return out
 
     def _regex_candidates(
@@ -1095,12 +1238,17 @@ def classify_parity_miss(
     enum_vals = set(param_schema.enum) if param_schema.enum else None
     is_restricted = (
         ptype == "boolean"
-        or (enum_vals is not None and ptype in ("string", "integer", "number"))
+        or ptype == "object"
+        or (enum_vals is not None and ptype in ("string", "integer", "number", "array"))
         or ptype in ("date", "datetime", "time", "integer", "number",
                      "email", "url", "phone", "id", "identifier", "uuid")
     )
     if is_restricted:
         return "never_generated_typefilter"
+    if ptype == "array":
+        items_type = (getattr(param_schema, "items_type", None) or "string").strip().lower()
+        if items_type in ("integer", "number", "boolean", "date", "datetime", "time"):
+            return "never_generated_typefilter"
     if (te - ts + 1) > int(max_span_width):
         return "never_generated_width"
     return "truncated"

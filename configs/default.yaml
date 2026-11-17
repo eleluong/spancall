@@ -98,6 +98,12 @@ optimization:
   # T3: keep only the top positive slot per param. Multi-positive (MAX_POS=3)
   # suppresses top-1 probability; MAX_POS=1 is the cheap ablation.
   max_pos: 1
+  # v3.1: favor H3 pointer extraction over already-saturated H1 tool selection
+  lambda_pointer: 2.0
+  lambda_tool: 0.2
+  lambda_tool_binary: 0.2
+  pointer_focal_gamma: 1.0
+  multi_pos_slot_weight: 1.5
 
 training:
   gradient_accumulation_steps: 1

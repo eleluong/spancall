@@ -461,6 +461,8 @@ def eval_param_extraction_lean(
     only_tools: Optional[Sequence[str]] = None,
     exclude_tools: Optional[Sequence[str]] = None,
     quiet: bool = False,
+    batch_size: int = 32,
+    num_workers: int = 4,
 ) -> Dict[str, Any]:
     """Run retrieval-first param-extraction eval on a canonical split.
 
@@ -606,6 +608,7 @@ def eval_param_extraction_lean(
         lambda: {"gt": 0, "tp": 0, "fp": 0, "fn": 0, "extractable": 0, "unextractable": 0}
     )
 
+    samples_to_eval: List[UnifiedSample] = []
     with open(src, encoding="utf-8") as fh:
         for line in fh:
             if not line.strip():
@@ -620,41 +623,84 @@ def eval_param_extraction_lean(
                 continue
             if excl_set is not None and gt_name0 in excl_set:
                 continue
+            samples_to_eval.append(s)
+            if limit is not None and len(samples_to_eval) >= limit:
+                break
 
-            gt_calls = list(s.ground_truth_calls)
-            n_calls_gt = len(gt_calls)
+    _supports_parity = bool(getattr(resolver, "supports_candidate_parity", False))
+    _supports_ctx = bool(getattr(resolver, "supports_context_schemas", False))
+    _use_batch = (
+        hasattr(resolver, "resolve_oracle_batch")
+        and _supports_ctx
+        and _supports_parity
+        and len(samples_to_eval) > 1
+    )
 
-            # J6/R0.4: score EVERY GT call, not just ``[0]``. Part 1 runs in the
-            # oracle-tool setting, so each call is resolved against its own tool
-            # (still rendered beside the whole ``s.tools`` set, R0.2). Scoring
-            # only call 0 silently under-reported the 13.9% multi-call rows.
-            per_call: List[Tuple[int, Any, Any, Any]] = []
-            for ci, gt_call in enumerate(gt_calls):
+    batch_call_items: List[Dict[str, Any]] = []
+    batch_call_meta: List[Tuple[int, int, Any, Any, Any]] = []
+    if _use_batch:
+        for s_idx, s in enumerate(samples_to_eval):
+            for ci, gt_call in enumerate(s.ground_truth_calls):
                 gt_tool = next((t for t in s.tools if t.name == gt_call.tool_name), None)
                 if gt_tool is None:
                     continue
-                # R0.2: render the SAME tool set the model was trained on. Under
-                # the oracle-tool setting only the GT tool is rendered (T=1),
-                # while training packed ``pack_tools`` anchors — a layout H1/H3
-                # never saw. The capability flag (not a TypeError fallback) keeps
-                # old stubs honest: they simply keep the oracle prompt and the T
-                # mismatch is reported, rather than being hidden by a swallowed
-                # exception.
-                # T1: hand the resolver this call's extractable GT spans so it
-                # can report whether they were even offerable. ``parity_spans``
-                # alone only MEASURES (protection stays off) — protection is a
-                # separate opt-in (T2) so the diagnosis is never self-fulfilling.
                 _p_spans = (
                     _parity_spans_for_call(s, ci)
                     if (measure_candidate_parity or protect_parity_spans)
                     else None
                 )
-                # Capability flag, not a TypeError probe: a swallowed TypeError
-                # would silently restore the un-instrumented call and report a
-                # parity of "n/a" that looks like a clean run.
-                _supports_parity = bool(getattr(resolver, "supports_candidate_parity", False))
                 _ctx_schemas = [gt_tool] if ctx_mode == "single" else s.tools
-                if getattr(resolver, "supports_context_schemas", False):
+                batch_call_items.append({
+                    "schema": gt_tool,
+                    "utterance": s.utterance,
+                    "recent_context": s.recent_context,
+                    "now": s.current_time_iso,
+                    "context_schemas": _ctx_schemas,
+                    "parity_spans": _p_spans,
+                })
+                batch_call_meta.append((s_idx, ci, gt_call, gt_tool, _p_spans))
+        batch_results = resolver.resolve_oracle_batch(
+            batch_call_items,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            protect_parity_spans=protect_parity_spans,
+        )
+        per_sample_calls: Dict[int, List[Tuple[int, Any, Any, Any, Any]]] = defaultdict(list)
+        for (s_idx, ci, gt_call, gt_tool, _p_spans), res in zip(batch_call_meta, batch_results):
+            per_sample_calls[s_idx].append((ci, gt_call, gt_tool, res, _p_spans))
+
+    for s_idx, s in enumerate(samples_to_eval):
+        gt_calls = list(s.ground_truth_calls)
+        n_calls_gt = len(gt_calls)
+
+        per_call: List[Tuple[int, Any, Any, Any]] = []
+        if _use_batch:
+            for ci, gt_call, gt_tool, res, _p_spans in per_sample_calls.get(s_idx, []):
+                if _p_spans:
+                    _f = getattr(res, "features", None) or {}
+                    if "parity_checked" in _f:
+                        parity_checked += int(_f.get("parity_checked", 0))
+                        parity_hit += int(_f.get("parity_hit", 0))
+                        parity_rel_resolved += int(_f.get("parity_rel_resolved", 0))
+                        parity_rel_fallback += int(_f.get("parity_rel_fallback", 0))
+                        parity_unresolvable += int(_f.get("parity_unresolvable", 0))
+                        for _mr, _mc in (_f.get("parity_miss_reasons") or {}).items():
+                            parity_miss_reasons[str(_mr)] += int(_mc)
+                    else:
+                        parity_undetermined += sum(len(v) for v in _p_spans.values())
+                per_call.append((ci, gt_call, gt_tool, res))
+        else:
+            for ci, gt_call in enumerate(gt_calls):
+                gt_tool = next((t for t in s.tools if t.name == gt_call.tool_name), None)
+                if gt_tool is None:
+                    continue
+                _p_spans = (
+                    _parity_spans_for_call(s, ci)
+                    if (measure_candidate_parity or protect_parity_spans)
+                    else None
+                )
+                _ctx_schemas = [gt_tool] if ctx_mode == "single" else s.tools
+                if _supports_ctx:
                     if _supports_parity:
                         res = resolver.try_resolve(
                             gt_tool, s.utterance, s.recent_context, s.current_time_iso,
@@ -675,10 +721,6 @@ def eval_param_extraction_lean(
                     if "parity_checked" in _f:
                         parity_checked += int(_f.get("parity_checked", 0))
                         parity_hit += int(_f.get("parity_hit", 0))
-                        # ``rel_resolved``/``rel_fallback``/``unresolvable`` are
-                        # only present on a resolver that implements the P1 fix.
-                        # Their absence is NOT an error (old stubs keep working),
-                        # but it is also not silently counted as "all rel".
                         parity_rel_resolved += int(_f.get("parity_rel_resolved", 0))
                         parity_rel_fallback += int(_f.get("parity_rel_fallback", 0))
                         parity_unresolvable += int(_f.get("parity_unresolvable", 0))
@@ -687,252 +729,252 @@ def eval_param_extraction_lean(
                     else:
                         parity_undetermined += sum(len(v) for v in _p_spans.values())
                 per_call.append((ci, gt_call, gt_tool, res))
-            if not per_call:
+        if not per_call:
+            continue
+
+        total += 1
+        n_calls_hist[n_calls_gt] += 1
+
+        # R9/R2 telemetry is per SAMPLE: read it off the first resolution so a
+        # 2-call row does not double-count the layout actually rendered.
+        res0 = per_call[0][3]
+        _feats = getattr(res0, "features", None) or {}
+        _rt = _feats.get("render_T")
+        if _rt is not None:
+            render_T_hist[int(_rt)] += 1
+            render_T_rows += 1
+        _rb = _feats.get("recent_budget_effective")
+        if _rb is not None:
+            recent_budget_effective[int(_rb)] += 1
+        # T1: record the retention policy and cap the resolver actually ran
+        # under, plus the candidate-set size distribution. Without these a
+        # low parity rate cannot be attributed to a specific policy.
+        _fill = _feats.get("cand_pack_fill")
+        if _fill is not None:
+            pack_fill_seen[str(_fill)] += 1
+        _cap = _feats.get("cand_cap")
+        if _cap is not None:
+            cand_cap_seen[int(_cap)] += 1
+        _cpp = _feats.get("cands_per_param") or {}
+        for _v in _cpp.values():
+            cands_per_param_hist[int(_v)] += 1
+            cands_per_param_rows += 1
+
+        # J6: predicted call count vs GT call count (R0.4 call-count accuracy).
+        #
+        # A call set is a MULTISET: two GT calls to the SAME tool are two
+        # calls. Deduping by tool name collapsed a perfectly predicted
+        # [get_weather, get_weather] down to one call and scored
+        # ``call_count_acc=0`` / ``call_exact_set_match=0`` for a correct
+        # prediction. Part 3 matches per tool bucket (``multi_call_equal``);
+        # Part 1 must not use a weaker rule.
+        #
+        # Two shapes reach here:
+        #  1. a resolution that decoded the whole SET (``calls`` longer than
+        #     1, e.g. ``try_resolve(..., call_schemas=...)``) — it repeats
+        #     the set once per GT call, so counting every list would
+        #     multiply the calls;
+        #  2. a resolution that returns the call(s) produced BY that
+        #     resolution — the normal Part 1 case. ONE call per resolution
+        #     is exactly one predicted call, and two identical calls are
+        #     still two calls.
+        #
+        # So: single-call resolutions always contribute (multiplicity is
+        # real and is never deduped — name dedupe used to collapse a
+        # same-tool multiset, content dedupe still collapses two identical
+        # GT calls). Multi-call lists are unioned with a per-identity
+        # MAXIMUM count rather than a sum, which reads a repeated whole-set
+        # decode once while keeping any genuine extra call it carries.
+        pred_calls: List[Any] = []
+        _multi_counts: Dict[Tuple[str, str], int] = {}
+        _multi_repr: Dict[Tuple[str, str], Any] = {}
+        for _ci, _gc, _gt, r in per_call:
+            _cs = _predicted_calls(r)
+            if len(_cs) <= 1:
+                pred_calls.extend(_cs)
                 continue
+            _local: Dict[Tuple[str, str], int] = {}
+            for _c in _cs:
+                _ident = _call_identity(_c)
+                _local[_ident] = _local.get(_ident, 0) + 1
+                _multi_repr.setdefault(_ident, _c)
+            for _ident, _n in _local.items():
+                if _n > _multi_counts.get(_ident, 0):
+                    _multi_counts[_ident] = _n
+        for _ident, _n in _multi_counts.items():
+            pred_calls.extend([_multi_repr[_ident]] * _n)
+        pred_n_calls_hist[len(pred_calls)] += 1
+        if len(pred_calls) == n_calls_gt:
+            call_count_correct += 1
 
-            total += 1
-            n_calls_hist[n_calls_gt] += 1
+        multi_call = n_calls_gt > 1
+        sample_extracted = False
+        sample_gt_params = 0
+        sample_groundable = 0
+        call0_exact = False
+        all_calls_exact = True
 
-            # R9/R2 telemetry is per SAMPLE: read it off the first resolution so a
-            # 2-call row does not double-count the layout actually rendered.
-            res0 = per_call[0][3]
-            _feats = getattr(res0, "features", None) or {}
-            _rt = _feats.get("render_T")
-            if _rt is not None:
-                render_T_hist[int(_rt)] += 1
-                render_T_rows += 1
-            _rb = _feats.get("recent_budget_effective")
-            if _rb is not None:
-                recent_budget_effective[int(_rb)] += 1
-            # T1: record the retention policy and cap the resolver actually ran
-            # under, plus the candidate-set size distribution. Without these a
-            # low parity rate cannot be attributed to a specific policy.
-            _fill = _feats.get("cand_pack_fill")
-            if _fill is not None:
-                pack_fill_seen[str(_fill)] += 1
-            _cap = _feats.get("cand_cap")
-            if _cap is not None:
-                cand_cap_seen[int(_cap)] += 1
-            _cpp = _feats.get("cands_per_param") or {}
-            for _v in _cpp.values():
-                cands_per_param_hist[int(_v)] += 1
-                cands_per_param_rows += 1
+        for k, (ci, gt_call, gt_tool, res) in enumerate(per_call):
+            gt_args = dict(gt_call.arguments or {})
+            key_prefix = f"{ci}::" if multi_call else ""
 
-            # J6: predicted call count vs GT call count (R0.4 call-count accuracy).
-            #
-            # A call set is a MULTISET: two GT calls to the SAME tool are two
-            # calls. Deduping by tool name collapsed a perfectly predicted
-            # [get_weather, get_weather] down to one call and scored
-            # ``call_count_acc=0`` / ``call_exact_set_match=0`` for a correct
-            # prediction. Part 3 matches per tool bucket (``multi_call_equal``);
-            # Part 1 must not use a weaker rule.
-            #
-            # Two shapes reach here:
-            #  1. a resolution that decoded the whole SET (``calls`` longer than
-            #     1, e.g. ``try_resolve(..., call_schemas=...)``) — it repeats
-            #     the set once per GT call, so counting every list would
-            #     multiply the calls;
-            #  2. a resolution that returns the call(s) produced BY that
-            #     resolution — the normal Part 1 case. ONE call per resolution
-            #     is exactly one predicted call, and two identical calls are
-            #     still two calls.
-            #
-            # So: single-call resolutions always contribute (multiplicity is
-            # real and is never deduped — name dedupe used to collapse a
-            # same-tool multiset, content dedupe still collapses two identical
-            # GT calls). Multi-call lists are unioned with a per-identity
-            # MAXIMUM count rather than a sum, which reads a repeated whole-set
-            # decode once while keeping any genuine extra call it carries.
-            pred_calls: List[Any] = []
-            _multi_counts: Dict[Tuple[str, str], int] = {}
-            _multi_repr: Dict[Tuple[str, str], Any] = {}
-            for _ci, _gc, _gt, r in per_call:
-                _cs = _predicted_calls(r)
-                if len(_cs) <= 1:
-                    pred_calls.extend(_cs)
+            # C1: the GT universe keeps explicitly-null args.
+            gt_universe = _gt_params(gt_args, gt_tool)
+            norm_gt = {kk: _norm(v) for kk, v in gt_universe.items()}
+
+            # C4: null-aware prediction view — "null" != "no prediction".
+            pred_view: Dict[str, Dict[str, Any]] = {}
+            pred_args: Dict[str, Any] = {}
+            n_non_null_pred = 0
+            for p in gt_tool.parameters:
+                pr = res.parameters.get(p.name)
+                if pr is None:
                     continue
-                _local: Dict[Tuple[str, str], int] = {}
-                for _c in _cs:
-                    _ident = _call_identity(_c)
-                    _local[_ident] = _local.get(_ident, 0) + 1
-                    _multi_repr.setdefault(_ident, _c)
-                for _ident, _n in _local.items():
-                    if _n > _multi_counts.get(_ident, 0):
-                        _multi_counts[_ident] = _n
-            for _ident, _n in _multi_counts.items():
-                pred_calls.extend([_multi_repr[_ident]] * _n)
-            pred_n_calls_hist[len(pred_calls)] += 1
-            if len(pred_calls) == n_calls_gt:
-                call_count_correct += 1
+                src_type = str(getattr(pr, "source_type", "") or "")
+                buckets[src_type] += 1
+                confs.append(float(getattr(pr, "confidence", 0.0) or 0.0))
+                is_null = pr.value is None and src_type == "null"
+                present = pr.value is not None or is_null
+                pred_view[p.name] = {
+                    "present": present,
+                    "is_null": is_null,
+                    "value": None if is_null else pr.value,
+                }
+                if present:
+                    pred_args[p.name] = None if is_null else pr.value
+                    if not is_null:
+                        n_non_null_pred += 1
 
-            multi_call = n_calls_gt > 1
-            sample_extracted = False
-            sample_gt_params = 0
-            sample_groundable = 0
-            call0_exact = False
-            all_calls_exact = True
+            norm_pred = {kk: _norm(v) for kk, v in pred_args.items()}
 
-            for k, (ci, gt_call, gt_tool, res) in enumerate(per_call):
-                gt_args = dict(gt_call.arguments or {})
-                key_prefix = f"{ci}::" if multi_call else ""
+            if n_non_null_pred:
+                sample_extracted = True
+            exact_this_call = norm_pred == norm_gt
+            if k == 0:
+                call0_exact = exact_this_call
+            all_calls_exact = all_calls_exact and exact_this_call
 
-                # C1: the GT universe keeps explicitly-null args.
-                gt_universe = _gt_params(gt_args, gt_tool)
-                norm_gt = {kk: _norm(v) for kk, v in gt_universe.items()}
-
-                # C4: null-aware prediction view — "null" != "no prediction".
-                pred_view: Dict[str, Dict[str, Any]] = {}
-                pred_args: Dict[str, Any] = {}
-                n_non_null_pred = 0
-                for p in gt_tool.parameters:
-                    pr = res.parameters.get(p.name)
-                    if pr is None:
-                        continue
-                    src_type = str(getattr(pr, "source_type", "") or "")
-                    buckets[src_type] += 1
-                    confs.append(float(getattr(pr, "confidence", 0.0) or 0.0))
-                    is_null = pr.value is None and src_type == "null"
-                    present = pr.value is not None or is_null
-                    pred_view[p.name] = {
-                        "present": present,
-                        "is_null": is_null,
-                        "value": None if is_null else pr.value,
-                    }
-                    if present:
-                        pred_args[p.name] = None if is_null else pr.value
-                        if not is_null:
-                            n_non_null_pred += 1
-
-                norm_pred = {kk: _norm(v) for kk, v in pred_args.items()}
-
-                if n_non_null_pred:
-                    sample_extracted = True
-                exact_this_call = norm_pred == norm_gt
-                if k == 0:
-                    call0_exact = exact_this_call
-                all_calls_exact = all_calls_exact and exact_this_call
-
-                # Fix E3: per-call aligner-drift tripwire.
-                if s.stratum == Stratum.F:
-                    viol = e3_aligner_violation(s, gt_args, gt_tool, ci)
-                    if viol is not None:
-                        e3_violations += 1
-                        if len(e3_examples) < 10:
-                            tag = f"{ci}:" if multi_call else ""
-                            e3_examples.append(f"{s.sample_id}:{tag}{viol}")
-
-                # --- coverage / classification per param ---
-                param_classes: Dict[str, str] = {}
-                n_groundable_this_call = 0
-                n_gt_this_call = 0
-                for p in gt_tool.parameters:
-                    pn = p.name
-                    in_gt = pn in gt_universe
-                    if in_gt:
-                        n_gt_this_call += 1
-                        total_gt_params += 1
-                    is_groundable = param_is_groundable(s, pn, ci)
-                    if in_gt and is_groundable:
-                        n_groundable_this_call += 1
-                        groundable_gt_params += 1
-                    param_classes[pn] = classify_param(is_groundable)
-                sample_gt_params += n_gt_this_call
-                sample_groundable += n_groundable_this_call
-
-                # --- blended (all-params) scoring, same as the legacy notebook ---
-                for kk, v in norm_pred.items():
-                    if kk in norm_gt and norm_gt[kk] == v:
-                        all_tp += 1
-                    else:
-                        all_fp += 1
-                        if kk in norm_gt:
-                            # C4: a wrong value on a null GT param is a bad pointer.
-                            pointer_wrong += 1
-                for kk in norm_gt:
-                    if kk not in norm_pred:
-                        all_fn += 1
-
-                # --- single classified pass (S2): headline + refusal split ---
-                for p in gt_tool.parameters:
-                    pn = p.name
-                    cls = param_classes.get(pn, "unextractable")
-                    pv = pred_view.get(pn)
-                    present = pv is not None and bool(pv["present"])
-                    if pn not in norm_gt:
-                        # Predicted a param GT never mentions -> precision hit.
-                        if present and cls == "extractable":
-                            ex_fp += 1
-                        continue
-                    if cls != "extractable":
-                        if not present:
-                            refused_unextractable += 1
-                        continue
-                    gt_v = norm_gt[pn]
-                    if not present:
-                        ex_fn += 1
-                        missed_extractable += 1
-                        continue
-                    pred_v = None if pv["is_null"] else _norm(pv["value"])
-                    if pred_v == gt_v:
-                        ex_tp += 1
-                    else:
-                        ex_fp += 1
-                        ex_wrong += 1
-
-                # --- per-param Stratum-F table ---
-                # Multi-call rows are tagged ``call_index::param`` so two calls
-                # declaring the same param name stay distinguishable instead of
-                # being summed into one misleading row.
-                if s.stratum == Stratum.F:
-                    for p in gt_tool.parameters:
-                        pn = p.name
-                        st = per_param[key_prefix + pn]
-                        cls = param_classes.get(pn, "unextractable")
-                        if cls == "extractable":
-                            st["extractable"] += 1
-                        else:
-                            st["unextractable"] += 1
-                        if pn in norm_gt:
-                            st["gt"] += 1
-                        if pn in norm_pred:
-                            if pn in norm_gt and norm_pred[pn] == norm_gt[pn]:
-                                st["tp"] += 1
-                            else:
-                                st["fp"] += 1
-                        elif pn in norm_gt:
-                            st["fn"] += 1
-
-            if sample_extracted:
-                extracted += 1
-            if sample_gt_params > 0 and sample_groundable == sample_gt_params:
-                calls_all_groundable += 1
-
-            # J6: set-level exactness — every GT call matched exactly AND the
-            # predicted call count agrees (no missing call, no extra call).
-            # ``exact_payload_match_F`` stays call-0-only so its historical
-            # meaning is unchanged; this is the new headline that no longer
-            # penalises a row merely for having a second call.
-            set_exact = (
-                all_calls_exact
-                and len(per_call) == n_calls_gt
-                and len(pred_calls) == n_calls_gt
-            )
-            if set_exact:
-                call_set_exact += 1
-
+            # Fix E3: per-call aligner-drift tripwire.
             if s.stratum == Stratum.F:
-                stratum_f_total += 1
-                if call0_exact:
-                    stratum_f_exact += 1
-                if res0.hit:
-                    stratum_f_hits += 1
-                if bool(_feats.get("pointer_collapsed")):
-                    stratum_f_collapsed += 1
-                if set_exact:
-                    call_set_exact_F += 1
+                viol = e3_aligner_violation(s, gt_args, gt_tool, ci)
+                if viol is not None:
+                    e3_violations += 1
+                    if len(e3_examples) < 10:
+                        tag = f"{ci}:" if multi_call else ""
+                        e3_examples.append(f"{s.sample_id}:{tag}{viol}")
 
-            if limit is not None and total >= limit:
-                break
+            # --- coverage / classification per param ---
+            param_classes: Dict[str, str] = {}
+            n_groundable_this_call = 0
+            n_gt_this_call = 0
+            for p in gt_tool.parameters:
+                pn = p.name
+                in_gt = pn in gt_universe
+                if in_gt:
+                    n_gt_this_call += 1
+                    total_gt_params += 1
+                is_groundable = param_is_groundable(s, pn, ci)
+                if in_gt and is_groundable:
+                    n_groundable_this_call += 1
+                    groundable_gt_params += 1
+                param_classes[pn] = classify_param(is_groundable)
+            sample_gt_params += n_gt_this_call
+            sample_groundable += n_groundable_this_call
+
+            # --- blended (all-params) scoring, same as the legacy notebook ---
+            for kk, v in norm_pred.items():
+                if kk in norm_gt and norm_gt[kk] == v:
+                    all_tp += 1
+                else:
+                    all_fp += 1
+                    if kk in norm_gt:
+                        # C4: a wrong value on a null GT param is a bad pointer.
+                        pointer_wrong += 1
+            for kk in norm_gt:
+                if kk not in norm_pred:
+                    all_fn += 1
+
+            # --- single classified pass (S2): headline + refusal split ---
+            for p in gt_tool.parameters:
+                pn = p.name
+                cls = param_classes.get(pn, "unextractable")
+                pv = pred_view.get(pn)
+                present = pv is not None and bool(pv["present"])
+                if pn not in norm_gt:
+                    # Predicted a param GT never mentions -> precision hit.
+                    if present and cls == "extractable":
+                        ex_fp += 1
+                    continue
+                if cls != "extractable":
+                    if not present:
+                        refused_unextractable += 1
+                    continue
+                gt_v = norm_gt[pn]
+                if not present:
+                    ex_fn += 1
+                    missed_extractable += 1
+                    continue
+                pred_v = None if pv["is_null"] else _norm(pv["value"])
+                if pred_v == gt_v:
+                    ex_tp += 1
+                else:
+                    ex_fp += 1
+                    ex_wrong += 1
+
+            # --- per-param Stratum-F table ---
+            # Multi-call rows are tagged ``call_index::param`` so two calls
+            # declaring the same param name stay distinguishable instead of
+            # being summed into one misleading row.
+            if s.stratum == Stratum.F:
+                for p in gt_tool.parameters:
+                    pn = p.name
+                    st = per_param[key_prefix + pn]
+                    cls = param_classes.get(pn, "unextractable")
+                    if cls == "extractable":
+                        st["extractable"] += 1
+                    else:
+                        st["unextractable"] += 1
+                    if pn in norm_gt:
+                        st["gt"] += 1
+                    if pn in norm_pred:
+                        if pn in norm_gt and norm_pred[pn] == norm_gt[pn]:
+                            st["tp"] += 1
+                        else:
+                            st["fp"] += 1
+                    elif pn in norm_gt:
+                        st["fn"] += 1
+
+        if sample_extracted:
+            extracted += 1
+        if sample_gt_params > 0 and sample_groundable == sample_gt_params:
+            calls_all_groundable += 1
+
+        # J6: set-level exactness — every GT call matched exactly AND the
+        # predicted call count agrees (no missing call, no extra call).
+        # ``exact_payload_match_F`` stays call-0-only so its historical
+        # meaning is unchanged; this is the new headline that no longer
+        # penalises a row merely for having a second call.
+        set_exact = (
+            all_calls_exact
+            and len(per_call) == n_calls_gt
+            and len(pred_calls) == n_calls_gt
+        )
+        if set_exact:
+            call_set_exact += 1
+
+        if s.stratum == Stratum.F:
+            stratum_f_total += 1
+            if call0_exact:
+                stratum_f_exact += 1
+            if res0.hit:
+                stratum_f_hits += 1
+            if bool(_feats.get("pointer_collapsed")):
+                stratum_f_collapsed += 1
+            if set_exact:
+                call_set_exact_F += 1
+
+        if limit is not None and total >= limit:
+            break
 
     # --- metric computation ---
     ex_p = _ratio(ex_tp, ex_tp + ex_fp)

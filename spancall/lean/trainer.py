@@ -317,11 +317,15 @@ class LeanTrainer(BaseTrainer):
             _opt = getattr(config, "optimization", None) if config is not None else None
             use_binary_tool_head = bool(getattr(_opt, "use_binary_tool_head", False))
         self.use_binary_tool_head = bool(use_binary_tool_head)
-        self.loss_container = loss_container or LeanLossContainer(
-            tool_objective="binary" if self.use_binary_tool_head else "ce"
-        )
-
         opt_cfg = getattr(config, "optimization", None) if config is not None else None
+        self.loss_container = loss_container or LeanLossContainer(
+            lambda_pointer=float(getattr(opt_cfg, "lambda_pointer", 1.0)) if opt_cfg else 1.0,
+            lambda_tool=float(getattr(opt_cfg, "lambda_tool", 1.0)) if opt_cfg else 1.0,
+            lambda_tool_binary=float(getattr(opt_cfg, "lambda_tool_binary", 1.0)) if opt_cfg else 1.0,
+            tool_objective="binary" if self.use_binary_tool_head else "ce",
+            pointer_focal_gamma=float(getattr(opt_cfg, "pointer_focal_gamma", 0.0)) if opt_cfg else 0.0,
+            multi_pos_slot_weight=float(getattr(opt_cfg, "multi_pos_slot_weight", 1.0)) if opt_cfg else 1.0,
+        )
         self.lr_encoder = float(
             lr_encoder if lr_encoder is not None else (getattr(opt_cfg, "learning_rate_encoder", 2e-5) if opt_cfg else 2e-5)
         )

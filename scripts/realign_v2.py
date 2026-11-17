@@ -48,14 +48,23 @@ import json
 import shutil
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # Allow running from the repo root without installing the package.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from spancall.data.align import ReverseAligner
+from spancall.data.align import ReverseAligner, _infer_leaf_type
+from spancall.data.flatten import (
+    OBJECT_MAX_DEPTH,
+    flatten_args,
+    is_decomposable,
+    iter_balanced_spans,
+    object_paths_from_params,
+    safe_parse_literal,
+    validate_object_paths,
+)
 from spancall.data.partition import _enum_aware_default, sample_to_dict
-from spancall.data.schema import UnifiedSample
+from spancall.data.schema import ParameterSchema, ToolDefinition, UnifiedSample
 from span_template.stamp import check_stamp, write_stamp
 
 #: Splits the Lean flow reads. ``prepare_report.json`` is copied verbatim so the
@@ -160,6 +169,116 @@ def _summarize(before: List[UnifiedSample], after: List[UnifiedSample]) -> Dict[
     }
 
 
+def _is_literal_dict_in_text(text: str, val: Dict[str, Any]) -> bool:
+    for rs, re_ in iter_balanced_spans(text, "{", "}"):
+        parsed = safe_parse_literal(text[rs:re_])
+        if isinstance(parsed, dict) and parsed == val:
+            return True
+    return False
+
+
+def _upgrade_opaque_object_schemas(samples: List[UnifiedSample]) -> int:
+    """Decompose opaque ``object`` params in legacy v1/v2 splits using GT dict shapes.
+
+    v1 ``data/processed/*.jsonl`` stripped nested JSON-Schema ``properties`` from
+    ``object`` params. For tools whose GT dict arguments are decomposable
+    (depth <= ``OBJECT_MAX_DEPTH``) and not verbatim ``{...}`` literals in the
+    utterance, synthesize dotted scalar leaf ``ParameterSchema`` entries and
+    populate ``ToolDefinition.object_paths`` consistently across the split.
+    """
+    # Collect (tool_name, param_name) -> list of (flat_dict, is_literal)
+    observed: Dict[Tuple[str, str], List[Tuple[Dict[str, Any], bool]]] = {}
+    for s in samples:
+        tmap = {t.name: t for t in (s.tools or [])}
+        for c in (s.ground_truth_calls or []):
+            t = tmap.get(c.tool_name)
+            if t is None:
+                continue
+            pmap = {p.name: p for p in (t.parameters or [])}
+            for k, v in (c.arguments or {}).items():
+                p = pmap.get(k)
+                if p is None or (p.param_type or "").lower() != "object":
+                    continue
+                if t.object_paths and k in t.object_paths:
+                    continue
+                if isinstance(v, dict) and is_decomposable(v, max_depth=OBJECT_MAX_DEPTH):
+                    flat = flatten_args({k: v}, max_depth=OBJECT_MAX_DEPTH)
+                    is_lit = _is_literal_dict_in_text(s.utterance or "", v)
+                    observed.setdefault((t.name, k), []).append((flat, is_lit))
+
+    # Decide which (tool_name, param_name) pairs to decompose
+    leaf_specs: Dict[Tuple[str, str], List[ParameterSchema]] = {}
+    for key, entries in observed.items():
+        if all(is_lit for _, is_lit in entries):
+            # Verbatim {...} dict in utterance (e.g. merge_dictionaries): keep as object
+            continue
+        all_leaf_names: List[str] = []
+        seen_names: set = set()
+        sample_vals: Dict[str, Any] = {}
+        for flat, _ in entries:
+            for ln, lv in flat.items():
+                if ln not in seen_names:
+                    seen_names.add(ln)
+                    all_leaf_names.append(ln)
+                if ln not in sample_vals and lv is not None:
+                    sample_vals[ln] = lv
+        if not all_leaf_names:
+            continue
+        specs: List[ParameterSchema] = []
+        for ln in all_leaf_names:
+            ptype, items_type = _infer_leaf_type(sample_vals.get(ln))
+            is_req = all(ln in flat for flat, _ in entries)
+            specs.append(
+                ParameterSchema(
+                    name=ln,
+                    description="",
+                    param_type=ptype,
+                    required=is_req,
+                    items_type=items_type,
+                )
+            )
+        leaf_specs[key] = specs
+
+    if not leaf_specs:
+        return 0
+
+    upgraded = 0
+    for s in samples:
+        new_tools: List[ToolDefinition] = []
+        changed_sample = False
+        for t in (s.tools or []):
+            t_changed = False
+            new_params: List[ParameterSchema] = []
+            for p in (t.parameters or []):
+                specs = leaf_specs.get((t.name, p.name))
+                if specs is not None:
+                    new_params.extend(specs)
+                    t_changed = True
+                else:
+                    new_params.append(p)
+            if t_changed:
+                obj_paths = object_paths_from_params(new_params) or None
+                if obj_paths and validate_object_paths([q.name for q in new_params], obj_paths):
+                    new_tools.append(t)
+                else:
+                    new_tools.append(
+                        ToolDefinition(
+                            name=t.name,
+                            description=t.description,
+                            parameters=new_params,
+                            risk_tier=t.risk_tier,
+                            object_paths=obj_paths,
+                        )
+                    )
+                    changed_sample = True
+                    upgraded += 1
+            else:
+                new_tools.append(t)
+        if changed_sample:
+            s.tools = new_tools
+    return upgraded
+
+
 def main() -> None:
     args = parse_args()
     src_dir = Path(args.src_dir)
@@ -182,6 +301,9 @@ def main() -> None:
             print(f"[realign_v2] skip {name}: {src} not found")
             continue
         before = _read_split(src, args.limit)
+        n_upg = _upgrade_opaque_object_schemas(before)
+        if n_upg:
+            print(f"[realign_v2] {name}: upgraded {n_upg} opaque object tool schema(s) into dotted leaves")
         after = [aligner.align(s) for s in before]
         staged[name] = after
         reports[name] = _summarize(before, after)

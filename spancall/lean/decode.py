@@ -367,27 +367,19 @@ class LeanJointDecoder(BaseJointDecoder):
     def select_list_choices(
         self,
         entries: Sequence[Any],
-        max_items: int = 8,
-        # 0.25 (was 0.5): with the uniform element CE the groupkey-summed
-        # probs of equal-likelihood list elements can sit just under 0.5x of
-        # the top group when the top group absorbed extra near-duplicate
-        # spans; 0.25 keeps inertness on single-dominant checkpoints (floor
-        # = 0.25 * 0.9 still far above the ~0.05 noise mass) while capturing
-        # uniform multi-element distributions.
+        max_items: int = 32,
         rel_threshold: float = 0.25,
+        step_ratio: float = 0.35,
     ) -> List[LeanValueChoice]:
-        """A-1 (multi-span lists): element choices for an array-typed param.
+        """A-1 / v3.1 (multi-span lists): element choices for an array-typed param.
 
-        The joint decoder assigns ONE winner per param, which reduces a GT
-        list like ``['chicken','broccoli','cheese']`` to its first element
-        (the single positive slot the old ``max_pos=1`` training exposed).
-        After multi-positive array training, the element spans share the
-        softmax mass; this method unions the top non-conflicting spans whose
-        probability stays within ``rel_threshold`` of the winner.
-
-        Falls back to the single winner (list of length 1) when the
-        distribution does not support multiple elements, so it is inert on
-        checkpoints trained with the old single-positive supervision.
+        Supports dual-mode array extraction:
+        - If the top choice is a whole-list bracketed literal (``[...]``), return
+          it alone so nested/long lists cast cleanly without duplicate elements.
+        - Otherwise, union top non-overlapping element spans (strictly disjoint,
+          no nested container spans) above both ``top.prob * rel_threshold`` and
+          ``prev.prob * step_ratio``, then sort by document order so mention
+          sequence is preserved.
         """
         cands = [_coerce_entry(e) for e in entries]
         choices = self._collapse(cands, max(2 * max_items, self.top_k))
@@ -396,24 +388,56 @@ class LeanJointDecoder(BaseJointDecoder):
         top = choices[0]
         if getattr(top, "region", "") == "null":
             return [top]
+
+        def _is_bracket_lit(val: Any) -> bool:
+            if not isinstance(val, str):
+                return False
+            s = val.strip()
+            return len(s) >= 2 and s.startswith("[") and s.endswith("]")
+
+        if _is_bracket_lit(top.value):
+            return [top]
+
         selected: List[LeanValueChoice] = [top]
-        floor = float(top.prob) * float(rel_threshold)
+        floor = max(float(top.prob) * float(rel_threshold), 1.0 / max(2 * max_items, 1))
         for v in choices[1:]:
             if len(selected) >= max_items:
                 break
-            if float(v.prob) < floor:
+            vp = float(v.prob)
+            if vp < floor:
+                break
+            if step_ratio > 0 and vp < float(selected[-1].prob) * float(step_ratio):
                 break
             if getattr(v, "region", "") == "null":
                 continue
+            if _is_bracket_lit(v.value):
+                continue
             v_span = getattr(v, "span", None)
+            v_reg = getattr(v, "region", "")
             overlapping = False
             for s in selected:
                 s_span = getattr(s, "span", None)
-                if v_span is not None and s_span is not None and self._conflict(v, s):
+                s_reg = getattr(s, "region", "")
+                if (
+                    v_span is not None
+                    and s_span is not None
+                    and v_reg == s_reg
+                    and v_span[0] < s_span[1]
+                    and s_span[0] < v_span[1]
+                ):
                     overlapping = True
                     break
             if not overlapping and _groupkey(v.value) != _groupkey(top.value):
                 selected.append(v)
+
+        if len(selected) > 1:
+            selected.sort(
+                key=lambda c: (
+                    0 if getattr(c, "region", "") in ("utterance", "recent") else 1,
+                    c.span[0] if getattr(c, "span", None) is not None else 0,
+                    c.span[1] if getattr(c, "span", None) is not None else 0,
+                )
+            )
         return selected
 
     def _conflict(self, v1: LeanValueChoice, v2: LeanValueChoice) -> bool:

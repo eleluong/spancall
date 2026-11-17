@@ -31,6 +31,8 @@ anchor and one pointer slot; deeper trees stay whole and therefore remain
 
 from __future__ import annotations
 
+import ast
+import json
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 #: Maximum number of dotted segments a leaf may have (``filters.a.b`` == 3).
@@ -376,3 +378,67 @@ def split_flat_payload(
         else:
             whole[name] = value
     return leaves, whole
+
+
+def iter_balanced_spans(text: str, open_ch: str, close_ch: str) -> List[Tuple[int, int]]:
+    """Return ``(start, end)`` char spans of top-level balanced ``open_ch...close_ch`` blocks.
+
+    Tracks single/double-quoted strings (with backslash escapes) only *inside*
+    an open block so English apostrophes outside delimiters never swallow a
+    subsequent literal. If an opening delimiter is never closed before EOF,
+    scanning resumes right after it so later valid blocks are still found.
+    """
+    if not text:
+        return []
+    spans: List[Tuple[int, int]] = []
+    n = len(text)
+    i = 0
+    while i < n:
+        if text[i] != open_ch:
+            i += 1
+            continue
+        start = i
+        depth = 1
+        in_str: Optional[str] = None
+        j = i + 1
+        while j < n and depth > 0:
+            c = text[j]
+            if in_str is not None:
+                if c == "\\":
+                    j += 2
+                    continue
+                if c == in_str:
+                    in_str = None
+            else:
+                if c == '"' or c == "'":
+                    in_str = c
+                elif c == open_ch:
+                    depth += 1
+                elif c == close_ch:
+                    depth -= 1
+                    if depth == 0:
+                        spans.append((start, j + 1))
+                        break
+            j += 1
+        if depth == 0:
+            i = j + 1
+        else:
+            i = start + 1
+    return spans
+
+
+def safe_parse_literal(text: str) -> Optional[Any]:
+    """Parse a JSON or Python-literal string (e.g. ``{'a': 1}`` or ``[1, 2]``)."""
+    if not text or not isinstance(text, str):
+        return None
+    s = text.strip()
+    if not s:
+        return None
+    try:
+        return json.loads(s)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+    try:
+        return ast.literal_eval(s)
+    except (ValueError, SyntaxError, TypeError):
+        return None

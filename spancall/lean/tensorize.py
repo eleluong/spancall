@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 
 from spancall.data.align import tooldef_to_template_tool
+from spancall.data.flatten import safe_parse_literal
 from spancall.data.schema import (
     GroundTruthCall,
     SpanTarget,
@@ -915,11 +916,16 @@ def tensorize_sample_lean(
                     # mirroring the aligner's own "every equal-valued entry is a
                     # positive" rule for dates. Do NOT break at the first hit.
                     t_str = str(t.canonical_value).strip().lower()
+                    t_is_struct = isinstance(t.canonical_value, (dict, list))
                     for ci, c in enumerate(cands):
                         if c.canon_value is None:
                             continue
                         c_str = str(c.canon_value).strip().lower()
-                        if c.canon_value == t.canonical_value or c_str == t_str:
+                        matched_val = (c.canon_value == t.canonical_value or c_str == t_str)
+                        if not matched_val and t_is_struct and isinstance(c.canon_value, str):
+                            parsed_c = safe_parse_literal(c.canon_value)
+                            matched_val = (type(parsed_c) is type(t.canonical_value) and parsed_c == t.canonical_value)
+                        if matched_val:
                             if ci not in matched_cis:
                                 matched_cis.append(ci)
                             found = True

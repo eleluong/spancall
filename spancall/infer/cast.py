@@ -33,6 +33,7 @@ from datetime import date as _date_type
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from spancall.data.flatten import safe_parse_literal
 from spancall.data.schema import ParameterSchema, ToolDefinition
 
 # --------------------------------------------------------------------------- #
@@ -378,6 +379,24 @@ class StrictTypeCaster(BaseTypeCaster):
     def _array(self, raw_text: str, ps: ParameterSchema) -> Tuple[bool, Any]:
         t = raw_text.strip()
         if t.startswith("[") and t.endswith("]"):
+            parsed = safe_parse_literal(t)
+            if isinstance(parsed, list):
+                if any(isinstance(el, (list, dict)) for el in parsed):
+                    return True, parsed
+                items_type = (ps.items_type or "string").lower()
+                item_schema = replace(ps, param_type=items_type)
+                out_lit: List[Any] = []
+                lit_ok = True
+                for el in parsed:
+                    ok, v = self.cast_canonical(el, item_schema)
+                    if not ok and isinstance(el, str):
+                        ok, v = self._cast(el, item_schema)
+                    if not ok:
+                        lit_ok = False
+                        break
+                    out_lit.append(v)
+                if lit_ok:
+                    return True, out_lit
             t = t[1:-1].strip()
         # Handle natural conjunctions like ", and ", ", or ", " and ", " or "
         t = re.sub(r",\s*(?:and|or)\s+", ",", t, flags=re.IGNORECASE)
@@ -398,14 +417,8 @@ class StrictTypeCaster(BaseTypeCaster):
 
     @staticmethod
     def _object(raw_text: str, ps: ParameterSchema) -> Tuple[bool, Any]:
-        # v1: strict JSON object parse only; anything else abstains.
-        import json
-
-        t = raw_text.strip()
-        try:
-            obj = json.loads(t)
-        except ValueError:
-            return False, None
+        # Strict JSON or Python-literal dict parse; anything else abstains.
+        obj = safe_parse_literal(raw_text)
         if not isinstance(obj, dict):
             return False, None
         return True, obj

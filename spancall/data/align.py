@@ -42,7 +42,15 @@ from span_template.template import (
 )
 
 from spancall.data.base import BaseAligner
-from spancall.data.flatten import flatten_args
+from spancall.data.flatten import (
+    OBJECT_MAX_DEPTH,
+    PATH_SEP,
+    flatten_args,
+    is_decomposable,
+    iter_balanced_spans,
+    object_paths_from_params,
+    safe_parse_literal,
+)
 from spancall.data.schema import (
     GroundTruthCall,
     ParameterSchema,
@@ -220,6 +228,45 @@ def _is_word_char(ch: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _infer_leaf_type(value: Any) -> Tuple[str, Optional[str]]:
+    if isinstance(value, bool):
+        return "boolean", None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return "integer", None
+    if isinstance(value, float):
+        return "number", None
+    if isinstance(value, str):
+        return "string", None
+    if isinstance(value, list):
+        return "array", _element_type(value)
+    if isinstance(value, dict):
+        return "object", None
+    return "string", None
+
+
+def _expand_inferred_arg(
+    prefix: str,
+    value: Any,
+    out: List[ParameterSchema],
+    depth: int = 1,
+    max_depth: int = OBJECT_MAX_DEPTH,
+) -> None:
+    if isinstance(value, dict) and depth < int(max_depth) and is_decomposable(value, max_depth=max_depth - depth + 1):
+        for sub_k, sub_v in value.items():
+            _expand_inferred_arg(f"{prefix}{PATH_SEP}{sub_k}", sub_v, out, depth + 1, max_depth)
+        return
+    ptype, items_type = _infer_leaf_type(value)
+    out.append(
+        ParameterSchema(
+            name=str(prefix),
+            description="",
+            param_type=ptype,
+            required=True,
+            items_type=items_type,
+        )
+    )
+
+
 def _infer_schema_from_arguments(
     gt_call: GroundTruthCall,
     tool_def: ToolDefinition,
@@ -228,44 +275,24 @@ def _infer_schema_from_arguments(
 
     Returns ``(tool_def, changed)`` — ``changed=True`` means the tool gained the
     inferred schema (used when the synthetic ``json_output`` tool has no params).
-    Python scalar types map to schema types: ``str`` -> string, ``int`` -> integer,
-    ``float`` -> number, ``bool`` -> boolean, ``list`` -> array, ``dict`` -> object.
+    Decomposable nested dicts (depth <= ``OBJECT_MAX_DEPTH``) are expanded into
+    dotted scalar leaves and recorded in ``tool_def.object_paths``.
     """
     if tool_def.parameters:
         return tool_def, False
     args = gt_call.arguments or {}
     params: List[ParameterSchema] = []
     for key, value in args.items():
-        if isinstance(value, bool):
-            ptype, items_type = "boolean", None
-        elif isinstance(value, int) and not isinstance(value, bool):
-            ptype, items_type = "integer", None
-        elif isinstance(value, float):
-            ptype, items_type = "number", None
-        elif isinstance(value, str):
-            ptype, items_type = "string", None
-        elif isinstance(value, list):
-            ptype, items_type = "array", _element_type(value)
-        elif isinstance(value, dict):
-            ptype, items_type = "object", None
-        else:
-            ptype, items_type = "string", None
-        params.append(
-            ParameterSchema(
-                name=str(key),
-                description="",
-                param_type=ptype,
-                required=True,
-                items_type=items_type,
-            )
-        )
+        _expand_inferred_arg(str(key), value, params, depth=1, max_depth=OBJECT_MAX_DEPTH)
     if not params:
         return tool_def, False
+    object_paths = object_paths_from_params(params) or None
     tool_def = ToolDefinition(
         name=tool_def.name,
         description=tool_def.description,
         parameters=params,
         risk_tier=tool_def.risk_tier,
+        object_paths=object_paths,
     )
     return tool_def, True
 
@@ -642,8 +669,12 @@ class ReverseAligner(BaseAligner):
         if p.param_type == "array" and isinstance(val, list):
             return self._align_array(p, val, output, base, sample)
 
-        # Case G: opaque / undecomposed object (free-form or depth > OBJECT_MAX_DEPTH)
+        # Case G: literal object span in context, else opaque OBJECT_UNDECOMPOSED
         if p.param_type == "object" or isinstance(val, Mapping):
+            if isinstance(val, Mapping):
+                lit_targets = self._align_literal_block(p, dict(val), output, "{", "}")
+                if lit_targets:
+                    return lit_targets, True, None
             return self._fail(p, "OBJECT_UNDECOMPOSED")
 
         # Case E: scalar string / integer / number
@@ -707,6 +738,46 @@ class ReverseAligner(BaseAligner):
             return targets, True, None
         return self._fail(p, "OFF_WINDOW")
 
+    def _align_literal_block(
+        self,
+        p: ParameterSchema,
+        val: Any,
+        output: SpanTemplateOutput,
+        open_ch: str,
+        close_ch: str,
+    ) -> List[SpanTarget]:
+        """Match a verbatim ``{...}`` or ``[...]`` literal in utterance or recent_context."""
+        targets: List[SpanTarget] = []
+        utt = _find_utterance_entry(output)
+        if utt is not None and isinstance(utt.value, str):
+            for rs, re_ in iter_balanced_spans(utt.value, open_ch, close_ch):
+                parsed = safe_parse_literal(utt.value[rs:re_])
+                if type(parsed) is type(val) and parsed == val:
+                    targets.append(self._utterance_target(p, utt, rs, re_, val))
+        if not targets:
+            for e in output.entries:
+                if e.segment != "recent" or not e.selectable or e.kind != "string":
+                    continue
+                e_val = str(e.value)
+                for rs, re_ in iter_balanced_spans(e_val, open_ch, close_ch):
+                    parsed = safe_parse_literal(e_val[rs:re_])
+                    if type(parsed) is type(val) and parsed == val:
+                        e_text = getattr(e, "text", None) or e_val
+                        idx = e_text.find(e_val[rs:re_]) if e_text != e_val else rs
+                        cs = e.char_start + (idx if idx >= 0 else rs)
+                        ce = cs + (re_ - rs)
+                        targets.append(
+                            SpanTarget(
+                                param_name=p.name,
+                                target_type="recent_ctx",
+                                char_start=cs,
+                                char_end=ce,
+                                ctx_key=e.key,
+                                canonical_value=val,
+                            )
+                        )
+        return targets
+
     def _align_array(
         self,
         p: ParameterSchema,
@@ -715,17 +786,43 @@ class ReverseAligner(BaseAligner):
         base: date,
         sample: UnifiedSample,
     ) -> Tuple[List[SpanTarget], bool, Optional[str]]:
-        """Case F: align every element via Cases B–E; all elements must align."""
+        """Case F: dual-mode array alignment (whole-list literal or element-wise)."""
+        sample.metadata.setdefault("list_sizes", {})[p.name] = len(val)
+        if not val:
+            lit = self._align_literal_block(p, val, output, "[", "]")
+            if lit:
+                return lit, True, None
+            if not p.required or "null" in (p.param_type or "").lower():
+                return [self._null_target(p)], True, None
+            return self._fail(p, "OFF_WINDOW")
+
+        # Nested lists (e.g. matrices [[1, 2], [3, 4]]) or lists of dicts must
+        # match as whole-list literals rather than flattened scalar elements.
+        if any(isinstance(v_i, (list, Mapping)) for v_i in val):
+            lit = self._align_literal_block(p, val, output, "[", "]")
+            if lit:
+                return lit, True, None
+            return self._fail(p, "OFF_WINDOW")
+
         all_targets: List[SpanTarget] = []
+        elem_ok = True
+        fail_reason: Optional[str] = None
         for v_i in val:
             sub_p = _element_param(p, v_i)
             targets, ok, reason = self._align_value(sub_p, v_i, output, base, sample)
             if not ok or not targets:
-                sample.metadata.setdefault("list_sizes", {})[p.name] = len(val)
-                return self._fail(p, reason or "OFF_WINDOW")
+                elem_ok = False
+                fail_reason = reason
+                break
             all_targets.extend(targets)
-        sample.metadata.setdefault("list_sizes", {})[p.name] = len(val)
-        return all_targets, True, None
+        if elem_ok and all_targets:
+            return all_targets, True, None
+
+        # Fallback: whole-list bracketed literal in utterance/recent
+        lit = self._align_literal_block(p, val, output, "[", "]")
+        if lit:
+            return lit, True, None
+        return self._fail(p, fail_reason or "OFF_WINDOW")
 
     # ----------------------------------------------------------- recent ctx
     def _match_recent(

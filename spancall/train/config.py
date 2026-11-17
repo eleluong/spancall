@@ -92,6 +92,12 @@ class OptimizationConfig:
     early_stopping_patience: int = 0
     early_stopping_min_delta: float = 1e-4
     restore_best_on_exit: bool = True
+    # v3.1: favor H3 pointer training over already-saturated H1 tool selection
+    lambda_pointer: float = 2.0
+    lambda_tool: float = 0.2
+    lambda_tool_binary: float = 0.2
+    pointer_focal_gamma: float = 1.0
+    multi_pos_slot_weight: float = 1.5
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> "OptimizationConfig":

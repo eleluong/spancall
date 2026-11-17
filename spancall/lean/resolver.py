@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -1163,6 +1165,47 @@ class LeanResolver(BaseResolver):
         anchors, per_param_scores = self._score_parameters(output, H, per_token, cand_masks, schema=schema)
         t_heads = time.perf_counter()
 
+        return self._finalize_param_resolve(
+            schema=schema,
+            output=output,
+            render_schemas=render_schemas,
+            cand_masks=cand_masks,
+            _ctx=_ctx,
+            anchors=anchors,
+            per_param_scores=per_param_scores,
+            parity_absolutes=parity_absolutes,
+            parity_unresolvable=parity_unresolvable,
+            parity_counters=parity_counters,
+            ctx_features=ctx_features,
+            t0=t0,
+            t_pre=t_pre,
+            t_mask=t_mask,
+            t_enc=t_enc,
+            t_heads=t_heads,
+        )
+
+    def _finalize_param_resolve(
+        self,
+        *,
+        schema: ToolDefinition,
+        output: SpanTemplateOutput,
+        render_schemas: Sequence[ToolDefinition],
+        cand_masks: Dict[str, Dict[str, Any]],
+        _ctx: Any,
+        anchors: List[Tuple[str, int]],
+        per_param_scores: Dict[str, List[Tuple[Any, float]]],
+        parity_absolutes: Dict[str, List[Tuple[int, int]]],
+        parity_unresolvable: Dict[str, int],
+        parity_counters: Dict[str, int],
+        ctx_features: Dict[str, Any],
+        t0: float,
+        t_pre: float,
+        t_mask: float,
+        t_enc: float,
+        t_heads: float,
+    ) -> LeanResolveResult:
+        """Shared decode -> cast -> unflatten -> validate -> gate -> telemetry tail."""
+
         if schema.parameters and not anchors:
             reason = "no_param_anchors"
             req = [p.name for p in schema.parameters if p.required]
@@ -1223,6 +1266,30 @@ class LeanResolver(BaseResolver):
                     per_param_scores.get(p.name, [])
                 )
                 if elem_choices and getattr(elem_choices[0], "region", "") != "null":
+                    # Whole-list bracketed literal: cast directly as array `p`
+                    # instead of wrapping into a 1-element list via `elem_param`.
+                    if (
+                        len(elem_choices) == 1
+                        and isinstance(getattr(elem_choices[0], "value", None), str)
+                        and elem_choices[0].value.strip().startswith("[")
+                        and elem_choices[0].value.strip().endswith("]")
+                    ):
+                        ok_w, v_w, _rw = self.caster.cast_choice(elem_choices[0], p, output)
+                        if ok_w and isinstance(v_w, list):
+                            ec0 = elem_choices[0]
+                            span0 = getattr(ec0, "span", None)
+                            payload[p.name] = v_w
+                            payload_partial[p.name] = v_w
+                            parameters[p.name] = LeanParameterResolution(
+                                name=p.name,
+                                value=v_w,
+                                confidence=float(getattr(ec0, "prob", 0.0)),
+                                margin=float(margins.get(p.name, 0.0)),
+                                source_type=str(getattr(ec0, "region", "value")),
+                                char_span=(int(span0[0]), int(span0[1])) if span0 is not None else None,
+                                p_abstain=0.0,
+                            )
+                            continue
                     items: List[Any] = []
                     spans: List[Tuple[int, int]] = []
                     src_regions: List[str] = []
@@ -1871,3 +1938,564 @@ class LeanResolver(BaseResolver):
             ranked = sorted(groups.values(), reverse=True)
             margins[name] = ranked[0] - (ranked[1] if len(ranked) > 1 else 0.0)
         return margins
+
+    # ------------------------------------------------------------------ #
+    # Batched & Parallel Evaluation Inference (v3.1)
+    # ------------------------------------------------------------------ #
+
+    def _run_encoded_batches(
+        self,
+        prepared: Sequence[Tuple[int, List[int]]],
+        on_encoded: Any,
+        batch_size: int = 32,
+        max_tokens_per_batch: int = 16384,
+    ) -> None:
+        """Length-sort, pad, and batch-encode ``(orig_idx, ids)`` items on the backbone."""
+        if not prepared or self.model is None:
+            return
+        backbone = self.model.backbone if self.model is not None else self.encoder
+        device = next(backbone.parameters()).device
+        pad_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_id is None:
+            pad_id = 0
+        head_p = next(
+            (p for n, p in self.model.named_parameters() if not n.startswith(("encoder.", "backbone."))),
+            None,
+        )
+        head_dtype = head_p.dtype if head_p is not None else None
+
+        ordered = sorted(prepared, key=lambda x: len(x[1]))
+        bs = max(1, int(batch_size))
+        tok_cap = max(int(max_tokens_per_batch), self.max_seq_len)
+
+        batches: List[List[Tuple[int, List[int]]]] = []
+        cur: List[Tuple[int, List[int]]] = []
+        cur_max = 0
+        for item in ordered:
+            L = len(item[1])
+            new_max = max(cur_max, L)
+            if cur and (len(cur) >= bs or (len(cur) + 1) * new_max > tok_cap):
+                batches.append(cur)
+                cur = [item]
+                cur_max = L
+            else:
+                cur.append(item)
+                cur_max = new_max
+        if cur:
+            batches.append(cur)
+
+        use_bf16 = str(device).startswith("cuda") and torch.cuda.is_available()
+        amp_ctx = (
+            torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+            if use_bf16
+            else nullcontext()
+        )
+        with torch.inference_mode():
+            for grp in batches:
+                max_l = max(len(ids) for _, ids in grp)
+                B = len(grp)
+                input_ids = torch.full((B, max_l), int(pad_id), dtype=torch.long, device=device)
+                attn_mask = torch.zeros((B, max_l), dtype=torch.long, device=device)
+                for b_i, (_, ids) in enumerate(grp):
+                    L = len(ids)
+                    input_ids[b_i, :L] = torch.tensor(ids, dtype=torch.long, device=device)
+                    attn_mask[b_i, :L] = 1
+                with amp_ctx:
+                    H_batch = backbone(input_ids, attn_mask)
+                if head_dtype is not None and H_batch.dtype != head_dtype:
+                    H_batch = H_batch.to(dtype=head_dtype)
+                for b_i, (orig_idx, ids) in enumerate(grp):
+                    on_encoded(orig_idx, H_batch[b_i : b_i + 1, : len(ids)])
+
+    def predict_tools_batch(
+        self,
+        items: Sequence[Tuple[List[ToolDefinition], str, Optional[List[Dict[str, Any]]], Optional[Any]]],
+        *,
+        batch_size: int = 32,
+        num_workers: int = 4,
+    ) -> List[Dict[str, Any]]:
+        """Batched equivalent of :meth:`predict_tool` with parallel CPU prep."""
+        n = len(items)
+        results: List[Optional[Dict[str, Any]]] = [None] * n
+        obj_mode = getattr(self, "tool_objective", "ce")
+        thresh_val = float(self.tool_call_threshold) if obj_mode == "binary" else None
+
+        to_prep: List[Tuple[int, List[ToolDefinition], str, Optional[List[Dict[str, Any]]], Optional[Any]]] = []
+        for idx, (cands, utt, rc, now) in enumerate(items):
+            if not cands:
+                results[idx] = {
+                    "tool_name": None, "tool_idx": -1, "tool_prob": 0.0, "tool_margin": 0.0,
+                    "tool_scores": [], "gated_hit": False, "abstain_reason": "no_candidates",
+                    "tool_objective": obj_mode, "tool_call_threshold": None,
+                }
+            elif len(cands) == 1:
+                results[idx] = {
+                    "tool_name": cands[0].name, "tool_idx": 0, "tool_prob": 1.0, "tool_margin": 1.0,
+                    "tool_scores": [(cands[0].name, 1.0)], "gated_hit": True, "abstain_reason": None,
+                    "tool_objective": obj_mode, "tool_call_threshold": None,
+                }
+            elif self.model is None:
+                results[idx] = {
+                    "tool_name": None, "tool_idx": -1, "tool_prob": 0.0, "tool_margin": 0.0,
+                    "tool_scores": [], "gated_hit": False, "abstain_reason": "no_model_loaded",
+                    "tool_objective": obj_mode, "tool_call_threshold": None,
+                }
+            else:
+                to_prep.append((idx, cands, utt, rc, now))
+
+        if not to_prep:
+            return [r for r in results if r is not None]
+
+        eff_budget = min(self.context_budget_tokens, max(64, self.max_seq_len // 2))
+
+        def _prep_one(arg: Tuple[int, List[ToolDefinition], str, Optional[List[Dict[str, Any]]], Optional[Any]]):
+            idx, cands, utt, rc, now = arg
+            selected_recent, _ = select_recent_context(
+                rc or [], cands, k_recent=self.k_recent,
+                context_budget_tokens=eff_budget, tokenizer=self.tokenizer,
+            )
+            try:
+                output = build_input_multi(
+                    [tooldef_to_template_tool(s) for s in cands],
+                    utt, recent_context=_to_recent_rows(selected_recent), now=_to_date(now),
+                )
+                ids, per_token = tokenize_offset_mapping(output, self.tokenizer, max_len=self.max_seq_len)
+                if len(ids) > self.max_seq_len:
+                    raise SanitizeError("overflow", f"sequence {len(ids)} tokens > L_max={self.max_seq_len}")
+                return idx, cands, output, ids, per_token, None
+            except SanitizeError as exc:
+                return idx, cands, None, None, None, str(exc)
+
+        if num_workers > 1 and len(to_prep) > 1:
+            with ThreadPoolExecutor(max_workers=num_workers) as pool:
+                prepped = list(pool.map(_prep_one, to_prep))
+        else:
+            prepped = [_prep_one(x) for x in to_prep]
+
+        enc_queue: List[Tuple[int, List[int]]] = []
+        meta_by_idx: Dict[int, Tuple[List[ToolDefinition], SpanTemplateOutput, Sequence[Optional[Entry]]]] = {}
+        for idx, cands, output, ids, per_token, err in prepped:
+            if err is not None or ids is None or output is None or per_token is None:
+                results[idx] = {
+                    "tool_name": None, "tool_idx": -1, "tool_prob": 0.0, "tool_margin": 0.0,
+                    "tool_scores": [], "gated_hit": False, "abstain_reason": f"sanitize: {err}",
+                    "tool_scores_reason": "sanitize_error",
+                    "tool_objective": obj_mode, "tool_call_threshold": thresh_val,
+                }
+            else:
+                meta_by_idx[idx] = (cands, output, per_token)
+                enc_queue.append((idx, ids))
+
+        def _on_enc(idx: int, H_k: torch.Tensor) -> None:
+            cands, output, per_token = meta_by_idx[idx]
+            choices = self._tool_scores(output, H_k, per_token)
+            if not choices:
+                results[idx] = {
+                    "tool_name": None, "tool_idx": -1, "tool_prob": 0.0, "tool_margin": 0.0,
+                    "tool_scores": [], "gated_hit": False,
+                    "abstain_reason": f"no_tool_scores:{self.last_tool_scores_reason}",
+                    "tool_scores_reason": self.last_tool_scores_reason,
+                    "tool_objective": obj_mode, "tool_call_threshold": thresh_val,
+                }
+                return
+            winner_name, winner_p = choices[0]
+            margin = winner_p - (choices[1][1] if len(choices) > 1 else 0.0)
+            winner_idx = next((i for i, s in enumerate(cands) if s.name == winner_name), 0)
+            gated_out = obj_mode == "binary" and float(winner_p) < float(self.tool_call_threshold)
+            results[idx] = {
+                "tool_name": winner_name, "tool_idx": winner_idx,
+                "tool_prob": float(winner_p), "tool_margin": float(margin),
+                "tool_scores": choices, "gated_hit": not gated_out,
+                "abstain_reason": "tool_below_threshold" if gated_out else None,
+                "tool_scores_reason": self.last_tool_scores_reason,
+                "tool_objective": obj_mode, "tool_call_threshold": thresh_val,
+            }
+
+        self._run_encoded_batches(enc_queue, _on_enc, batch_size=batch_size)
+        return [r for r in results if r is not None]
+
+    def _prep_step2_item(
+        self,
+        key: Any,
+        schema: ToolDefinition,
+        utterance: str,
+        recent_context: Optional[List[Dict[str, Any]]],
+        now: Optional[Any],
+        context_schemas: Optional[Sequence[ToolDefinition]],
+        parity_spans: Optional[Dict[str, Sequence[Any]]],
+        protect_parity_spans: bool,
+    ) -> Dict[str, Any]:
+        t0 = time.perf_counter()
+        render_schemas: List[ToolDefinition] = list(context_schemas) if context_schemas else [schema]
+        if not any(s.name == schema.name for s in render_schemas):
+            render_schemas = [schema, *render_schemas]
+        eff_budget = min(self.context_budget_tokens, max(64, self.max_seq_len // 2))
+        selected_recent, ctx_features = select_recent_context(
+            recent_context or [], render_schemas, k_recent=self.k_recent,
+            context_budget_tokens=eff_budget, tokenizer=self.tokenizer,
+        )
+        ctx_features = dict(ctx_features)
+        ctx_features["recent_budget_tokens"] = int(self.context_budget_tokens)
+        ctx_features["recent_budget_effective"] = int(eff_budget)
+        ctx_features["recent_budget_clamped"] = bool(eff_budget < int(self.context_budget_tokens))
+        try:
+            output = build_input_multi(
+                [tooldef_to_template_tool(s) for s in render_schemas],
+                utterance, recent_context=_to_recent_rows(selected_recent), now=_to_date(now),
+            )
+            parity_absolutes, parity_unresolvable, parity_counters = (
+                _absolutize_parity_spans(output, parity_spans or {})
+            )
+            protected_spans = parity_absolutes if protect_parity_spans else None
+            t_pre = time.perf_counter()
+            ids, per_token, token_offsets = tokenize_legend(
+                output, self.tokenizer, max_len=self.max_seq_len
+            )
+            if len(ids) > self.max_seq_len:
+                raise SanitizeError("overflow", f"sequence {len(ids)} tokens > L_max={self.max_seq_len}")
+            cand_masks, _ctx = self._candidate_masks(
+                output, output.text, [schema], token_offsets=token_offsets,
+                protected_spans=protected_spans,
+            )
+            t_mask = time.perf_counter()
+            ctx_features["render_T"] = int(sum(
+                1 for e in output.entries
+                if getattr(e, "kind", None) == "bridge_text" and getattr(e, "tool", None) is not None
+            ))
+            return {
+                "key": key, "ok": True, "schema": schema, "output": output,
+                "render_schemas": render_schemas, "ids": ids, "per_token": per_token,
+                "cand_masks": cand_masks, "_ctx": _ctx,
+                "parity_absolutes": parity_absolutes, "parity_unresolvable": parity_unresolvable,
+                "parity_counters": parity_counters, "ctx_features": ctx_features,
+                "t0": t0, "t_pre": t_pre, "t_mask": t_mask,
+            }
+        except Exception as exc:
+            reason = f"sanitize: {exc}" if isinstance(exc, SanitizeError) else f"render_or_encode_error: {exc}"
+            req = [p.name for p in schema.parameters if p.required]
+            opt = [p.name for p in schema.parameters if not p.required]
+            return {
+                "key": key, "ok": False,
+                "result": LeanResolveResult(
+                    hit=False, tool_name=schema.name, status="abstain",
+                    missing_required=req, missing_optional=opt,
+                    abstain_reason=reason, error_reason=reason,
+                    latency_ms=(time.perf_counter() - t0) * 1000,
+                    features=dict(ctx_features),
+                ),
+            }
+
+    def resolve_oracle_batch(
+        self,
+        items: Sequence[Dict[str, Any]],
+        *,
+        batch_size: int = 32,
+        num_workers: int = 4,
+        protect_parity_spans: bool = False,
+    ) -> List[LeanResolveResult]:
+        """Batched equivalent of :meth:`try_resolve` (Step 2 oracle-tool eval)."""
+        n = len(items)
+        results: List[Optional[LeanResolveResult]] = [None] * n
+        if self.model is None or self.tokenizer is None:
+            return [
+                LeanResolveResult(
+                    hit=False, status="abstain",
+                    abstain_reason="no_model_or_tokenizer", error_reason="no_model_or_tokenizer",
+                )
+                for _ in range(n)
+            ]
+
+        def _prep_idx(idx: int) -> Dict[str, Any]:
+            it = items[idx]
+            return self._prep_step2_item(
+                idx, it["schema"], it["utterance"], it.get("recent_context"),
+                it.get("now"), it.get("context_schemas"), it.get("parity_spans"),
+                protect_parity_spans,
+            )
+
+        if num_workers > 1 and n > 1:
+            with ThreadPoolExecutor(max_workers=num_workers) as pool:
+                prepped = list(pool.map(_prep_idx, range(n)))
+        else:
+            prepped = [_prep_idx(i) for i in range(n)]
+
+        enc_queue: List[Tuple[int, List[int]]] = []
+        meta_by_idx: Dict[int, Dict[str, Any]] = {}
+        for rec in prepped:
+            idx = rec["key"]
+            if not rec["ok"]:
+                results[idx] = rec["result"]
+            else:
+                meta_by_idx[idx] = rec
+                enc_queue.append((idx, rec["ids"]))
+
+        def _on_enc(idx: int, H_k: torch.Tensor) -> None:
+            rec = meta_by_idx[idx]
+            t_enc = time.perf_counter()
+            anchors, per_param_scores = self._score_parameters(
+                rec["output"], H_k, rec["per_token"], rec["cand_masks"], schema=rec["schema"]
+            )
+            t_heads = time.perf_counter()
+            results[idx] = self._finalize_param_resolve(
+                schema=rec["schema"], output=rec["output"], render_schemas=rec["render_schemas"],
+                cand_masks=rec["cand_masks"], _ctx=rec["_ctx"],
+                anchors=anchors, per_param_scores=per_param_scores,
+                parity_absolutes=rec["parity_absolutes"], parity_unresolvable=rec["parity_unresolvable"],
+                parity_counters=rec["parity_counters"], ctx_features=rec["ctx_features"],
+                t0=rec["t0"], t_pre=rec["t_pre"], t_mask=rec["t_mask"],
+                t_enc=t_enc, t_heads=t_heads,
+            )
+
+        self._run_encoded_batches(enc_queue, _on_enc, batch_size=batch_size)
+        return [r for r in results if r is not None]
+
+    def resolve_candidates_batch(
+        self,
+        items: Sequence[Dict[str, Any]],
+        *,
+        batch_size: int = 32,
+        num_workers: int = 4,
+        protect_parity_spans: bool = False,
+    ) -> List[LeanResolveResult]:
+        """Batched ``two_step`` E2E resolution across a list of candidate-tool samples."""
+        n = len(items)
+        results: List[Optional[LeanResolveResult]] = [None] * n
+        obj_mode = getattr(self, "tool_objective", "ce")
+        thresh_val = float(self.tool_call_threshold) if obj_mode == "binary" else None
+
+        if self.model is None or self.tokenizer is None:
+            return [
+                LeanResolveResult(
+                    hit=False, status="abstain",
+                    abstain_reason="no_model_or_tokenizer", error_reason="no_model_or_tokenizer",
+                )
+                for _ in range(n)
+            ]
+
+        # Phase 1: Step-1 tool selection for multi-tool rows (len(candidate_schemas) >= 2)
+        eff_budget = min(self.context_budget_tokens, max(64, self.max_seq_len // 2))
+        step1_indices: List[int] = []
+        single_indices: List[int] = []
+        for idx, it in enumerate(items):
+            cands = it.get("candidate_schemas") or []
+            if not cands:
+                results[idx] = LeanResolveResult(
+                    hit=False, status="abstain", abstain_reason="no_candidates",
+                    error_reason="no_candidates",
+                    features={"n_candidates": 0, "empty_candidates": True, "resolve_mode": "two_step"},
+                )
+            elif len(cands) == 1:
+                single_indices.append(idx)
+            else:
+                step1_indices.append(idx)
+
+        def _prep_s1(idx: int):
+            it = items[idx]
+            cands = it["candidate_schemas"]
+            t0 = time.perf_counter()
+            selected_recent, ctx_features = select_recent_context(
+                it.get("recent_context") or [], cands, k_recent=self.k_recent,
+                context_budget_tokens=eff_budget, tokenizer=self.tokenizer,
+            )
+            try:
+                output = build_input_multi(
+                    [tooldef_to_template_tool(s) for s in cands],
+                    it["utterance"], recent_context=_to_recent_rows(selected_recent),
+                    now=_to_date(it.get("now")),
+                )
+                ids, per_token = tokenize_offset_mapping(output, self.tokenizer, max_len=self.max_seq_len)
+                if len(ids) > self.max_seq_len:
+                    raise SanitizeError("overflow", f"sequence {len(ids)} tokens > L_max={self.max_seq_len}")
+                return idx, output, ids, per_token, ctx_features, selected_recent, t0, time.perf_counter(), None
+            except Exception as exc:
+                reason = f"sanitize: {exc}" if isinstance(exc, SanitizeError) else f"pre_error: {exc}"
+                return idx, None, None, None, ctx_features, selected_recent, t0, time.perf_counter(), reason
+
+        step1_meta: Dict[int, Dict[str, Any]] = {}
+        step1_admitted: Dict[int, List[Tuple[str, float]]] = {}
+        if step1_indices:
+            if num_workers > 1 and len(step1_indices) > 1:
+                with ThreadPoolExecutor(max_workers=num_workers) as pool:
+                    s1_prepped = list(pool.map(_prep_s1, step1_indices))
+            else:
+                s1_prepped = [_prep_s1(i) for i in step1_indices]
+
+            s1_queue: List[Tuple[int, List[int]]] = []
+            for idx, output, ids, per_token, ctx_f, sel_rc, t0, t_pre_end, err in s1_prepped:
+                if err is not None or ids is None or output is None or per_token is None:
+                    results[idx] = LeanResolveResult(
+                        hit=False, status="abstain", abstain_reason=err, error_reason=err,
+                        latency_ms=(time.perf_counter() - t0) * 1000,
+                        features={
+                            **ctx_f, "tool_objective": obj_mode, "tool_call_threshold": thresh_val,
+                        },
+                    )
+                else:
+                    step1_meta[idx] = {
+                        "output": output, "per_token": per_token, "ctx_f": ctx_f,
+                        "selected_recent": sel_rc, "t0": t0, "pre_ms": (t_pre_end - t0) * 1000,
+                    }
+                    s1_queue.append((idx, ids))
+
+            def _on_s1_enc(idx: int, H_k: torch.Tensor) -> None:
+                m = step1_meta[idx]
+                t_enc_s = time.perf_counter()
+                choices = self._tool_scores(m["output"], H_k, m["per_token"])
+                enc_ms = (time.perf_counter() - t_enc_s) * 1000
+                cands = items[idx]["candidate_schemas"]
+                feats = {
+                    **m["ctx_f"],
+                    "n_candidates": len(cands),
+                    "pre_ms": m["pre_ms"],
+                    "enc_ms": enc_ms,
+                    "tool_scores": dict(choices),
+                    "temperature": self.temperature,
+                    "tool_objective": obj_mode,
+                    "tool_call_threshold": thresh_val,
+                    "tool_scores_reason": self.last_tool_scores_reason,
+                }
+                if not choices:
+                    feats["n_tool_anchors"] = 0
+                    feats["no_tool_anchors"] = True
+                    results[idx] = LeanResolveResult(
+                        hit=False, status="abstain",
+                        abstain_reason=f"no_tool_scores:{self.last_tool_scores_reason}",
+                        error_reason=f"no_tool_scores:{self.last_tool_scores_reason}",
+                        latency_ms=(time.perf_counter() - m["t0"]) * 1000,
+                        features=feats,
+                    )
+                    return
+                winner_name, winner_p = choices[0]
+                if obj_mode == "binary" and float(winner_p) < float(self.tool_call_threshold):
+                    feats["winner_prob"] = float(winner_p)
+                    feats["n_calls"] = 0
+                    feats["gated_tool_below_threshold"] = True
+                    results[idx] = LeanResolveResult(
+                        hit=False, status="abstain",
+                        abstain_reason="tool_below_threshold", error_reason="tool_below_threshold",
+                        latency_ms=(time.perf_counter() - m["t0"]) * 1000,
+                        features=feats,
+                    )
+                    return
+                admitted: List[Tuple[str, float]] = [(winner_name, float(winner_p))]
+                for name, p in choices[1:]:
+                    if len(admitted) >= self.max_calls:
+                        break
+                    if p < self.call_min_prob or p < float(winner_p) * self.call_min_prob_ratio:
+                        break
+                    admitted.append((name, float(p)))
+                m["step1_features"] = feats
+                m["step1_render_T"] = int(sum(
+                    1 for e in m["output"].entries
+                    if getattr(e, "kind", None) == "bridge_text" and getattr(e, "tool", None) is not None
+                ))
+                m["admitted"] = admitted
+                step1_admitted[idx] = admitted
+
+            self._run_encoded_batches(s1_queue, _on_s1_enc, batch_size=batch_size)
+
+        # Phase 2: Step-2 param extraction (T=1) for single-tool & admitted calls
+        s2_jobs: List[Tuple[int, int, ToolDefinition, float]] = []
+        for idx in single_indices:
+            s2_jobs.append((idx, 0, items[idx]["candidate_schemas"][0], 1.0))
+        for idx, admitted in step1_admitted.items():
+            cands = items[idx]["candidate_schemas"]
+            for ci, (name, p) in enumerate(admitted):
+                schema_i = next((s for s in cands if s.name == name), None)
+                if schema_i is not None:
+                    s2_jobs.append((idx, ci, schema_i, p))
+
+        def _prep_s2(job: Tuple[int, int, ToolDefinition, float]) -> Dict[str, Any]:
+            idx, ci, schema_i, p = job
+            it = items[idx]
+            rc = step1_meta[idx]["selected_recent"] if idx in step1_meta else it.get("recent_context")
+            rec = self._prep_step2_item(
+                (idx, ci), schema_i, it["utterance"], rc, it.get("now"),
+                [schema_i], it.get("parity_spans"), protect_parity_spans,
+            )
+            rec["tool_prob"] = p
+            return rec
+
+        s2_results: Dict[Tuple[int, int], LeanResolveResult] = {}
+        if s2_jobs:
+            if num_workers > 1 and len(s2_jobs) > 1:
+                with ThreadPoolExecutor(max_workers=num_workers) as pool:
+                    s2_prepped = list(pool.map(_prep_s2, s2_jobs))
+            else:
+                s2_prepped = [_prep_s2(j) for j in s2_jobs]
+
+            s2_queue: List[Tuple[Tuple[int, int], List[int]]] = []
+            s2_meta: Dict[Tuple[int, int], Dict[str, Any]] = {}
+            for rec in s2_prepped:
+                k = rec["key"]
+                if not rec["ok"]:
+                    s2_results[k] = rec["result"]
+                else:
+                    s2_meta[k] = rec
+                    s2_queue.append((k, rec["ids"]))
+
+            def _on_s2_enc(k: Tuple[int, int], H_k: torch.Tensor) -> None:
+                rec = s2_meta[k]
+                t_enc = time.perf_counter()
+                anchors, per_param_scores = self._score_parameters(
+                    rec["output"], H_k, rec["per_token"], rec["cand_masks"], schema=rec["schema"]
+                )
+                t_heads = time.perf_counter()
+                s2_results[k] = self._finalize_param_resolve(
+                    schema=rec["schema"], output=rec["output"], render_schemas=rec["render_schemas"],
+                    cand_masks=rec["cand_masks"], _ctx=rec["_ctx"],
+                    anchors=anchors, per_param_scores=per_param_scores,
+                    parity_absolutes=rec["parity_absolutes"], parity_unresolvable=rec["parity_unresolvable"],
+                    parity_counters=rec["parity_counters"], ctx_features=rec["ctx_features"],
+                    t0=rec["t0"], t_pre=rec["t_pre"], t_mask=rec["t_mask"],
+                    t_enc=t_enc, t_heads=t_heads,
+                )
+
+            self._run_encoded_batches(s2_queue, _on_s2_enc, batch_size=batch_size)
+
+        for idx in single_indices:
+            res = s2_results[(idx, 0)]
+            res.features["resolve_mode"] = "two_step"
+            results[idx] = res
+
+        for idx, admitted in step1_admitted.items():
+            m = step1_meta[idx]
+            s1_feats = m["step1_features"]
+            calls: List[LeanCallResult] = []
+            first_res: Optional[LeanResolveResult] = None
+            for ci, (_name, p) in enumerate(admitted):
+                part = s2_results.get((idx, ci))
+                if part is None:
+                    continue
+                if first_res is None:
+                    first_res = part
+                calls.append(_call_from_result(part, ci, tool_prob=p))
+            if first_res is None:
+                continue
+            res = first_res
+            res.latency_ms = float(res.latency_ms or 0.0) + float(s1_feats.get("pre_ms", 0.0)) + float(s1_feats.get("enc_ms", 0.0))
+            step2_pre_ms = float(res.features.get("pre_ms", 0.0) or 0.0)
+            step2_enc_ms = float(res.features.get("enc_ms", 0.0) or 0.0)
+            step2_render_T = res.features.get("render_T")
+            res.features.update(s1_feats)
+            res.features["resolve_mode"] = "two_step"
+            res.features["step1_pre_ms"] = float(s1_feats["pre_ms"])
+            res.features["step1_enc_ms"] = float(s1_feats["enc_ms"])
+            res.features["step1_render_T"] = m["step1_render_T"]
+            res.features["step2_pre_ms"] = step2_pre_ms
+            res.features["step2_enc_ms"] = step2_enc_ms
+            res.features["step2_render_T"] = step2_render_T
+            res.features["pre_ms"] = float(s1_feats["pre_ms"]) + step2_pre_ms
+            res.features["enc_ms"] = float(s1_feats["enc_ms"]) + step2_enc_ms
+            res.features["stage_sum_ms"] = float(
+                sum(res.features.get(k, 0.0) or 0.0 for k in
+                    ("pre_ms", "mask_ms", "enc_ms", "heads_ms", "decode_ms", "post_ms"))
+            )
+            res.features["unattributed_ms"] = float(max(0.0, res.latency_ms - res.features["stage_sum_ms"]))
+            res.features["winner_prob"] = float(admitted[0][1])
+            res.features["n_calls"] = len(calls)
+            res.features["call_probs"] = [round(float(p), 6) for _n, p in admitted[: len(calls)]]
+            res.calls = calls
+            results[idx] = res
+
+        return [r for r in results if r is not None]

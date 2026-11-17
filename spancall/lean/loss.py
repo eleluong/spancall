@@ -312,6 +312,8 @@ class LeanLossContainer(nn.Module):
         lambda_tool: float = 1.0,
         lambda_tool_binary: float = 1.0,
         tool_objective: str = "ce",
+        pointer_focal_gamma: float = 0.0,
+        multi_pos_slot_weight: float = 1.0,
     ) -> None:
         super().__init__()
         self.lambda_pointer = lambda_pointer
@@ -319,6 +321,8 @@ class LeanLossContainer(nn.Module):
         # Weight for the v2.1 binary arm. Kept separate from ``lambda_tool`` so
         # an ablation can track both terms independently.
         self.lambda_tool_binary = lambda_tool_binary
+        self.pointer_focal_gamma = float(pointer_focal_gamma)
+        self.multi_pos_slot_weight = float(multi_pos_slot_weight)
         # Which H1 objective actually TRAINS: ``ce`` (default, the shipped
         # head) or ``binary`` (v2.1). This is deliberately an explicit string
         # rather than "whichever logits happen to be present", because a silent
@@ -386,7 +390,23 @@ class LeanLossContainer(nn.Module):
             out["pointer"] = ptr_loss.detach()
             out["pointer_sum"] = ptr_per_param.sum().detach()
             out["pointer_count"] = n_active_raw.detach()
-            total_loss = total_loss + self.lambda_pointer * ptr_loss
+
+            if self.pointer_focal_gamma > 0.0 or self.multi_pos_slot_weight != 1.0:
+                weight = torch.ones_like(ptr_per_param)
+                if self.pointer_focal_gamma > 0.0:
+                    p_pos = torch.exp(-ptr_per_param.detach()).clamp(0.0, 1.0)
+                    weight = weight * ((1.0 - p_pos) ** self.pointer_focal_gamma)
+                if self.multi_pos_slot_weight != 1.0:
+                    n_pos_slots = ((positives >= 0) & (positives < span_logits.size(-1))).sum(-1)
+                    weight = weight * torch.where(
+                        n_pos_slots > 1,
+                        torch.full_like(weight, self.multi_pos_slot_weight),
+                        torch.ones_like(weight),
+                    )
+                grad_ptr_loss = (ptr_per_param * weight).sum() / n_active
+            else:
+                grad_ptr_loss = ptr_loss
+            total_loss = total_loss + self.lambda_pointer * grad_ptr_loss
 
         # 2. Tool loss (H1)
         #
