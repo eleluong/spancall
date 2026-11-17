@@ -110,6 +110,76 @@ def classify_param(is_groundable: bool) -> str:
     return "extractable" if is_groundable else "unextractable"
 
 
+COMPLEX_PARAM_TYPES = frozenset({"array", "object"})
+
+
+def is_complex_param(
+    param: Any,
+    object_paths: Optional[Dict[str, Sequence[str]]] = None,
+) -> bool:
+    """True when ``param`` is an ``array``, ``object``, or decomposed ``object-leaf``.
+
+    Normal (scalar) types — ``string``, ``integer``, ``number``, ``boolean``,
+    ``date``, ``datetime``, ``enum`` (and nullable scalars) — return ``False``.
+    """
+    if object_paths:
+        pname = str(getattr(param, "name", None) or (param.get("name") if isinstance(param, dict) else "") or "")
+        root = pname.split(".", 1)[0]
+        if any(str(leaf) == pname for leaf in (object_paths.get(root) or ())):
+            return True
+    raw_pt = getattr(param, "param_type", None) if not isinstance(param, dict) else param.get("param_type")
+    if isinstance(raw_pt, (list, tuple)):
+        return any(str(t).strip().lower() in COMPLEX_PARAM_TYPES for t in raw_pt)
+    return str(raw_pt or "string").strip().lower() in COMPLEX_PARAM_TYPES
+
+
+def classify_sample_complexity(sample_or_dict: Any) -> str:
+    """Classify a sample as ``'complex'`` or ``'normal'`` based on its GT call(s).
+
+    A sample is ``'complex'`` if any GT argument maps to an ``array``, ``object``,
+    or ``object-leaf`` parameter (or carries a ``list``/``dict`` value). Otherwise
+    it is ``'normal'`` (scalar-only).
+    """
+    if isinstance(sample_or_dict, dict):
+        tools = sample_or_dict.get("tools") or []
+        gt_calls = sample_or_dict.get("ground_truth_calls") or []
+    else:
+        tools = getattr(sample_or_dict, "tools", None) or []
+        gt_calls = getattr(sample_or_dict, "ground_truth_calls", None) or []
+
+    tool_by_name = {}
+    for t in tools:
+        tname = t.get("name") if isinstance(t, dict) else getattr(t, "name", None)
+        if tname:
+            tool_by_name[str(tname)] = t
+
+    for call in gt_calls:
+        cname = call.get("tool_name") if isinstance(call, dict) else getattr(call, "tool_name", None)
+        cargs = (call.get("arguments") if isinstance(call, dict) else getattr(call, "arguments", None)) or {}
+        if any(isinstance(v, (list, dict)) for v in cargs.values()):
+            return "complex"
+        tdef = tool_by_name.get(str(cname or ""))
+        if tdef is None and tools:
+            tdef = tools[0]
+        if tdef is None:
+            continue
+        obj_paths = (tdef.get("object_paths") if isinstance(tdef, dict) else getattr(tdef, "object_paths", None)) or {}
+        params = (tdef.get("parameters") if isinstance(tdef, dict) else getattr(tdef, "parameters", None)) or []
+        pmap = {}
+        for p in params:
+            pname = p.get("name") if isinstance(p, dict) else getattr(p, "name", None)
+            if pname:
+                pmap[str(pname)] = p
+        for arg_name in cargs:
+            p = pmap.get(str(arg_name))
+            if p is not None and is_complex_param(p, obj_paths):
+                return "complex"
+            # Check if arg_name is an object root whose leaves are in object_paths
+            if str(arg_name) in obj_paths:
+                return "complex"
+    return "normal"
+
+
 def _gt_params(gt_args: Dict[str, Any], schema: Any) -> Dict[str, Any]:
     """GT param universe: every schema param with a GT entry, explicit nulls included.
 
@@ -117,8 +187,19 @@ def _gt_params(gt_args: Dict[str, Any], schema: Any) -> Dict[str, Any]:
     fast path can and must predict via ``<|null|>``. Filtering ``None`` out (as
     the previous implementation did) silently removed those params from
     coverage, from the per-param ``gt`` counts, and from every denominator.
+
+    When ``schema.object_paths`` is populated (v2.7+ object decomposition),
+    nested ``gt_args`` are flattened into the declared dotted-leaf key space
+    so ``schema.parameters`` leaf names resolve against ``gt_args``.
     """
-    return {p.name: gt_args.get(p.name) for p in schema.parameters if p.name in gt_args}
+    obj_paths = getattr(schema, "object_paths", None)
+    if obj_paths:
+        from spancall.data.flatten import flatten_args
+
+        eff_args = flatten_args(gt_args, obj_paths)
+    else:
+        eff_args = gt_args
+    return {p.name: eff_args.get(p.name) for p in schema.parameters if p.name in eff_args}
 
 
 def _predicted_calls(res: Any) -> List[Any]:
@@ -551,6 +632,20 @@ def eval_param_extraction_lean(
     groundable_gt_params = 0            # of those, extractable by the fast path
     calls_all_groundable = 0            # samples where every GT param is extractable
 
+    # Normal (scalar) vs Complex (array / object / object-leaf) breakdown
+    comp_stats: Dict[str, Dict[str, int]] = {
+        "normal": {
+            "ex_tp": 0, "ex_fp": 0, "ex_fn": 0, "ex_wrong": 0,
+            "total_gt_params": 0, "groundable_gt_params": 0,
+            "stratum_f_n": 0, "stratum_f_exact": 0,
+        },
+        "complex": {
+            "ex_tp": 0, "ex_fp": 0, "ex_fn": 0, "ex_wrong": 0,
+            "total_gt_params": 0, "groundable_gt_params": 0,
+            "stratum_f_n": 0, "stratum_f_exact": 0,
+        },
+    }
+
     # J6 / R0.4: multi-call accounting. ``call_count_acc`` compares the number of
     # predicted calls to the number of GT calls; ``call_exact_set_match`` is the
     # set-level "every GT call exact, no extra call" headline that replaces the
@@ -865,18 +960,24 @@ def eval_param_extraction_lean(
 
             # --- coverage / classification per param ---
             param_classes: Dict[str, str] = {}
+            param_complexities: Dict[str, str] = {}
+            gt_obj_paths = getattr(gt_tool, "object_paths", None) or {}
             n_groundable_this_call = 0
             n_gt_this_call = 0
             for p in gt_tool.parameters:
                 pn = p.name
+                pk = "complex" if is_complex_param(p, gt_obj_paths) else "normal"
+                param_complexities[pn] = pk
                 in_gt = pn in gt_universe
                 if in_gt:
                     n_gt_this_call += 1
                     total_gt_params += 1
+                    comp_stats[pk]["total_gt_params"] += 1
                 is_groundable = param_is_groundable(s, pn, ci)
                 if in_gt and is_groundable:
                     n_groundable_this_call += 1
                     groundable_gt_params += 1
+                    comp_stats[pk]["groundable_gt_params"] += 1
                 param_classes[pn] = classify_param(is_groundable)
             sample_gt_params += n_gt_this_call
             sample_groundable += n_groundable_this_call
@@ -898,12 +999,14 @@ def eval_param_extraction_lean(
             for p in gt_tool.parameters:
                 pn = p.name
                 cls = param_classes.get(pn, "unextractable")
+                pk = param_complexities.get(pn, "normal")
                 pv = pred_view.get(pn)
                 present = pv is not None and bool(pv["present"])
                 if pn not in norm_gt:
                     # Predicted a param GT never mentions -> precision hit.
                     if present and cls == "extractable":
                         ex_fp += 1
+                        comp_stats[pk]["ex_fp"] += 1
                     continue
                 if cls != "extractable":
                     if not present:
@@ -912,14 +1015,18 @@ def eval_param_extraction_lean(
                 gt_v = norm_gt[pn]
                 if not present:
                     ex_fn += 1
+                    comp_stats[pk]["ex_fn"] += 1
                     missed_extractable += 1
                     continue
                 pred_v = None if pv["is_null"] else _norm(pv["value"])
                 if pred_v == gt_v:
                     ex_tp += 1
+                    comp_stats[pk]["ex_tp"] += 1
                 else:
                     ex_fp += 1
                     ex_wrong += 1
+                    comp_stats[pk]["ex_fp"] += 1
+                    comp_stats[pk]["ex_wrong"] += 1
 
             # --- per-param Stratum-F table ---
             # Multi-call rows are tagged ``call_index::param`` so two calls
@@ -966,6 +1073,10 @@ def eval_param_extraction_lean(
             stratum_f_total += 1
             if call0_exact:
                 stratum_f_exact += 1
+            sc = classify_sample_complexity(s)
+            comp_stats[sc]["stratum_f_n"] += 1
+            if call0_exact:
+                comp_stats[sc]["stratum_f_exact"] += 1
             if res0.hit:
                 stratum_f_hits += 1
             if bool(_feats.get("pointer_collapsed")):
@@ -1029,6 +1140,29 @@ def eval_param_extraction_lean(
         _ratio(parity_checked - parity_hit, parity_checked)
         if parity_checked else float("nan")
     )
+
+    by_complexity: Dict[str, Dict[str, Any]] = {}
+    for ck in ("normal", "complex"):
+        cs = comp_stats[ck]
+        cp = _ratio(cs["ex_tp"], cs["ex_tp"] + cs["ex_fp"])
+        cr = _ratio(cs["ex_tp"], cs["ex_tp"] + cs["ex_fn"])
+        c_scored = cs["ex_tp"] + cs["ex_wrong"] + cs["ex_fn"]
+        by_complexity[ck] = {
+            "extraction_precision": _round(cp),
+            "extraction_recall": _round(cr),
+            "extraction_f1": _round(_f1(cp, cr)),
+            "param_accuracy_scored": _round(_ratio(cs["ex_tp"], c_scored)),
+            "params_scored": int(c_scored),
+            "total_gt_params": int(cs["total_gt_params"]),
+            "groundable_gt_params": int(cs["groundable_gt_params"]),
+            "tp": int(cs["ex_tp"]),
+            "fp": int(cs["ex_fp"]),
+            "fn": int(cs["ex_fn"]),
+            "wrong": int(cs["ex_wrong"]),
+            "stratum_f_n": int(cs["stratum_f_n"]),
+            "exact_payload_match_F": _round(_ratio(cs["stratum_f_exact"], cs["stratum_f_n"])),
+            "exact_payload_match_F_n": int(cs["stratum_f_exact"]),
+        }
 
     metrics: Dict[str, Any] = {
         "split": split_name,
@@ -1139,6 +1273,7 @@ def eval_param_extraction_lean(
             "groundable_gt_params": groundable_gt_params,
         },
         "source_type_distribution": dict(buckets),
+        "by_complexity": by_complexity,
     }
 
     if not quiet:
