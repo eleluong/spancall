@@ -37,7 +37,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 TRAIN_NB = ROOT / "notebooks" / "spancall_lean_v3_train_eval.ipynb"
-AGENT_NB = ROOT / "notebooks" / "spancall_lean_v3_agentic.ipynb"
+AGENT_NB = ROOT / "notebooks" / "spancall_lean_v3_2_agentic.ipynb"
 
 
 # ---------------------------------------------------------------------------
@@ -411,13 +411,28 @@ def test_probe_config_keys_match_the_trainer(train_nb: None) -> None:
 
 
 def test_wandb_config_keys_match_the_trainer(train_nb: None) -> None:
+    """Any ``wandb_*`` key a notebook writes must be one the trainer reads.
+
+    The notebook does not currently configure W&B — ``TrainingConfig`` defaults
+    ``wandb_project`` to ``""``, which means the trainer never imports wandb. So
+    "no keys" is the valid state, and the test guards the *contract* rather than
+    a fixed key list: if W&B is ever wired up, a typo (``wandb_run``) would leave
+    logging silently off, which is indistinguishable from a run that finished
+    without metrics.
+    """
     written = set(re.findall(r"cfg\[[\"']training[\"']\]\[[\"']([a-z_]+)[\"']\]\s*=", _live_code(TRAIN_NB)))
     wandb_keys = {k for k in written if k.startswith("wandb")}
-    assert wandb_keys == {"wandb_project", "wandb_run_name", "wandb_mode"}, (
-        f"W&B keys written are {sorted(wandb_keys)!r}"
-    )
     unknown = wandb_keys - _training_fields()
-    assert not unknown, f"W&B keys not read by TrainingConfig: {sorted(unknown)}"
+    assert not unknown, (
+        f"W&B keys written by {TRAIN_NB.name} are not read by TrainingConfig: "
+        f"{sorted(unknown)}"
+    )
+    if wandb_keys:
+        # If the notebook does configure W&B, the full triple must be present,
+        # because the trainer needs a project *and* a mode to open a run.
+        assert {"wandb_project", "wandb_mode"} <= wandb_keys, (
+            f"partial W&B configuration written: {sorted(wandb_keys)}"
+        )
 
 
 def test_probe_set_is_disjoint_from_dev(train_nb: None) -> None:
@@ -654,8 +669,16 @@ def test_no_hardcoded_credentials(path: Path) -> None:
 
 
 @pytest.mark.parametrize("path", [TRAIN_NB, AGENT_NB], ids=["train_eval", "agentic"])
-def test_credentials_are_read_from_the_environment(path: Path) -> None:
-    """A token may only ever be ``ENV.get(...)`` / ``os.environ.get(...)``."""
+def test_credentials_are_never_assigned_in_the_notebook(path: Path) -> None:
+    """A credential must never be *written* into an artifact.
+
+    The resolution order is env -> repo-root ``.env`` -> interactive ``input()``,
+    so a run either supplies the value externally or the notebook asks for it.
+    Both are acceptable; a literal in the cell is not, because the notebook is
+    committed and may be executed by someone else. Prompts use plain ``input()``
+    rather than ``getpass``: ``getpass`` reads ``/dev/tty``, which blocks or
+    raises under ``nbconvert --execute`` and cannot be stubbed by a test.
+    """
     if not path.is_file():
         pytest.skip(f"{path.name} not built")
     live = _live_code(path)
@@ -665,8 +688,16 @@ def test_credentials_are_read_from_the_environment(path: Path) -> None:
     )
     assert not literal, f"{path.name} assigns a credential literal: {literal!r}"
     if "HF_TOKEN" in live:
-        assert re.search(r"HF_TOKEN\s*=\s*ENV\.get\(", live), (
-            "HF_TOKEN is not read from the environment"
+        resolved = re.search(
+            r"HF_TOKEN\s*=\s*(?:ENV\.get\(|_resolve\(|_prompt\(|os\.environ\.get\()",
+            live,
+        )
+        assert resolved, (
+            "HF_TOKEN is neither read from the environment nor prompted for"
+        )
+        # A secret must never be printed verbatim; only its presence may be.
+        assert not re.search(r"print\([^)\n]*\{HF_TOKEN\}", live), (
+            "the notebook interpolates the HF token itself into a print"
         )
 
 

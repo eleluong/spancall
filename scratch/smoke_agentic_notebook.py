@@ -22,7 +22,7 @@ sys.path.insert(0, str(ROOT))
 
 import nbformat  # noqa: E402
 
-NB = ROOT / "notebooks" / "spancall_lean_v3_agentic.ipynb"
+NB = ROOT / "notebooks" / "spancall_lean_v3_2_agentic.ipynb"
 
 
 def is_ipython(src: str) -> bool:

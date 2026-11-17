@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate notebooks/spancall_lean_v3_agentic.ipynb via nbformat.
+"""Generate notebooks/spancall_lean_v3_2_agentic.ipynb via nbformat.
 
 SpanCall v3 — Agentic Integration Notebook (three modes)
 ========================================================
@@ -57,14 +57,16 @@ from nbformat.v4 import new_code_cell, new_markdown_cell, new_notebook
 
 HERE = Path(__file__).resolve().parent
 V26_SCRIPT = HERE / "build_lean_v2_6_colab_notebook.py"
-OUT = HERE / ".." / "notebooks" / "spancall_lean_v3_agentic.ipynb"
+OUT = HERE / ".." / "notebooks" / "spancall_lean_v3_2_agentic.ipynb"
 
 # --------------------------------------------------------------------------
 # Prose
 # --------------------------------------------------------------------------
-MARKDOWN_TITLE = """# SpanCall v3 — Agentic Integration (three modes)
+MARKDOWN_TITLE = """# SpanCall v3.2 — Agentic Integration (three modes)
 
 Compares three ways to place the **SpanCall** fast path in a multi-turn tool-calling agent, against the same mock booking environment and the same task suites. Only the router changes.
+
+The checkpoint is the **`v3.2`** export, so the resolver runs the same protocol the offline numbers were measured under: `two_step` extraction, the whole-call margin gate, the collapse guards, and `max_cands=1024` — all read from `resolve_config.json` rather than re-specified here.
 
 | # | Mode | `RouterMode` | Who writes the tool call |
 | --- | --- | --- | --- |
@@ -79,21 +81,33 @@ Mode 2 is all-or-nothing: one unresolvable parameter discards an otherwise perfe
 MARKDOWN_SETUP = """---
 ## 0. Setup
 
-Clones or updates the repository, installs dependencies, and reads the model id and any provider key **from the environment only**. No key is written into this notebook: `API_KEY`, `BASE_URL`, `BASE_LLM_MODEL` and `HF_TOKEN` are looked up in `os.environ` / `.env`, and their absence downgrades the LLM arm to a deterministic backend instead of failing."""
+Clones or updates the repository, installs dependencies, and resolves the model id and any provider key the same way the other `v3.2` notebooks do:
+
+| Value | First looked up as | If unset |
+| --- | --- | --- |
+| HF token | `HF_TOKEN` / `HUGGING_FACE_TOKEN` in the environment or `.env` | prompts via `input()`; Enter = anonymous access to the public `convoicon/*` repos |
+| LLM model id | `BASE_LLM_MODEL` | prompts; default `google/gemma-4` |
+| LLM base URL | `BASE_URL` | prompts; blank = the provider's own endpoint |
+| LLM API key | `API_KEY` / `OPENAI_API_KEY` | prompts via `input()`; blank = deterministic backend |
+
+A value already present in the environment or `.env` always wins, so a scripted `nbconvert --execute` run never blocks on stdin. Nothing secret is written into this notebook and no secret is ever printed — only `<set>` / `(not set)`. Because every credential may be skipped, the notebook still runs end to end with no credentials at all; the LLM arm then degrades to the deterministic backend and §5 prints that caveat beside its own numbers."""
 
 MARKDOWN_MODEL = """---
 ## 1. Load the pushed model from Hugging Face
 
-The v3 export (`§7` of the train/eval notebook) is **not** a transformers checkpoint. `LeanSpanCallModel` is a plain `nn.Module` with no `save_pretrained()`, so the artifact is:
+Defaults to `convoicon/spancall-lean-v3-2`, the **`v3.2`** export (`§7` of `spancall_lean_v3_2_train_eval.ipynb`). Override with `SPANCALL_HF_REPO_ID`, or set `USE_LOCAL_CHECKPOINT = True` and point `LOCAL_CHECKPOINT_DIR` at `results_lean_v3_2/hf_export`.
+
+The export is **not** a transformers checkpoint. `LeanSpanCallModel` is a plain `nn.Module` with no `save_pretrained()`, so the artifact is:
 
 - `model.pt` — a `state_dict`;
 - tokenizer files;
-- `resolve_config.json` — backbone, `head_dim`, `max_span_width`, gate thresholds, and the extraction mode (`resolve_mode`).
+- `resolve_config.json` — backbone, `head_dim`, `max_span_width`, `max_calls`, gate thresholds, the collapse guards, and the extraction mode (`resolve_mode`).
 
-This cell rebuilds the encoder + model **exactly** from `resolve_config.json`, then loads the weights. Two failure modes are made loud instead of silent:
+This cell rebuilds the encoder + model **exactly** from `resolve_config.json`, then loads the weights. Three failure modes are made loud instead of silent:
 
 - **Head dimension mismatch.** `head_dim` is part of the architecture. Loading a mismatched `pointer_head` with `strict=False` would leave it randomly initialised while looking like a successful load — so any `pointer_head`/`tool_head` key that fails to load aborts the cell.
-- **Missing extraction mode.** A pre-v3 export has no `resolve_mode`. The resolver's own default is `two_step` as of v3, but this notebook does not lean on that: a missing key is detected, the effective mode is printed, and `two_step` is applied explicitly — so the recorded mode is never an inherited one."""
+- **Missing extraction mode.** A pre-`v3.2` export has no `resolve_mode`. The resolver's own default is `two_step` as of `v3`, but this notebook does not lean on that: a missing key is detected, the effective mode is printed, and `two_step` is applied explicitly — so the recorded mode is never an inherited one.
+- **Silently different search width.** `max_cands` is *not* recorded in `resolve_config.json`, and the library default (`2048`) is not the `v3.2` training value (`1024`). Since a wider candidate pack changes which calls the gate admits, the `v3.2` value is pinned here rather than inherited, and the effective value is printed with the rest of the resolver provenance."""
 
 MARKDOWN_TOOLS = """---
 ## 2. Environment, backends, and task suites
@@ -102,7 +116,7 @@ The mock booking environment (`search_flights` / `book_flight` / `cancel_booking
 
 Task suites are **imported** from [`scripts/eval_agent.py`](../scripts/eval_agent.py) — the canonical three booking tasks and the long-trajectory set — so agent numbers here stay comparable with the offline comparative study. A copy would drift silently, so if the import fails, the notebook stops.
 
-The LLM arm is a live provider when `API_KEY` is set **and** a one-call probe succeeds; otherwise it is `DeterministicBackend`, the same rule-based backend the offline runs use. The probe matters: an invalid key would otherwise surface mid-suite, after several modes had already run."""
+The LLM arm is a live provider when an API key is available **and** a one-call probe succeeds; otherwise it is `DeterministicBackend`, the same rule-based backend the offline runs use. The key and endpoint are the ones resolved in §0b (env → `.env` → prompt) and are passed to the backend explicitly, so a value typed at the prompt is actually used. The probe matters: an invalid key would otherwise surface mid-suite, after several modes had already run."""
 
 MARKDOWN_DEMO = """---
 ## 3. Side-by-side demos: who produced what
@@ -141,9 +155,9 @@ USD is `n/a` unless `USD_PER_1K_IN` / `USD_PER_1K_OUT` are set, because a hardco
 MARKDOWN_LIVE = """---
 ## 6. Live LLM re-run (key-guarded)
 
-Everything above already runs with a real provider whenever `API_KEY` is present — the probe in §2 decides. This section is for the other direction: it lets you pin a specific model id, or re-run only the suites, without re-executing the notebook.
+Everything above already runs with a real provider whenever an API key was supplied at §0b — the probe in §2 decides. This section is for the other direction: it lets you pin a specific model id, or re-run only the suites, without re-executing the notebook.
 
-If no key is present it prints why and does nothing. It never prompts for a key, never reads one from a file path, and never writes one into a cell output."""
+If no key was supplied it prints why and does nothing. It never prompts for a key, never reads one from a file path, and never writes one into a cell output."""
 
 # --------------------------------------------------------------------------
 # Code cells
@@ -176,7 +190,7 @@ if (PROJECT_ROOT / ".git").is_dir():
 
 %pip install -q -e ".[model,data,agent,dev]" huggingface_hub'''
 
-CODE_CONFIG = '''# 0b. Configuration (env-key only - nothing secret appears in this cell)
+CODE_CONFIG = '''# 0b. Configuration - credentials from env/.env, then prompted (nothing secret in this file)
 import json, os, sys
 from pathlib import Path
 import torch
@@ -193,18 +207,66 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from spancall.agent.backends.litellm_adapter import _load_dotenv_values
 
+# Process environment wins over the file, so `API_KEY=... python ...` and
+# `%env API_KEY=...` behave the way a reader expects.
 ENV = {**_load_dotenv_values(PROJECT_ROOT / ".env"), **os.environ}
 
-# ---- model artifact ------------------------------------------------------ #
-# The v3 train/eval notebook pushes to this id (HF_REPO_ID there). Point it at
-# your own namespace if you trained elsewhere.
-HF_REPO_ID = ENV.get("SPANCALL_HF_REPO_ID") or "convoicon/spancall-lean-v3"
-# Alternative to HF: a local export directory holding model.pt + resolve_config.json
-USE_LOCAL_CHECKPOINT = False
-LOCAL_CHECKPOINT_DIR = str(PROJECT_ROOT / "results_lean_v3" / "hf_export")
 
-# Token is read, never required: a private repo needs one, a public repo does not.
-HF_TOKEN = ENV.get("HUGGING_FACE_TOKEN") or ENV.get("HF_TOKEN") or None
+def _prompt(label, default="", secret=False):
+    """One interactive question. Enter keeps ``default``; EOF means "skip".
+
+    Everything goes through plain ``input()``. ``getpass`` reads ``/dev/tty``
+    rather than stdin, so under ``nbconvert --execute``, a piped heredoc, or any
+    test double it either blocks on a terminal that is not there or raises
+    outside the ``except`` below. Plain ``input()`` reads stdin, honours EOF, and
+    can be patched. The key is still never written to the file and never printed
+    - it is only reported as ``<set>`` - which is the property that matters; an
+    echoed keystroke in your own terminal is not a leak into the artifact.
+
+    Nothing here can abort a headless run: ``nbconvert --execute`` with the
+    values already exported never reaches this function, and a prompt it does
+    reach sees EOF and falls through to the default.
+    """
+    suffix = f" [{default}]" if default else " [optional - Enter to skip]"
+    try:
+        val = input(f"{label}{suffix}: ")
+    except (EOFError, OSError):
+        val = ""
+    return (val or "").strip() or default
+
+
+def _resolve(*names, default="", secret=False, label=""):
+    """First of ``names`` found in env/.env wins; only then prompt."""
+    for name in names:
+        val = ENV.get(name)
+        if val:
+            return str(val).strip()
+    return _prompt(label or names[0], default, secret=secret)
+
+
+# ---- model artifact ------------------------------------------------------ #
+# `spancall_lean_v3_2_train_eval.ipynb` §7 pushes the v3.2 export to this id.
+# Point it at your own namespace if you trained elsewhere.
+HF_REPO_ID = ENV.get("SPANCALL_HF_REPO_ID") or "convoicon/spancall-lean-v3-2"
+# Alternative to HF: a local export dir holding model.pt + resolve_config.json
+USE_LOCAL_CHECKPOINT = False
+LOCAL_CHECKPOINT_DIR = str(PROJECT_ROOT / "results_lean_v3_2" / "hf_export")
+
+# Token is read, never required: a private repo needs one, a public repo does
+# not. Prompted only when neither variable is set, and never printed back.
+HF_TOKEN = ENV.get("HUGGING_FACE_TOKEN") or ENV.get("HF_TOKEN") or _prompt(
+    "Hugging Face access token", secret=True) or None
+
+# ---- LLM arm ------------------------------------------------------------- #
+# These three are the only things the run needs from you. `build_backend`
+# passes them to `UniversalAPIBackend` explicitly, because that class resolves
+# its own key from .env/os.environ and would otherwise ignore a typed-in value.
+LLM_MODEL_ID = _resolve("BASE_LLM_MODEL", default="google/gemma-4",
+                        label="LLM model id")
+LLM_BASE_URL = _resolve("BASE_URL", "LLM_BASE_URL", default="",
+                        label="LLM base URL (blank = provider default)")
+LLM_API_KEY = _resolve("API_KEY", "OPENAI_API_KEY", "LLM_API_KEY", default="",
+                       secret=True, label="LLM API key")
 
 # ---- runtime ------------------------------------------------------------- #
 DEVICE = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
@@ -217,14 +279,19 @@ MAX_TURNS = 8          # shared with scripts/eval_agent.py's default
 USD_PER_1K_IN = None
 USD_PER_1K_OUT = None
 
-RESULTS_DIR = str(PROJECT_ROOT / "results_lean_v3" / "agentic")
+RESULTS_DIR = str(PROJECT_ROOT / "results_lean_v3_2" / "agentic")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
+# Print shapes, never secrets: a run log that leaks a key gets pasted into a
+# bug report, so a credential is only ever reported as set / not set.
 print("=" * 72)
-print("SPANCALL v3 - AGENTIC INTEGRATION")
+print("SPANCALL v3.2 - AGENTIC INTEGRATION")
 print("=" * 72)
 print(f"HF_REPO_ID        = {HF_REPO_ID}  (local fallback: {USE_LOCAL_CHECKPOINT})")
-print(f"HF token present  = {bool(HF_TOKEN)}   API key present = {bool(ENV.get('API_KEY'))}")
+print(f"HF token present  = {'<set>' if HF_TOKEN else '(none - public repos only)'}")
+print(f"LLM_MODEL_ID      = {LLM_MODEL_ID}")
+print(f"LLM_BASE_URL      = {LLM_BASE_URL or '(provider default)'}")
+print(f"LLM key present   = {'<set>' if LLM_API_KEY else '(none - deterministic backend)'}")
 print(f"DEVICE            = {DEVICE}   SEED = {SEED}   MAX_TURNS = {MAX_TURNS}")
 print(f"RESULTS_DIR       = {RESULTS_DIR}")'''
 
@@ -244,6 +311,12 @@ BACKBONE_FALLBACK = "answerdotai/ModernBERT-large"
 MAX_SEQ_LEN_FALLBACK = 4096
 MAX_SPAN_WIDTH_FALLBACK = 16
 MAX_CALLS_FALLBACK = 1
+# `max_cands` is a *resolver* search width, not part of the architecture, so
+# the v3.2 export does not record it in resolve_config.json. The library default
+# is 2048; v3.2 was trained and evaluated at 1024. A wider pack changes which
+# calls clear the whole-call gate, so the value is pinned here rather than
+# inherited from a default that a future revision could change.
+MAX_CANDS_FALLBACK = 1024
 
 RESOLVER_INFO = {"kind": "unknown"}
 
@@ -368,6 +441,9 @@ else:
         print("[model] resolve_config.json has no resolve_mode (pre-v3 export) -> "
               "forcing 'two_step', which is the mode this notebook evaluates.")
         _mode = "two_step"
+    if _cfg.get("version") not in (None, "v3.2"):
+        print(f"[model] WARNING: artifact version is {_cfg.get('version')!r}, not 'v3.2'. "
+              "The numbers below will not be v3.2 numbers.")
     _floor = _cfg.get("min_joint_margin")
 
     resolver = LeanResolver(
@@ -377,18 +453,27 @@ else:
         max_seq_len=int(_cfg.get("max_seq_len") or MAX_SEQ_LEN_FALLBACK),
         max_span_width=int(_cfg.get("max_span_width") or MAX_SPAN_WIDTH_FALLBACK),
         max_calls=int(_cfg.get("max_calls") or MAX_CALLS_FALLBACK),
+        max_cands=int(_cfg.get("max_cands") or MAX_CANDS_FALLBACK),
         call_min_prob=float(_cfg.get("call_min_prob", 0.25)),
         call_min_prob_ratio=float(_cfg.get("call_min_prob_ratio", 0.5)),
         min_joint_margin=(float(_floor) if _floor is not None else None),
         resolve_mode=str(_mode),
-        collapse_guard=bool(_cfg.get("collapse_guard", False)),
-        prevent_param_collapse=bool(_cfg.get("prevent_param_collapse", False)),
+        # The v3.2 export writes both guards as True. The fallback default only
+        # applies to an artifact that predates them, and defaulting such a case
+        # to False would silently re-enable the parameter-collapse failure they
+        # were introduced to prevent.
+        collapse_guard=bool(_cfg.get("collapse_guard", True)),
+        prevent_param_collapse=bool(_cfg.get("prevent_param_collapse", True)),
     )
     RESOLVER_INFO = {
         "kind": "lean",
         "backbone": _cfg.get("backbone"),
         "head_dim": int(_cfg.get("head_dim") or 256),
         "max_seq_len": int(_cfg.get("max_seq_len") or MAX_SEQ_LEN_FALLBACK),
+        "max_cands": int(_cfg.get("max_cands") or MAX_CANDS_FALLBACK),
+        "max_calls": int(_cfg.get("max_calls") or MAX_CALLS_FALLBACK),
+        "collapse_guard": bool(_cfg.get("collapse_guard", True)),
+        "prevent_param_collapse": bool(_cfg.get("prevent_param_collapse", True)),
         "resolve_mode": str(_mode),
         "min_joint_margin": _floor,
         "version": _cfg.get("version"),
@@ -396,8 +481,12 @@ else:
         "source": "local export" if _local_dir else HF_REPO_ID,
     }
     print(f"[model] loaded from {RESOLVER_INFO['source']}")
-    print(f"[model] backbone={RESOLVER_INFO['backbone']} head_dim={RESOLVER_INFO['head_dim']} "
-          f"resolve_mode={RESOLVER_INFO['resolve_mode']} min_joint_margin={RESOLVER_INFO['min_joint_margin']}")
+    print(f"[model] version={RESOLVER_INFO['version']} backbone={RESOLVER_INFO['backbone']} "
+          f"head_dim={RESOLVER_INFO['head_dim']} resolve_mode={RESOLVER_INFO['resolve_mode']}")
+    print(f"[model] min_joint_margin={RESOLVER_INFO['min_joint_margin']} "
+          f"max_cands={RESOLVER_INFO['max_cands']} max_calls={RESOLVER_INFO['max_calls']} "
+          f"collapse_guard={RESOLVER_INFO['collapse_guard']} "
+          f"prevent_param_collapse={RESOLVER_INFO['prevent_param_collapse']}")
 
 print(f"[model] resolver = {type(resolver).__name__}")'''
 
@@ -428,7 +517,10 @@ for _name, _suite in TASK_SUITES.items():
     print(f"[tasks] {_name}: {len(_suite)} task(s) -> {[t['task_id'] for t in _suite]}")
 
 # ---- LLM backend --------------------------------------------------------- #
-LLM_MODEL_ID = ENV.get("BASE_LLM_MODEL") or "google/gemma-4"
+# `LLM_MODEL_ID` / `LLM_BASE_URL` / `LLM_API_KEY` were resolved in cell 0b
+# (env -> .env -> prompt). Re-reading the environment here would reintroduce the
+# exact failure the prompt exists to prevent: a key typed in at 0b and then not
+# found by a second, independent lookup.
 
 
 def build_backend(live):
@@ -437,11 +529,19 @@ def build_backend(live):
     The one-call probe is the point: without it an invalid key surfaces inside
     the first suite, after some modes have already been scored, and the partial
     results look like a router difference rather than an auth failure.
+
+    ``api_key`` / ``api_base`` are passed explicitly because ``UniversalAPIBackend``
+    otherwise resolves them from ``.env`` / ``os.environ`` alone, which would
+    silently ignore a value the user typed at the 0b prompt.
     """
     if live:
         try:
             from spancall.agent.backends.litellm_adapter import UniversalAPIBackend
-            backend = UniversalAPIBackend(model_id=LLM_MODEL_ID)
+            backend = UniversalAPIBackend(
+                model_id=LLM_MODEL_ID,
+                api_base=LLM_BASE_URL or None,
+                api_key=LLM_API_KEY,
+            )
             probe = backend.generate_tool_call(
                 [{"role": "user", "content": "Book flight F001."}],
                 make_booking_tools(),
@@ -453,11 +553,12 @@ def build_backend(live):
             print(f"[llm] live backend unavailable ({type(exc).__name__}: {exc}) "
                   "-> falling back to the deterministic backend")
     else:
-        print("[llm] no API_KEY in the environment -> deterministic backend")
+        print("[llm] no API key (none in env/.env, none typed at the 0b prompt) "
+              "-> deterministic backend")
     return eval_agent.DeterministicBackend(), "deterministic"
 
 
-LLM_BACKEND, BACKEND_KIND = build_backend(bool(ENV.get("API_KEY")))
+LLM_BACKEND, BACKEND_KIND = build_backend(bool(LLM_API_KEY))
 print(f"[llm] backend = {BACKEND_KIND}")
 
 
@@ -739,7 +840,8 @@ if not _has_lean:
 elif BACKEND_KIND == "deterministic":
     print("\\n[!] LLM arm is the deterministic rule-based backend: it is a fair test of")
     print("    router plumbing and token accounting, but NOT of LLM quality. Re-run with")
-    print("    API_KEY set for numbers you would put in a paper.")
+    print("    an API key (export API_KEY, or type one at the 0b prompt) for numbers")
+    print("    you would put in a paper.")
 
 with open(os.path.join(RESULTS_DIR, "agentic_mode_table.json"), "w", encoding="utf-8") as _fh:
     json.dump(
@@ -762,8 +864,8 @@ CODE_LIVE = '''# 6. Live LLM re-run (key-guarded). No-op without a key.
 LIVE_MODEL_ID = None          # e.g. "anthropic/claude-sonnet-4" or a vLLM model id
 LIVE_RERUN = False            # flip to True to replace the table with live numbers
 
-if not ENV.get("API_KEY"):
-    print("[live] no API_KEY in the environment -> nothing to do.")
+if not LLM_API_KEY:
+    print("[live] no LLM key was supplied at 0b (env/.env/prompt) -> nothing to do.")
     print("[live] Section 4 already used the deterministic backend; the table above")
     print("[live] is a plumbing/token-accounting result, not an LLM-quality result.")
 elif LIVE_MODEL_ID:
