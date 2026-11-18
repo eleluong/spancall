@@ -1,6 +1,7 @@
 """Unit tests for the Lean flow (spancall/lean)."""
 
 import math
+import time
 from datetime import date
 from types import SimpleNamespace
 
@@ -2614,6 +2615,136 @@ def test_resolver_latency_is_additive_across_stages() -> None:
     assert stage_sum <= res.latency_ms + 1e-6, (
         f"stage sum {stage_sum} > total {res.latency_ms}; total is not additive"
     )
+
+
+class _SleepyEncoder(nn.Module):
+    """Backbone whose forward costs ~``per_row_ms`` for every row it processes.
+
+    A real GPU forward scales with the rows in the batch, so the AMORTISED cost
+    per row is constant. Any latency metric that charges each row the whole batch
+    forward — or its queue wait behind the other rows — therefore grows linearly
+    with the row count. That is exactly the bug these tests pin.
+    """
+
+    def __init__(self, hidden_dim: int = 32, per_row_ms: float = 1.0) -> None:
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.per_row_ms = per_row_ms
+        self.emb = nn.Embedding(256, hidden_dim)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        token_type_ids: torch.Tensor = None,
+    ) -> torch.Tensor:
+        time.sleep(self.per_row_ms * input_ids.shape[0] / 1000.0)
+        return self.emb(input_ids)
+
+
+def _sleepy_oracle_results(n_rows: int, per_row_ms: float = 1.0):
+    """Run ``n_rows`` identical oracle resolutions through the batched path."""
+    torch.manual_seed(0)
+    enc = _SleepyEncoder(hidden_dim=32, per_row_ms=per_row_ms)
+    model = LeanSpanCallModel(encoder=enc, head_dim=16, hidden_dim=32)
+    resolver = LeanResolver(model=model, max_seq_len=512, resolve_mode="two_step")
+    schema = ToolDefinition(
+        name="get_weather",
+        description="Weather",
+        parameters=[ParameterSchema(name="city", description="", param_type="string", required=True)],
+    )
+    items = [
+        {
+            "schema": schema,
+            "utterance": "Weather in Tokyo",
+            "recent_context": None,
+            "now": None,
+            "context_schemas": [schema],
+        }
+        for _ in range(n_rows)
+    ]
+    return resolver.resolve_oracle_batch(items, batch_size=32, num_workers=1)
+
+
+def test_per_row_latency_is_not_linear_in_the_number_of_rows() -> None:
+    """Latency must not grow with the size of the batch it rode in.
+
+    ``_prep_step2_item`` captures ``t0`` at prep time while every row's prep
+    finishes before the first forward runs, so the old ``perf_counter() - t0``
+    charged each row its own queue wait plus the entire batch forward. With
+    constant per-row work that made mean latency linear in the row count
+    (measured 4.9x -> 18x -> 66.8x inflation at n = 8 / 32 / 128). The amortised
+    share fixes it: 8x more rows must not mean ~8x more per-row latency.
+    """
+    small = _sleepy_oracle_results(8)
+    large = _sleepy_oracle_results(64)
+    mean_small = sum(float(r.latency_ms or 0.0) for r in small) / len(small)
+    mean_large = sum(float(r.latency_ms or 0.0) for r in large) / len(large)
+    assert mean_large <= mean_small * 2.0, (
+        f"per-row latency grew {mean_large / mean_small:.1f}x when the row count went "
+        f"8 -> 64 ({mean_small:.2f} -> {mean_large:.2f} ms with constant per-row work): "
+        "latency is still being charged the batch forward or the queue wait"
+    )
+
+
+def test_latency_equals_the_sum_of_its_stages() -> None:
+    """``latency_ms`` IS the stage sum, not a wall-clock delta around them."""
+    results = _sleepy_oracle_results(16)
+    for res in results:
+        stage_sum = sum(
+            float(res.features.get(k, 0.0) or 0.0)
+            for k in ("pre_ms", "mask_ms", "enc_ms", "heads_ms", "decode_ms", "post_ms")
+        )
+        assert float(res.latency_ms) == pytest.approx(stage_sum, abs=1e-6), (
+            f"latency {res.latency_ms} != stage sum {stage_sum}; the total has "
+            "drifted from the stages it is supposed to be made of"
+        )
+
+
+def test_amortised_encode_share_is_split_across_the_batch() -> None:
+    """Each row reports ``forward_ms / batch_rows``, not the whole forward.
+
+    ``_SleepyEncoder`` sleeps ``per_row_ms`` per row, so a batch of B rows costs
+    ~B ms. The share each row is charged must therefore stay ~``per_row_ms`` no
+    matter how many rows shared the forward.
+    """
+    results = _sleepy_oracle_results(32, per_row_ms=1.0)
+    shares = [float(r.features.get("enc_ms", 0.0) or 0.0) for r in results]
+    assert all(s > 0.0 for s in shares), f"some rows recorded no encode time: {shares}"
+    # One shared 32-row batch (~32 ms) split 32 ways => ~1 ms per row. The old
+    # code charged ~32 ms to EVERY row.
+    assert max(shares) < 8.0, (
+        f"a row was charged {max(shares):.1f} ms of encode time for a ~1 ms/row "
+        "forward; the batch cost is not being amortised"
+    )
+
+
+def test_two_step_latency_attributes_the_step1_forward() -> None:
+    """Step 1's forward must be counted somewhere in the two-step total.
+
+    Previously step-1 ``enc_ms`` held its HEAD-SCORING time and the forward was
+    never added, so two-step latency silently omitted an entire encoder pass.
+    """
+    torch.manual_seed(0)
+    enc = _SleepyEncoder(hidden_dim=32, per_row_ms=1.0)
+    model = LeanSpanCallModel(encoder=enc, head_dim=16, hidden_dim=32)
+    resolver = LeanResolver(model=model, max_seq_len=512, resolve_mode="two_step")
+    a, b = _two_schemas_sharing_param()
+    items = [
+        {"candidate_schemas": [a, b], "utterance": "find the doc about Paris",
+         "recent_context": None, "now": None}
+    ]
+    res = resolver.resolve_candidates_batch(items, batch_size=8, num_workers=1)[0]
+    assert float(res.features.get("step1_enc_ms", 0.0) or 0.0) > 0.0, (
+        "step 1 recorded no encode time; its forward is still unattributed"
+    )
+    assert res.features.get("step1_heads_ms") is not None, (
+        "step 1 has no separate head-scoring timer; scoring is still mislabelled "
+        "as encoding"
+    )
+    assert float(res.latency_ms) == pytest.approx(
+        float(res.features["stage_sum_ms"]), abs=1e-6
+    ), "two-step latency is not the sum of its merged stages"
 
 
 def test_tensorize_sanitizes_recent_rows_like_inference() -> None:

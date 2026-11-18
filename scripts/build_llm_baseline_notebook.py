@@ -166,6 +166,24 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 # subsets, which is why `SINGLE_CALL_ONLY=True` and `max_calls=1` below.
 EVAL_SPLITS = ["hermes_eval", "xlam_eval"]
 
+# Rows to SAMPLE from each split before any filtering. Must equal EVAL_LIMIT in
+# `spancall_lean_v3_2_train_eval.ipynb`, which is 2000.
+#
+# This is not a tunable: it is the POPULATION DEFINITION. The frozen prediction
+# files (`preds_eval_twostep.jsonl` = 1,659 rows, `preds_xlam_eval_twostep.jsonl`
+# = 2,000 rows) were produced by sampling with `limit=2000`, so a subset built
+# with a different limit is a different set of rows. `limit=None` samples the
+# WHOLE split (9,101 xLAM rows) and then the frozen predictions cover only the
+# first ~22% of it - the coverage check then fails with "N subset rows have NO
+# prediction", which is correct but describes a self-inflicted wound: the two
+# arms were pointed at different populations before either ran.
+#
+# `build_stratified_eval_subset()` allocates `int(round(target_n * ratio))` per
+# cohort from a seed-shuffled per-cohort list, so `limit=2000` is deterministic
+# and its output is a SUBSET of what `limit=None` would emit - which is exactly
+# why a 9,101-row `_clean` file looks plausible and is wrong.
+EVAL_LIMIT = 2000
+
 # --------------------------------------------------------------------------- #
 # Where the frozen v3.2 SpanCall predictions come from.
 # --------------------------------------------------------------------------- #
@@ -335,6 +353,7 @@ print(f"LLM_API_KEY     = {'<set>' if LLM_API_KEY else '(MISSING - cell 4 will s
 print(f"LLM_LIMIT_FRACTION = {LLM_LIMIT_FRACTION}")
 print(f"LLM_RESUME      = {LLM_RESUME}   (checkpoint every {LLM_CHECKPOINT_EVERY} rows)")
 print(f"EVAL_SPLITS     = {EVAL_SPLITS}")
+print(f"EVAL_LIMIT      = {EVAL_LIMIT}   (rows sampled per split; must match v3.2)")
 print(f"RESULTS_DIR     = {RESULTS_DIR}")
 print("=" * 72)
 if LLM_LIMIT_FRACTION < 1.0:
@@ -358,14 +377,21 @@ subset could have been produced by a different stratification seed and the
 
 | stage | output | what it does |
 | --- | --- | --- |
-| 1. stratify | `subset_{sp}.jsonl` | `build_stratified_eval_subset()`, seed-controlled, cohort-proportional |
+| 1. stratify | `subset_{sp}.jsonl` | `build_stratified_eval_subset(limit=EVAL_LIMIT)`, seed-controlled, cohort-proportional |
 | 2. single-call | `subset_{sp}.jsonl` (in place) | keep rows with exactly one GT call, because `SINGLE_CALL_ONLY` pins `max_calls=1` |
 | 3. Step-0 gate | `subset_{sp}_clean.jsonl` | drop rows `build_input_multi()` cannot render; **this file is scored** |
 
 The training notebook scores the `_clean` file, so this notebook does too.
 
-Both extra stages matter for fairness, and both were missing here before:
+All three stages matter for fairness, and each one was missing here at some point:
 
+- **Stage 1's `limit`** — `EVAL_LIMIT` is the **population definition**, not a
+  sampling convenience. The training notebook samples `limit=2000` and writes
+  those rows to `preds_*_twostep.jsonl`; a subset sampled with any other limit
+  (in particular `None`, which means *the whole split*) describes different rows.
+  That mismatch is silent until the coverage check runs, and then it looks like
+  missing predictions rather than like the sampling bug it is. `EVAL_LIMIT` in
+  cell 0 must stay at `2000`.
 - **Stage 2** — with `max_calls=1`, SpanCall *cannot* emit a second call. Scoring
   it on multi-call rows charges it with a structural miss, while the LLM (which
   returns several calls happily) is treated generously on the same rows. The
@@ -373,6 +399,15 @@ Both extra stages matter for fairness, and both were missing here before:
   filter the LLM here would be scored on a larger, different population.
 - **Stage 3** — the gate vetoed 0 rows in the published run, which is exactly why
   a silent divergence would go unnoticed until the data changed.
+
+### The subset is rebuilt every run, never reused from disk
+
+Stage 1-3 are unconditional. Caching them on `os.path.exists()` was a cache with
+no invalidation key: a `subset_xlam_eval_clean.jsonl` left behind by a build with
+a different `EVAL_LIMIT` is silently reused, and the population mismatch only
+surfaces three cells later as "N subset rows have NO prediction". Rebuilding is
+deterministic (fixed seed) and costs one line scan plus ~2k renders, so the cache
+bought nothing and could only ever hide a stale sample.
 
 ### The `data/processed_v3_2` directory is **built, not downloaded**
 
@@ -558,58 +593,80 @@ def _single_call_filter(sub_path: str, split_name: str) -> int:
     return len(keep)
 
 
+# The subset is rebuilt on EVERY run, unconditionally.
+#
+# It used to be `if not os.path.exists(_sub)`, which is a cache with no
+# invalidation key: a `subset_xlam_eval_clean.jsonl` left behind by an earlier
+# version of this cell is silently reused. That is exactly how the
+# "69/910 subset rows have NO prediction" failure happened - an earlier build
+# passed `limit=None`, sampling all 9,101 xLAM rows instead of the paper's
+# 2,000, and every later run happily reused the 9,101-row file while the frozen
+# predictions still covered only 2,000. The population mismatch then surfaced as
+# a coverage error three cells later, blaming the predictions for a subset bug.
+#
+# Rebuilding is cheap (a line scan of the split + ~2k renders) and the realign
+# above stays cached, so there is nothing worth caching here. `build_stratified
+# _eval_subset` is seed-deterministic, so an unconditional rebuild is a no-op
+# when nothing changed and a repair when something did.
 SUBSET_PATHS = {}
+SUBSET_INFO = {}
 for _sp in EVAL_SPLITS:
     _sub = os.path.join(RESULTS_DIR, f"subset_{_sp}.jsonl")          # ungated
     _clean = os.path.join(RESULTS_DIR, f"subset_{_sp}_clean.jsonl")  # gated, SCORED
-    if not os.path.exists(_sub):
-        print(f"[data] building stratified subset for {_sp} ...")
-        # `limit=None` matters: the signature default is 500 rows, which would
-        # quietly shrink the comparison to a sample the paper never reports.
-        build_stratified_eval_subset(
-            split_name=_sp,
-            data_dir=DATA_DIR,
-            out_path=_sub,
-            limit=None,
-            seed=SEED,
-        )
-        # Order matters and matches the training notebook: sample -> single-call
-        # -> sanitize gate. The `_clean` file must be the SAME population the
-        # paper's SpanCall numbers were computed on.
-        if SINGLE_CALL_ONLY:
-            _single_call_filter(_sub, _sp)
-    if not os.path.exists(_clean):
-        _step0_sanitize_gate(_sub, _clean, _sp)
+    print(f"[data] building stratified subset for {_sp} (limit={EVAL_LIMIT}) ...")
+    # `limit=EVAL_LIMIT`, NOT `None` and NOT the 500 default. This argument
+    # defines the population: the frozen v3.2 predictions were produced by
+    # sampling `limit=EVAL_LIMIT`, so any other value makes the two arms
+    # incomparable before a single row is scored.
+    SUBSET_INFO[_sp] = build_stratified_eval_subset(
+        split_name=_sp,
+        data_dir=DATA_DIR,
+        out_path=_sub,
+        limit=EVAL_LIMIT,
+        seed=SEED,
+    )
+    # Order matters and matches the training notebook: sample -> single-call
+    # -> sanitize gate. The `_clean` file must be the SAME population the
+    # paper's SpanCall numbers were computed on.
+    if SINGLE_CALL_ONLY:
+        _single_call_filter(_sub, _sp)
+    _step0_sanitize_gate(_sub, _clean, _sp)
     SUBSET_PATHS[_sp] = _clean
     _rows = [json.loads(l) for l in open(_clean, encoding="utf-8") if l.strip()]
     _strata = {}
     for _r in _rows:
         _strata[_r.get("stratum", "?")] = _strata.get(_r.get("stratum", "?"), 0) + 1
 
-    # STALE-CACHE GUARD. Both stages above are skipped when the files already
-    # exist, so a `_clean` file produced by an earlier version of this notebook
-    # (or by hand) can predate the single-call filter and quietly put the LLM on
-    # multi-call rows the resolver cannot answer. Detect that instead of
-    # trusting the filename.
+    # SINGLE-CALL ASSERTION. The filter above is now unconditional, so this can
+    # only fire if the filter itself regressed. It stays because the failure it
+    # catches - scoring a resolver with `max_calls=1` on rows that ask for two
+    # calls - is invisible in every metric except as a mysterious hit-rate dip.
     if SINGLE_CALL_ONLY:
         _multi = sum(1 for _r in _rows
                      if len(_r.get("ground_truth_calls") or []) != 1)
         if _multi:
             raise SystemExit(
                 f"[data] {_clean} holds {_multi} rows that are not single-call, but "
-                f"SINGLE_CALL_ONLY=True. This is a STALE subset built before the "
-                f"single-call filter existed, and scoring it would compare the arms "
-                f"on a population the paper never used. Delete "
-                f"{os.path.dirname(_clean)}/subset_{_sp}*.jsonl and re-run this cell."
+                f"SINGLE_CALL_ONLY=True. The single-call filter did not run, so this "
+                f"cell would compare the arms on a population the paper never used."
             )
 
+    # POPULATION REPORT. `sampled_total` and `clean rows` are printed TOGETHER
+    # with the v3.2 reference counts because the mismatch that caused the
+    # coverage failure was invisible in either number alone: 9,101 xLAM rows is
+    # a perfectly valid subset, just not the one the predictions describe.
+    _sampled = SUBSET_INFO[_sp]["sampled_total"]
+    if _sp == "xlam_eval" and _sampled != 2000:
+        print(f"[data] !! {_sp}: sampled {_sampled} rows, but the frozen v3.2 "
+              f"predictions cover 2000. EVAL_LIMIT must be 2000.")
     _n_scored = len(_limit_rows(_rows))
-    print(f"[data] {_sp}: {len(_rows)} clean rows  strata={_strata}")
+    print(f"[data] {_sp}: sampled {_sampled} -> single-call+gate {len(_rows)} clean rows"
+          f"  strata={_strata}")
     print(f"[data] {_sp}: {_n_scored} rows will be scored "
           f"(LLM_LIMIT_FRACTION={LLM_LIMIT_FRACTION})")
-    print(f"[data] {_sp}: population must equal the v3.2 run's n_F denominator;"
-          f" if it does not, the subset files and the frozen predictions came from"
-          f" different data snapshots.")
+    print(f"[data] {_sp}: v3.2 reference = "
+          f"{'1659' if _sp == 'hermes_eval' else '2000'} rows"
+          f" (must match, or the frozen predictions describe another population)")
 
 # Every downstream cell iterates THIS mapping, so both arms are guaranteed the
 # same rows in the same order. A dict, not a set, because order is the contract.
@@ -790,6 +847,23 @@ The loaded file is validated against the subset before it is trusted: every
 subset `sample_id` must be covered, otherwise the two arms would be scored on
 different populations.
 
+### Two different failures, and only one of them is about predictions
+
+The coverage check distinguishes them, because the fix is completely different
+and the old message conflated them:
+
+| symptom | cause | fix |
+| --- | --- | --- |
+| subset file is **larger than `EVAL_LIMIT`** | cell 1 sampled a different population (e.g. `limit=None` → all 9,101 xLAM rows) | set `EVAL_LIMIT=2000` and re-run cell 1 |
+| subset ≤ `EVAL_LIMIT`, a few rows absent | inference was interrupted | re-run §4c of the v3.2 notebook |
+
+A clean subset can never exceed `EVAL_LIMIT`: `build_stratified_eval_subset()`
+caps at `limit` and the single-call + sanitize stages only remove rows. So
+"larger than `EVAL_LIMIT`" is a *proof* that the subset came from a different
+sampling call. Re-running inference, or repointing `CANDIDATE_PRED_PATHS`, cannot
+fix that case — and the original message said to do exactly that, which is how a
+one-argument bug turns into hours of wasted GPU time.
+
 Inference is kept as a fallback path for the case where the v3.2 results
 directory is not available (a fresh machine, or a re-run). If it is used, the
 cell prints a warning that the SpanCall numbers are **new** and may not match
@@ -859,7 +933,7 @@ CODE_INFER = '''# 3. Load the SpanCall predictions the v3.2 run already produced
 #   hermes_eval -> preds_eval_twostep.jsonl
 #   xlam_eval   -> preds_xlam_eval_twostep.jsonl
 from spancall.data.schema import UnifiedSample
-import json, os, glob, shutil, hashlib
+import json, os, glob, shutil, hashlib, time
 
 # `V3_2_RESULTS_DIR` comes from the config cell. `results_lean_v3_2/` is not in
 # git and not on the Hub, so a fresh clone must be pointed at it (Drive mount or
@@ -919,13 +993,62 @@ def _load_preds(path: str) -> dict:
     return out
 
 
-def _validate_coverage(split_name: str, subset_path: str, by_id: dict) -> None:
-    """Both arms must be scored on the same population, or nothing else means anything."""
-    rows = [json.loads(l) for l in open(subset_path, encoding="utf-8") if l.strip()]
-    rows = _limit_rows(rows)          # same cohort-proportional trim as every other cell
+def _validate_coverage(split_name: str, subset_path: str, by_id: dict,
+                       pred_path: str = None) -> None:
+    """Both arms must be scored on the same population, or nothing else means anything.
+
+    A missing prediction is ALWAYS fatal, but it has two very different causes and
+    the old message could not tell them apart:
+
+      1. the predictions are for the right rows and some are genuinely absent
+         (an interrupted inference run) -> re-run §4c;
+      2. the SUBSET is the wrong population, so the predictions were never meant
+         to cover it (this is what `limit=None` produced: 9,101 xLAM rows vs the
+         2,000 the frozen file covers) -> `EVAL_LIMIT` is wrong.
+
+    The second case used to be reported as case 1, which sends the reader off to
+    re-infer millions of tokens for a bug that lives in one argument. The check
+    below distinguishes them by SIZE: if the predictions cover far fewer rows than
+    the subset asks for while also being almost entirely a subset of it, the
+    population was resampled, not truncated.
+    """
+    all_rows = [json.loads(l) for l in open(subset_path, encoding="utf-8") if l.strip()]
+    rows = _limit_rows(all_rows)      # same cohort-proportional trim as every other cell
     want = [str(r.get("sample_id")) for r in rows]
     missing = [sid for sid in want if sid not in by_id]
     if missing:
+        # Two causes, and the difference is decisive:
+        #
+        #  * the SUBSET is the wrong population (built with a different
+        #    `EVAL_LIMIT`), so the frozen predictions were never meant to cover
+        #    it. Signature: the subset was drawn from a LARGER pool than the
+        #    paper's, so more rows survived sampling+filtering than EVAL_LIMIT.
+        #  * inference was INTERRUPTED. Signature: the subset is a legitimate
+        #    population (<= EVAL_LIMIT rows, since sampling caps it and the
+        #    single-call/sanitize stages only ever remove rows); only some of its
+        #    rows are absent from the prediction file.
+        #
+        # `len(all_rows) > _eval_limit` is exact, not a heuristic: sampling can
+        # never emit more than `limit` rows, and both later stages only filter.
+        # A clean subset larger than EVAL_LIMIT therefore PROVES it came from a
+        # different sampling call - no amount of re-inference can fix that.
+        #
+        # `globals().get`, not a bare name: the offline smoke test exec's this
+        # cell with a namespace that only carries the evaluation names, so a
+        # direct reference would raise NameError there and only there. The value
+        # still comes from the notebook at run time.
+        _eval_limit = globals().get("EVAL_LIMIT")
+        if _eval_limit and len(all_rows) > _eval_limit:
+            raise SystemExit(
+                f"[spancall:{split_name}] POPULATION MISMATCH, not a missing prediction. "
+                f"The subset file holds {len(all_rows)} rows, which is more than "
+                f"EVAL_LIMIT={_eval_limit}: it was sampled from a larger pool than the "
+                f"paper's, so {len(missing)} of the {len(want)} scored rows were never "
+                f"going to have a prediction (first: {missing[0]}). The frozen v3.2 "
+                f"file covers the {_eval_limit}-row stratified subset only, so re-running "
+                f"inference or repointing CANDIDATE_PRED_PATHS will NOT help. Set "
+                f"EVAL_LIMIT={_eval_limit} in cell 0 and re-run cell 1."
+            )
         raise SystemExit(
             f"[spancall:{split_name}] {len(missing)}/{len(want)} subset rows have NO prediction "
             f"(first: {missing[0]}). Scoring SpanCall on a different population than the LLM "
@@ -956,12 +1079,23 @@ def run_spancall_inference(split_name: str, subset_path: str, out_path: str) -> 
         }
         for s in samples
     ]
+    # WALL CLOCK is measured here and reported SEPARATELY from ``latency_ms``.
+    # The two answer different questions: ``latency_ms`` is the amortised
+    # per-sample cost (comparable to the LLM's per-call time), while this
+    # wall clock is the throughput actually achieved on whatever hardware ran
+    # the cell. Conflating them is what let the old per-row timer look honest
+    # while scaling with the batch size.
+    _wall_t0 = time.perf_counter()
     results = resolver.resolve_candidates_batch(
         items,
         batch_size=EVAL_BATCH_SIZE,
         num_workers=EVAL_WORKERS,
         protect_parity_spans=False,   # never True: it would leak GT spans past max_cands
     )
+    _wall_s = time.perf_counter() - _wall_t0
+    print(f"[spancall:{split_name}] wall clock {_wall_s:.2f}s for {len(results)} rows "
+          f"= {len(results) / _wall_s:.1f} rows/sec (batch_size={EVAL_BATCH_SIZE}, "
+          f"workers={EVAL_WORKERS})")
 
     by_id = {}
     with open(out_path, "w", encoding="utf-8") as fh:
@@ -1516,8 +1650,13 @@ def _print_latency(sys_metrics, split_name):
               f"{_t['mean']:>9.1f}{_t['p50']:>8.1f}{_t['p90']:>8.1f}"
               f"{_t['p95']:>8.1f}{_t['p99']:>8.1f}{_t['max']:>9.1f}")
     print("-" * len(_hdr))
-    print("Nearest-rank percentiles over positive per-row latencies. LLM latency")
-    print("includes the network round trip; SpanCall's is local decode time.")
+    print("Nearest-rank percentiles over positive per-row latencies.")
+    print("LLM latency = one network round trip to the hosted endpoint.")
+    print("SpanCall latency = AMORTISED per-sample cost: its own render/mask,")
+    print("  plus its share of the batched backbone forward (batch_ms / rows),")
+    print("  plus head scoring and decode. It is NOT the wall time of the batch,")
+    print("  so it is comparable across models but understates GPU throughput.")
+    print("  For throughput, see the rows/sec line above, which is wall clock.")
 
 
 def _print_latency_pivot(sys_metrics, rows, ids):
@@ -1804,11 +1943,25 @@ payload = {
         "llm_base_url": LLM_BASE_URL or "(sdk default)",
         "llm_temperature": LLM_TEMPERATURE,
         "llm_limit_fraction": LLM_LIMIT_FRACTION,
+        # The sampling limit that DEFINED the population. Recorded next to the
+        # results because a reader comparing against the paper needs to know
+        # which rows were eligible: `EVAL_LIMIT=None` would have produced the
+        # same table shape on a 4.5x larger base, and nothing in the metrics
+        # would say so.
+        #
+        # `globals().get` for the same reason as `_rev_resolved` below: this cell
+        # is exec'd by the offline smoke test with a namespace that carries only
+        # the evaluation names.
+        "eval_limit": globals().get("EVAL_LIMIT"),
         "seed": SEED,
         "eval_splits": EVAL_SPLITS,
         "resolve_mode": "two_step",
         "min_joint_margin": MIN_JOINT_MARGIN,
         "n_rows": {sp: len(_eval_rows(SUBSET_PATHS[sp])) for sp in EVAL_SPLITS},
+        "n_rows_sampled": {
+            sp: (globals().get("SUBSET_INFO") or {}).get(sp, {}).get("sampled_total")
+            for sp in EVAL_SPLITS
+        },
         "spancall_source": SPANCALL_SOURCE,
         "llm_source": LLM_SOURCE,
         "note": ("One hosted-LLM arm via the OpenAI SDK. Both arms scored by the "
@@ -1853,7 +2006,10 @@ for _sp in EVAL_SPLITS:
 print("-" * 121)
 print("exact_F / hit_F / param_F1 are stratum F (`F_func` + `F_json`).")
 print("false_hit_A is the share of ungroundable turns the system answered anyway (lower is better).")
-print(f"lat_ms / p90_ms are per-call wall clock over {LLM_LIMIT_FRACTION:.0%} of each split.")
+print(f"lat_ms / p90_ms are per-call latency over {LLM_LIMIT_FRACTION:.0%} of each split.")
+print("  LLM lat_ms = network round trip; SpanCall lat_ms = amortised per-sample")
+print("  cost (own preprocess + batch_forward/rows + heads + decode). Same unit,")
+print("  same population, so the two columns are directly comparable.")
 
 # --------------------------------------------------------------------------- #
 # What counts as a shipment artifact.
@@ -2020,10 +2176,17 @@ one fails, the comparison is not publishable and no amount of framing fixes it.
 ### On the latency numbers
 
 4. **Report p90, not just the mean — and say what each one measures.** The two
-   figures are not the same quantity. SpanCall's `latency_ms` is local decode
-   time on a GPU; the LLM's is a network round trip to a hosted endpoint plus
-   queueing. That asymmetry is the *finding*, not a flaw in the measurement, but
-   it has to be stated or a reviewer will read "850 ms" as model quality.
+   figures are not the same quantity. SpanCall's `latency_ms` is an **amortised
+   per-sample cost**: its own render/mask/tokenize work, plus its share of the
+   batched backbone forward (`batch_forward_ms / rows_in_batch`), plus head
+   scoring and decode. It deliberately does NOT include the queue wait behind
+   the other rows in its batch — a per-row `perf_counter()` delta would, and
+   that error grows linearly with the batch size, which is why an earlier
+   version of this notebook reported latencies many times too high. The LLM's
+   `latency_ms` is a network round trip to a hosted endpoint plus queueing.
+   That asymmetry is the *finding*, not a flaw in the measurement, but it has to
+   be stated or a reviewer will read "850 ms" as model quality. The honest
+   second number is **throughput** (wall-clock rows/sec), printed alongside.
 5. **Check `n_timed` before quoting any percentile.** If `n_timed` is 0 the arm
    made no timed call (see the error rows above), and if it is well below `n`,
    some rows were never timed. A p90 over 3 surviving rows is not a p90.

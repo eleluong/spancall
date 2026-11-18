@@ -64,6 +64,9 @@ def _run(project_root: Path, environ: dict, answers: list):
         "PROJECT_ROOT": str(project_root),
         # names the post-bootstrap part of the cell expects to already exist
         "EVAL_SPLITS": ["hermes_eval", "xlam_eval"],
+        # Cell 0 now also defines EVAL_LIMIT and prints it, so the sliced block
+        # needs it for the same reason it needs EVAL_SPLITS.
+        "EVAL_LIMIT": 2000,
         "RESULTS_DIR": str(project_root / "results_lean_v3_2_llm"),
     }
     prompts: list[str] = []

@@ -47,6 +47,24 @@ from span_template.template import (
 )
 
 
+#: The stage timers that make up a resolver's per-row cost. ``latency_ms`` is
+#: defined as their sum (see ``_finalize_param_resolve``), so any per-row
+#: measurement that reports latency MUST also report these under the same names.
+LATENCY_STAGE_KEYS: Tuple[str, ...] = (
+    "pre_ms",
+    "mask_ms",
+    "enc_ms",
+    "heads_ms",
+    "decode_ms",
+    "post_ms",
+)
+
+
+def _stage_sum(features: Dict[str, Any]) -> float:
+    """Sum of the stage timers. One definition so latency can never drift from it."""
+    return float(sum(float(features.get(k, 0.0) or 0.0) for k in LATENCY_STAGE_KEYS))
+
+
 @dataclass
 class LeanParameterResolution:
     """Resolved parameter detail in Lean flow."""
@@ -911,12 +929,16 @@ class LeanResolver(BaseResolver):
             calls = [_call_from_result(first_res, 0, tool_prob=float(winner_p))]
         res = first_res
 
-        # R5: latency must be ADDITIVE. ``_resolve`` starts its own clock, so its
-        # ``latency_ms`` only covers head/decode/post and silently omitted the
-        # render + encode + H1 scoring done here. Reported as the sum, and the
-        # sub-stages keep their own meaning: pre/enc belong to this frame.
-        total_ms = (time.perf_counter() - t0) * 1000
-        res.latency_ms = float(res.latency_ms or 0.0) + total_ms
+        # R5: latency must be ADDITIVE. ``_resolve`` starts its own clock and
+        # already reports the sum of its own stages, so the ONLY thing to add here
+        # is the work this frame owned: step-1 render/tokenize (``pre_ms``) and
+        # step-1 encode (``enc_ms``). Adding ``perf_counter() - t0`` here would
+        # charge the render and encode a second time.
+        res.latency_ms = (
+            float(res.latency_ms or 0.0)
+            + float(features.get("pre_ms", 0.0) or 0.0)
+            + float(features.get("enc_ms", 0.0) or 0.0)
+        )
         step2_pre_ms = float(res.features.get("pre_ms", 0.0) or 0.0)
         step2_enc_ms = float(res.features.get("enc_ms", 0.0) or 0.0)
         step2_render_T = res.features.get("render_T")
@@ -933,10 +955,7 @@ class LeanResolver(BaseResolver):
             res.features["enc_ms"] = float(features["enc_ms"]) + step2_enc_ms
         # Not every stage name exists in both frames; report the uncovered
         # remainder explicitly rather than letting it vanish into the total.
-        res.features["stage_sum_ms"] = float(
-            sum(res.features.get(k, 0.0) or 0.0 for k in
-                ("pre_ms", "mask_ms", "enc_ms", "heads_ms", "decode_ms", "post_ms"))
-        )
+        res.features["stage_sum_ms"] = _stage_sum(res.features)
         res.features["unattributed_ms"] = float(max(0.0, res.latency_ms - res.features["stage_sum_ms"]))
         res.features["winner_prob"] = float(winner_p)
         res.features["n_calls"] = len(calls)
@@ -1203,13 +1222,34 @@ class LeanResolver(BaseResolver):
         t_mask: float,
         t_enc: float,
         t_heads: float,
+        enc_ms: Optional[float] = None,
     ) -> LeanResolveResult:
-        """Shared decode -> cast -> unflatten -> validate -> gate -> telemetry tail."""
+        """Shared decode -> cast -> unflatten -> validate -> gate -> telemetry tail.
+
+        ``enc_ms`` is the AMORTISED share of the batch forward this row rode in.
+        A batched caller has already finished every row's prep before the first
+        forward runs, so it cannot express encode cost as ``t_enc - t_mask`` — that
+        difference is queue wait. Passing the amortised share makes ``latency_ms``
+        the sum of this row's own stages, which is the only figure comparable
+        across models. When omitted (the sequential ``_resolve`` path) the local
+        ``t_enc - t_mask`` delta is correct and used instead.
+        """
+
+        # Stage timers, defined ONCE so latency and the reported stages can never
+        # disagree. ``enc_ms`` is either the caller's amortised share or — on the
+        # sequential path — the real local encode delta.
+        stages = {
+            "pre_ms": (t_pre - t0) * 1000,
+            "mask_ms": (t_mask - t_pre) * 1000,
+            "enc_ms": float(enc_ms) if enc_ms is not None else (t_enc - t_mask) * 1000,
+            "heads_ms": (t_heads - t_enc) * 1000,
+        }
 
         if schema.parameters and not anchors:
             reason = "no_param_anchors"
             req = [p.name for p in schema.parameters if p.required]
             opt = [p.name for p in schema.parameters if not p.required]
+            early_stages = {**stages, "decode_ms": 0.0, "post_ms": 0.0}
             return _with_calls(LeanResolveResult(
                 hit=False,
                 tool_name=schema.name,
@@ -1218,8 +1258,8 @@ class LeanResolver(BaseResolver):
                 missing_optional=opt,
                 abstain_reason=reason,
                 error_reason=reason,
-                latency_ms=(time.perf_counter() - t0) * 1000,
-                features=dict(ctx_features),
+                latency_ms=_stage_sum(early_stages),
+                features={**ctx_features, **early_stages},
             ))
 
         # H3 must only see the anchors of the tool being scored: a distractor's
@@ -1532,14 +1572,18 @@ class LeanResolver(BaseResolver):
                         p_schema, int(cs), int(ce), _ctx, self.max_span_width
                     )
                     parity_miss_reasons[miss_r] = parity_miss_reasons.get(miss_r, 0) + 1
+        t_post_end = time.perf_counter()
+        # ``latency_ms`` is the SUM of these stages (see the return below). It is
+        # never ``perf_counter() - t0``: in a batched caller that delta also
+        # contains every other row's prep and the whole batch forward.
+        stages = {
+            **stages,
+            "decode_ms": (t_post - t_heads) * 1000,
+            "post_ms": (t_post_end - t_post) * 1000,
+        }
         features = {
             **ctx_features,
-            "pre_ms": (t_pre - t0) * 1000,
-            "mask_ms": (t_mask - t_pre) * 1000,
-            "enc_ms": (t_enc - t_mask) * 1000,
-            "heads_ms": (t_heads - t_enc) * 1000,
-            "decode_ms": (t_post - t_heads) * 1000,
-            "post_ms": (time.perf_counter() - t_post) * 1000,
+            **stages,
             "temperature": self.temperature,
             "n_valid": int(n_valid),
             "n_params": len(schema.parameters),
@@ -1594,7 +1638,7 @@ class LeanResolver(BaseResolver):
             missing_required=missing_required,
             missing_optional=missing_optional,
             confidence=overall_conf,
-            latency_ms=(time.perf_counter() - t0) * 1000,
+            latency_ms=_stage_sum(stages),
             features=features,
             error_reason=fail_reason,
         ))
@@ -1950,7 +1994,16 @@ class LeanResolver(BaseResolver):
         batch_size: int = 32,
         max_tokens_per_batch: int = 16384,
     ) -> None:
-        """Length-sort, pad, and batch-encode ``(orig_idx, ids)`` items on the backbone."""
+        """Length-sort, pad, and batch-encode ``(orig_idx, ids)`` items on the backbone.
+
+        ``on_encoded(orig_idx, H_k, enc_ms)`` fires once per item with THAT item's
+        amortised share of the batch forward (``forward_ms / rows_in_batch``).
+        Every prep finishes before the first forward runs, so a callback that
+        times itself with ``perf_counter() - t0`` measures its own queue wait plus
+        the whole batch rather than its own cost — an error that grows linearly
+        with the number of rows sharing the batch. The amortised share is the only
+        honest per-row encode cost a padded batched forward can offer.
+        """
         if not prepared or self.model is None:
             return
         backbone = self.model.backbone if self.model is not None else self.encoder
@@ -2000,12 +2053,14 @@ class LeanResolver(BaseResolver):
                     L = len(ids)
                     input_ids[b_i, :L] = torch.tensor(ids, dtype=torch.long, device=device)
                     attn_mask[b_i, :L] = 1
+                t_fwd_0 = time.perf_counter()
                 with amp_ctx:
                     H_batch = backbone(input_ids, attn_mask)
                 if head_dtype is not None and H_batch.dtype != head_dtype:
                     H_batch = H_batch.to(dtype=head_dtype)
+                enc_ms_share = (time.perf_counter() - t_fwd_0) * 1000.0 / float(B)
                 for b_i, (orig_idx, ids) in enumerate(grp):
-                    on_encoded(orig_idx, H_batch[b_i : b_i + 1, : len(ids)])
+                    on_encoded(orig_idx, H_batch[b_i : b_i + 1, : len(ids)], enc_ms_share)
 
     def predict_tools_batch(
         self,
@@ -2086,7 +2141,7 @@ class LeanResolver(BaseResolver):
                 meta_by_idx[idx] = (cands, output, per_token)
                 enc_queue.append((idx, ids))
 
-        def _on_enc(idx: int, H_k: torch.Tensor) -> None:
+        def _on_enc(idx: int, H_k: torch.Tensor, enc_ms: float) -> None:
             cands, output, per_token = meta_by_idx[idx]
             choices = self._tool_scores(output, H_k, per_token)
             if not choices:
@@ -2096,6 +2151,7 @@ class LeanResolver(BaseResolver):
                     "abstain_reason": f"no_tool_scores:{self.last_tool_scores_reason}",
                     "tool_scores_reason": self.last_tool_scores_reason,
                     "tool_objective": obj_mode, "tool_call_threshold": thresh_val,
+                    "enc_ms": float(enc_ms),
                 }
                 return
             winner_name, winner_p = choices[0]
@@ -2109,6 +2165,7 @@ class LeanResolver(BaseResolver):
                 "abstain_reason": "tool_below_threshold" if gated_out else None,
                 "tool_scores_reason": self.last_tool_scores_reason,
                 "tool_objective": obj_mode, "tool_call_threshold": thresh_val,
+                "enc_ms": float(enc_ms),
             }
 
         self._run_encoded_batches(enc_queue, _on_enc, batch_size=batch_size)
@@ -2229,7 +2286,7 @@ class LeanResolver(BaseResolver):
                 meta_by_idx[idx] = rec
                 enc_queue.append((idx, rec["ids"]))
 
-        def _on_enc(idx: int, H_k: torch.Tensor) -> None:
+        def _on_enc(idx: int, H_k: torch.Tensor, enc_ms: float) -> None:
             rec = meta_by_idx[idx]
             t_enc = time.perf_counter()
             anchors, per_param_scores = self._score_parameters(
@@ -2243,7 +2300,7 @@ class LeanResolver(BaseResolver):
                 parity_absolutes=rec["parity_absolutes"], parity_unresolvable=rec["parity_unresolvable"],
                 parity_counters=rec["parity_counters"], ctx_features=rec["ctx_features"],
                 t0=rec["t0"], t_pre=rec["t_pre"], t_mask=rec["t_mask"],
-                t_enc=t_enc, t_heads=t_heads,
+                t_enc=t_enc, t_heads=t_heads, enc_ms=enc_ms,
             )
 
         self._run_encoded_batches(enc_queue, _on_enc, batch_size=batch_size)
@@ -2337,17 +2394,30 @@ class LeanResolver(BaseResolver):
                     }
                     s1_queue.append((idx, ids))
 
-            def _on_s1_enc(idx: int, H_k: torch.Tensor) -> None:
+            def _on_s1_enc(idx: int, H_k: torch.Tensor, enc_ms: float) -> None:
                 m = step1_meta[idx]
-                t_enc_s = time.perf_counter()
+                t_score_0 = time.perf_counter()
                 choices = self._tool_scores(m["output"], H_k, m["per_token"])
-                enc_ms = (time.perf_counter() - t_enc_s) * 1000
+                # Step 1 owns three stages: its own render/tokenize (``pre_ms``,
+                # measured in the worker), its amortised share of the batch
+                # forward (``enc_ms``, handed in by the batcher), and H1 scoring
+                # here (``heads_ms``). Previously the scoring time was mislabelled
+                # ``enc_ms`` while the real forward was never counted at all, so
+                # step 1 looked free to encode and expensive to score.
+                heads_ms = (time.perf_counter() - t_score_0) * 1000
+                s1_stages = {
+                    "pre_ms": float(m["pre_ms"]),
+                    "mask_ms": 0.0,
+                    "enc_ms": float(enc_ms),
+                    "heads_ms": heads_ms,
+                    "decode_ms": 0.0,
+                    "post_ms": 0.0,
+                }
                 cands = items[idx]["candidate_schemas"]
                 feats = {
                     **m["ctx_f"],
                     "n_candidates": len(cands),
-                    "pre_ms": m["pre_ms"],
-                    "enc_ms": enc_ms,
+                    **s1_stages,
                     "tool_scores": dict(choices),
                     "temperature": self.temperature,
                     "tool_objective": obj_mode,
@@ -2361,7 +2431,7 @@ class LeanResolver(BaseResolver):
                         hit=False, status="abstain",
                         abstain_reason=f"no_tool_scores:{self.last_tool_scores_reason}",
                         error_reason=f"no_tool_scores:{self.last_tool_scores_reason}",
-                        latency_ms=(time.perf_counter() - m["t0"]) * 1000,
+                        latency_ms=_stage_sum(s1_stages),
                         features=feats,
                     )
                     return
@@ -2373,7 +2443,7 @@ class LeanResolver(BaseResolver):
                     results[idx] = LeanResolveResult(
                         hit=False, status="abstain",
                         abstain_reason="tool_below_threshold", error_reason="tool_below_threshold",
-                        latency_ms=(time.perf_counter() - m["t0"]) * 1000,
+                        latency_ms=_stage_sum(s1_stages),
                         features=feats,
                     )
                     return
@@ -2434,7 +2504,7 @@ class LeanResolver(BaseResolver):
                     s2_meta[k] = rec
                     s2_queue.append((k, rec["ids"]))
 
-            def _on_s2_enc(k: Tuple[int, int], H_k: torch.Tensor) -> None:
+            def _on_s2_enc(k: Tuple[int, int], H_k: torch.Tensor, enc_ms: float) -> None:
                 rec = s2_meta[k]
                 t_enc = time.perf_counter()
                 anchors, per_param_scores = self._score_parameters(
@@ -2448,7 +2518,7 @@ class LeanResolver(BaseResolver):
                     parity_absolutes=rec["parity_absolutes"], parity_unresolvable=rec["parity_unresolvable"],
                     parity_counters=rec["parity_counters"], ctx_features=rec["ctx_features"],
                     t0=rec["t0"], t_pre=rec["t_pre"], t_mask=rec["t_mask"],
-                    t_enc=t_enc, t_heads=t_heads,
+                    t_enc=t_enc, t_heads=t_heads, enc_ms=enc_ms,
                 )
 
             self._run_encoded_batches(s2_queue, _on_s2_enc, batch_size=batch_size)
@@ -2473,24 +2543,28 @@ class LeanResolver(BaseResolver):
             if first_res is None:
                 continue
             res = first_res
-            res.latency_ms = float(res.latency_ms or 0.0) + float(s1_feats.get("pre_ms", 0.0)) + float(s1_feats.get("enc_ms", 0.0))
-            step2_pre_ms = float(res.features.get("pre_ms", 0.0) or 0.0)
-            step2_enc_ms = float(res.features.get("enc_ms", 0.0) or 0.0)
+            # Two-step cost = step 1 + step 2, every stage added. The old merge
+            # only added step-1 ``pre_ms`` and ``enc_ms`` — and step-1 ``enc_ms``
+            # was really its head-scoring time, so the step-1 forward was never
+            # charged anywhere. Each stage is now summed under its own name so the
+            # total stays the honest per-row cost.
+            s2_stages = {k: float(res.features.get(k, 0.0) or 0.0) for k in LATENCY_STAGE_KEYS}
+            s1_stages = {k: float(s1_feats.get(k, 0.0) or 0.0) for k in LATENCY_STAGE_KEYS}
+            merged_stages = {k: s1_stages[k] + s2_stages[k] for k in LATENCY_STAGE_KEYS}
             step2_render_T = res.features.get("render_T")
             res.features.update(s1_feats)
             res.features["resolve_mode"] = "two_step"
-            res.features["step1_pre_ms"] = float(s1_feats["pre_ms"])
-            res.features["step1_enc_ms"] = float(s1_feats["enc_ms"])
+            res.features["step1_pre_ms"] = s1_stages["pre_ms"]
+            res.features["step1_enc_ms"] = s1_stages["enc_ms"]
+            res.features["step1_heads_ms"] = s1_stages["heads_ms"]
             res.features["step1_render_T"] = m["step1_render_T"]
-            res.features["step2_pre_ms"] = step2_pre_ms
-            res.features["step2_enc_ms"] = step2_enc_ms
+            res.features["step2_pre_ms"] = s2_stages["pre_ms"]
+            res.features["step2_enc_ms"] = s2_stages["enc_ms"]
+            res.features["step2_heads_ms"] = s2_stages["heads_ms"]
             res.features["step2_render_T"] = step2_render_T
-            res.features["pre_ms"] = float(s1_feats["pre_ms"]) + step2_pre_ms
-            res.features["enc_ms"] = float(s1_feats["enc_ms"]) + step2_enc_ms
-            res.features["stage_sum_ms"] = float(
-                sum(res.features.get(k, 0.0) or 0.0 for k in
-                    ("pre_ms", "mask_ms", "enc_ms", "heads_ms", "decode_ms", "post_ms"))
-            )
+            res.features.update(merged_stages)
+            res.features["stage_sum_ms"] = _stage_sum(merged_stages)
+            res.latency_ms = res.features["stage_sum_ms"]
             res.features["unattributed_ms"] = float(max(0.0, res.latency_ms - res.features["stage_sum_ms"]))
             res.features["winner_prob"] = float(admitted[0][1])
             res.features["n_calls"] = len(calls)
