@@ -150,7 +150,13 @@ MARKDOWN_TABLE = """---
 
 Success, turns, fast-path share, LLM calls, tokens, wall-clock and USD per `(mode, suite)`. `Δ calls` and `Δ tokens` are computed **against mode 1 on the same suite** — that is the only comparison that isolates the router's effect, since all three modes see identical tasks, tools and instructions.
 
-USD is `n/a` unless `USD_PER_1K_IN` / `USD_PER_1K_OUT` are set, because a hardcoded `0.0` would read as "free" rather than "not priced"."""
+USD is `n/a` unless `USD_PER_1K_IN` / `USD_PER_1K_OUT` are set, because a hardcoded `0.0` would read as "free" rather than "not priced".
+
+### Getting the table off the VM
+
+`DOWNLOAD_RESULTS=1` writes `agentic_mode_table.json` and then bundles it into **one** zip for the browser. One zip, not one download per file: Chrome blocks the second automatic download, so a per-file loop would deliver only the first artifact and then look like it had worked.
+
+There is no upload path here on purpose. The only inbound artifact is the model, and it already comes from the Hub (`HF_REPO_ID`) or a local export dir — there is nothing for you to bring by hand."""
 
 MARKDOWN_LIVE = """---
 ## 6. Live LLM re-run (key-guarded)
@@ -870,7 +876,47 @@ with open(os.path.join(RESULTS_DIR, "agentic_mode_table.json"), "w", encoding="u
         default=str,
     )
     _fh.write("\\n")
-print(f"\\n[5] wrote {os.path.join(RESULTS_DIR, 'agentic_mode_table.json')}")'''
+print(f"\\n[5] wrote {os.path.join(RESULTS_DIR, 'agentic_mode_table.json')}")
+
+# --------------------------------------------------------------------------- #
+# Optional Colab download: one click gets the table off the VM.
+#
+# Why a bundle and not `files.download()` per file: Chrome blocks the second
+# automatic download, so a loop would hand the user whichever artifact sorted
+# first and look like it had worked. One zip, one call.
+#
+# Why not upload anything here: this notebook's only inbound artifact is the
+# model, and that already comes from the Hub (`HF_REPO_ID`) or a local export
+# dir. There is no "bring your own results" path to add.
+#
+# The download is opt-in and guarded because `google.colab` does not exist on a
+# local kernel, under nbconvert --execute, or inside the offline smoke tests.
+# --------------------------------------------------------------------------- #
+DOWNLOAD_RESULTS = os.environ.get("DOWNLOAD_RESULTS", "0").strip().lower() not in (
+    "", "0", "false", "no")
+try:
+    from google.colab import files as _colab_files
+    _in_colab = True
+except ImportError:
+    _colab_files = None
+    _in_colab = False
+
+if not DOWNLOAD_RESULTS:
+    print(f"[download] off. Table is on disk at {os.path.join(RESULTS_DIR, 'agentic_mode_table.json')}")
+elif not _in_colab:
+    print(f"[download] DOWNLOAD_RESULTS=1 but this is not Colab -> table stays at {RESULTS_DIR}")
+else:
+    import shutil as _shutil
+    _bundle = os.path.join(RESULTS_DIR, "agentic_artifacts")
+    _shutil.rmtree(_bundle, ignore_errors=True)     # never archive a previous bundle
+    os.makedirs(_bundle, exist_ok=True)
+    for _f in sorted(os.listdir(RESULTS_DIR)):
+        if _f.endswith(".json") and os.path.isfile(os.path.join(RESULTS_DIR, _f)):
+            _shutil.copy2(os.path.join(RESULTS_DIR, _f), os.path.join(_bundle, _f))
+    _zip = _shutil.make_archive(_bundle, "zip", root_dir=_bundle)
+    print(f"[download] {_zip}  {os.path.getsize(_zip) / 1e6:.2f} MB")
+    _shutil.rmtree(_bundle, ignore_errors=True)     # the zip is the artifact
+    _colab_files.download(_zip)                     # exactly ONE browser download'''
 
 CODE_LIVE = '''# 6. Live LLM re-run (key-guarded). No-op without a key.
 LIVE_MODEL_ID = None          # e.g. "anthropic/claude-sonnet-4" or a vLLM model id

@@ -41,7 +41,7 @@ Usage::
     .venv/bin/python scripts/compare_llm_spancall.py \\
         --preds results/lean_v3/preds_eval_twostep.jsonl \\
         --split results/lean_v3/subset_hermes_eval.jsonl \\
-        --model gpt-4o-mini --api_key_env OPENAI_API_KEY \\
+        --model qwen3.7-flash --api_key_env OPENAI_API_KEY \\
         --out results/lean_v3/llm_parity.json
 
 Offline smoke test (no network, no key) -- ``--fake-responses`` replays a JSONL
@@ -561,7 +561,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--split", type=str, required=True,
                    help="The canonical/subset JSONL the predictions were produced from")
     p.add_argument("--model", type=str, default=None,
-                   help="LLM model id passed to litellm (e.g. gpt-4o-mini)")
+                   help="LLM model id passed to litellm (e.g. qwen3.7-flash)")
     p.add_argument("--api_key_env", type=str, default="OPENAI_API_KEY",
                    help="NAME of the env var holding the key (never the key itself)")
     p.add_argument("--api_base_env", type=str, default="",

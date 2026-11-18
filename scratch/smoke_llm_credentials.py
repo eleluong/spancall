@@ -157,7 +157,7 @@ def main() -> int:
     check(len(prompts) >= 3, f"prompted for the missing values (asked {len(prompts)})")
     check(ns["LLM_API_KEY"] == "", "EOF leaves the key EMPTY (cell 4 will stop)")
     check(ns["LLM_BASE_URL"] == "", "EOF leaves base_url empty (= api.openai.com)")
-    check(ns["LLM_MODEL"] == "gpt-4o-mini", "EOF keeps the model default")
+    check(ns["LLM_MODEL"] == "qwen3.7-flash", "EOF keeps the model default")
     check("from-environ" not in out, "no secret text in stdout")
     check("MISSING" in out or "cell 4 will stop" in out,
           "output flags the missing key")

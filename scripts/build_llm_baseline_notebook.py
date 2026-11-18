@@ -77,9 +77,13 @@ Nothing is re-derived here. `score`, `_llm_pred_row`, `_messages_for`,
 tests. A second copy of that logic in the notebook is how the two arms quietly
 stop being comparable.
 
-**What is configurable, and why it matters:** `LLM_LIMIT` trims every arm to the
-same first *N* rows. It is for cheap smoke runs, not for reporting — a headline
-number on 300 rows is a smoke test, and the notebook says so when it prints.
+**What is configurable, and why it matters:** `LLM_LIMIT_FRACTION` trims every
+arm to the same *fraction* of each split. It defaults to `0.1`, so the notebook
+is a ~10% smoke run out of the box (≈366 paid calls instead of ≈3,659); set it
+to `1.0` for the paper run. It is not a `rows[:N]` slice: the stratified subset
+writes one contiguous block per cohort, so a head-slice would be 100% `F_func`
+and would never exercise abstention. The trim is cohort-proportional, so the
+smoke run's metrics stay comparable to the full run's.
 
 ## Before the first run
 
@@ -89,7 +93,7 @@ token — **press Enter to be prompted**, or pre-set them for a non-interactive 
 | value | env var | notes |
 | --- | --- | --- |
 | HF access token | `HF_TOKEN` | optional; the `convoicon/*` repos are public |
-| LLM model name | `LLM_MODEL` | e.g. `gpt-4o-mini`, or whatever your server serves |
+| LLM model name | `LLM_MODEL` | e.g. `qwen3.7-flash`, or whatever your server serves |
 | LLM base URL | `LLM_BASE_URL` | `http://host:8000/v1`; blank → `api.openai.com` |
 | LLM API key | `LLM_API_KEY` | asked with `input()`, never written, reported only as `<set>` |
 
@@ -140,6 +144,17 @@ SEED = 42
 # would misdescribe the architecture. `resolve_config.json` is the rebuild recipe.
 HF_REPO_ID      = "convoicon/spancall-lean-v3-2"
 HF_DATASET_ID   = "convoicon/spancall"
+
+# Pin the weights, or the numbers describe a moving target. A model repo's HEAD
+# advances on every §7 re-push, so `HF_REPO_ID` names a repo, not a model. Set
+# this to a commit sha (or tag) to make the eval reproducible; leave `None` to
+# follow HEAD, in which case cell 7 records the sha it actually scored.
+HF_REVISION     = None
+
+# Publish the artifacts under `eval/llm_baseline/<run_tag>/` in HF_REPO_ID.
+# OFF by default: a push is public and effectively permanent, and an eval folder
+# that quietly accumulates a row per smoke run is worse than no folder at all.
+PUSH_RESULTS_TO_HUB = False
 
 DATA_DIR     = os.path.join(PROJECT_ROOT, "data", "processed_v3_2")
 RESULTS_DIR  = os.path.join(PROJECT_ROOT, "results_lean_v3_2_llm")
@@ -232,7 +247,7 @@ if HF_TOKEN:
     os.environ["HUGGING_FACE_HUB_TOKEN"] = HF_TOKEN
 
 # The LLM arm. These four are the only things the run needs from you.
-LLM_MODEL     = _resolve("LLM_MODEL", default="gpt-4o-mini",
+LLM_MODEL     = _resolve("LLM_MODEL", default="qwen3.7-flash",
                          label="LLM model name")
 LLM_BASE_URL  = _resolve("LLM_BASE_URL", "BASE_URL", default="",
                          label="LLM base URL (blank = api.openai.com)")
@@ -242,16 +257,73 @@ LLM_TEMPERATURE = 0.0   # greedy: a temperature sweep is a separate experiment
 LLM_TIMEOUT     = 120.0
 LLM_MAX_RETRIES = 3
 
-# Cost guard / smoke knob. `None` = every row of both splits (~3.7k LLM calls).
-# BOTH arms are trimmed to the same rows, so the comparison never spans
-# different populations. Set 300 for a smoke run; report numbers only at None.
-LLM_LIMIT: "int | None" = None
+# Cost guard / smoke knob, expressed as a FRACTION of each split.
+#   1.0  -> every row of both splits (~3.7k LLM calls) = the paper run
+#   0.1  -> ~10% of the rows (~366 LLM calls) = "does the pipeline work?" run
+# Report numbers only at 1.0. Both arms are trimmed by the SAME function, so the
+# comparison can never span different populations.
+LLM_LIMIT_FRACTION = float(os.environ.get("LLM_LIMIT_FRACTION", "0.1"))
+
+# Checkpointing. The LLM arm is the only part of this notebook that spends money,
+# so every completed row is appended to disk before the next call goes out.
+#   LLM_RESUME=1  -> a good run is reused instead of re-bought. Cell 4 then costs
+#                    nothing and re-scores an older run for free.
+#   LLM_RESUME=0  -> force a fresh run (the old artifacts are backed up, not lost).
+# Only rows whose run fingerprint matches exactly are reused; see cell 4.
+LLM_RESUME = os.environ.get("LLM_RESUME", "1").strip().lower() not in ("0", "false", "no")
+LLM_CHECKPOINT_EVERY = int(os.environ.get("LLM_CHECKPOINT_EVERY", "25"))
+
+# split -> how the paid rows in `preds_{split}_llm.jsonl` were obtained. Filled
+# by cell 4 and persisted by cell 7: a resumed table is a real result, but a
+# reader must be able to see that its rows came from a checkpoint rather than
+# from the session that produced the table. Declared here so cell 7 does not
+# depend on cell 4 having run.
+LLM_SOURCE = {}
 
 # SpanCall inference knobs (mirrored from the v3.2 notebook so the two agree).
 EVAL_BATCH_SIZE = 32
 EVAL_WORKERS    = 4
 MIN_JOINT_MARGIN = float(os.environ.get("MIN_JOINT_MARGIN", "0.02"))
 SINGLE_CALL_ONLY = True
+
+
+def _limit_rows(rows, fraction=None):
+    """Take `fraction` of each cohort, preserving file order. Deterministic.
+
+    A plain `rows[:int(len(rows) * fraction)]` is NOT a valid sample here.
+    `build_stratified_eval_subset()` emits ONE CONTIGUOUS BLOCK PER COHORT
+    (F_func, then F_json, then A_clean, then A_adv), so the first 10% of the
+    file is ~100% F_func: `false_hit_rate_on_a` would have an empty
+    denominator and the smoke run would never exercise abstention at all -
+    it would silently validate only the easy half of the task.
+
+    Sampling per cohort keeps the mix (and therefore every metric) comparable
+    to the full run, at a tenth of the tokens.
+    """
+    frac = LLM_LIMIT_FRACTION if fraction is None else float(fraction)
+    rows = list(rows)
+    if frac >= 1.0:
+        return rows
+    if frac <= 0.0:
+        raise SystemExit("LLM_LIMIT_FRACTION must be > 0 (use 1.0 for the full run)")
+    # Imported here, not at cell top: this runs after `%pip install -e .`, and
+    # keeping the import local keeps cell 0 cheap.
+    from spancall.lean.eval_p1 import classify_eval_cohort
+
+    total = {}
+    for _r in rows:
+        _k = classify_eval_cohort(_r)
+        total[_k] = total.get(_k, 0) + 1
+    quota = {_k: max(1, int(round(_n * frac))) for _k, _n in total.items()}
+
+    out, used = [], {}
+    for _r in rows:
+        _k = classify_eval_cohort(_r)
+        if used.get(_k, 0) < quota[_k]:
+            out.append(_r)
+            used[_k] = used.get(_k, 0) + 1
+    return out
+
 
 # Print shapes, never secrets: a run log that leaks a key gets pasted into a bug
 # report, so the key is only ever reported as set / not set.
@@ -260,10 +332,14 @@ print(f"HF_TOKEN        = {'<set>' if HF_TOKEN else '(none - public repos only)'
 print(f"LLM_MODEL       = {LLM_MODEL}")
 print(f"LLM_BASE_URL    = {LLM_BASE_URL or '(SDK default: api.openai.com)'}")
 print(f"LLM_API_KEY     = {'<set>' if LLM_API_KEY else '(MISSING - cell 4 will stop)'}")
-print(f"LLM_LIMIT       = {LLM_LIMIT}")
+print(f"LLM_LIMIT_FRACTION = {LLM_LIMIT_FRACTION}")
+print(f"LLM_RESUME      = {LLM_RESUME}   (checkpoint every {LLM_CHECKPOINT_EVERY} rows)")
 print(f"EVAL_SPLITS     = {EVAL_SPLITS}")
 print(f"RESULTS_DIR     = {RESULTS_DIR}")
 print("=" * 72)
+if LLM_LIMIT_FRACTION < 1.0:
+    print(f"SMOKE MODE: scoring {LLM_LIMIT_FRACTION:.0%} of each split (~10% of the")
+    print("token cost). These numbers validate the pipeline; they are NOT the paper's.")
 '''
 
 MD_DATA = """## 1. Eval data — the exact splits the paper scores
@@ -277,6 +353,26 @@ The subsets are rebuilt here with the repo's own
 `build_stratified_eval_subset()` rather than downloaded, because a downloaded
 subset could have been produced by a different stratification seed and the
 `n_F` column would then not match the paper by an amount nobody could explain.
+
+### Three stages, matching §4.0 of the training notebook
+
+| stage | output | what it does |
+| --- | --- | --- |
+| 1. stratify | `subset_{sp}.jsonl` | `build_stratified_eval_subset()`, seed-controlled, cohort-proportional |
+| 2. single-call | `subset_{sp}.jsonl` (in place) | keep rows with exactly one GT call, because `SINGLE_CALL_ONLY` pins `max_calls=1` |
+| 3. Step-0 gate | `subset_{sp}_clean.jsonl` | drop rows `build_input_multi()` cannot render; **this file is scored** |
+
+The training notebook scores the `_clean` file, so this notebook does too.
+
+Both extra stages matter for fairness, and both were missing here before:
+
+- **Stage 2** — with `max_calls=1`, SpanCall *cannot* emit a second call. Scoring
+  it on multi-call rows charges it with a structural miss, while the LLM (which
+  returns several calls happily) is treated generously on the same rows. The
+  paper's 1,659 / 2,000-row populations are already single-call; without this
+  filter the LLM here would be scored on a larger, different population.
+- **Stage 3** — the gate vetoed 0 rows in the published run, which is exactly why
+  a silent divergence would go unnoticed until the data changed.
 
 ### The `data/processed_v3_2` directory is **built, not downloaded**
 
@@ -372,26 +468,148 @@ if len(_got) != len(NEEDED):
 print(f"[data] processed_v3_2 ready: {_got}")
 
 # --- Stratified subsets (the paper's exact population) ---------------------
+#
+# TWO stages, exactly as the v3.2 notebook does it (its §4.0). Stage 1 is the
+# stratified sample; stage 2 is the **Step-0 pre-encode sanitize gate**, which
+# drops rows whose tool schemas or utterance cannot be rendered by
+# `build_input_multi()` at all. The training notebook writes the ungated sample
+# to `subset_{sp}.jsonl` and the gated one to `subset_{sp}_clean.jsonl`, and
+# then scores the `_clean` file.
+#
+# Skipping stage 2 here would be a fairness bug, not a shortcut: SpanCall's own
+# headline numbers come from the post-gate file, so an ungated LLM arm would be
+# scored on rows SpanCall was never allowed to attempt (and on rows whose
+# schemas it cannot even render). The published run vetoed 0 rows, which is
+# exactly why nobody would notice the divergence until it mattered.
+from span_template.template import RecentRow, build_input_multi
+from span_template.sanitize import SanitizeError
+from spancall.data.align import tooldef_to_template_tool
+from spancall.lean.eval_p1 import classify_eval_cohort
+from spancall.data.schema import UnifiedSample as _US
+
+
+def _step0_sanitize_gate(sub_path: str, clean_path: str, split_name: str):
+    """Drop rows `build_input_multi()` rejects; report per cohort, like §4.0."""
+    stats = {c: {"n": 0, "vetoed": 0} for c in ("F_func", "F_json", "A_clean", "A_adv")}
+    keep = []
+    with open(sub_path, encoding="utf-8") as fh:
+        for line in fh:
+            raw = line.strip()
+            if not raw:
+                continue
+            d = json.loads(raw)
+            coh = classify_eval_cohort(d)
+            st = stats.setdefault(coh, {"n": 0, "vetoed": 0})
+            st["n"] += 1
+            s = _US.from_dict(d)
+            vetoed = False
+            try:
+                recent = [
+                    RecentRow(key=str(r.get("key", "")), value=str(r.get("value", "")),
+                              source=str(r.get("source", "recent")))
+                    for r in (s.recent_context or [])
+                ]
+                build_input_multi(
+                    [tooldef_to_template_tool(t) for t in (s.tools or [])],
+                    s.utterance,
+                    recent_context=recent,
+                )
+            except SanitizeError:
+                vetoed = True            # rendered form would be unsafe to encode
+            except Exception:
+                vetoed = False           # NOT a sanitize veto: keep the row
+            if vetoed:
+                st["vetoed"] += 1
+            else:
+                keep.append(raw)
+
+    with open(clean_path, "w", encoding="utf-8") as fh:
+        for raw in keep:
+            fh.write(raw + "\\n")
+
+    print(f"[data] Step-0 sanitize gate ({split_name}):")
+    for c in ("F_func", "F_json", "A_clean", "A_adv"):
+        st = stats.get(c) or {"n": 0, "vetoed": 0}
+        rate = (st["vetoed"] / st["n"]) if st["n"] else 0.0
+        print(f"         {c:<8}: vetoed={st['vetoed']:>3} / {st['n']:<4} ({rate:.1%})")
+    print(f"         kept {len(keep)} rows -> {clean_path}")
+    if len(keep) == 0:
+        raise SystemExit(f"[data] the sanitize gate vetoed every row of {split_name}")
+    return len(keep)
+
+
+def _single_call_filter(sub_path: str, split_name: str) -> int:
+    """Keep only rows with exactly one ground-truth call, in place.
+
+    `SINGLE_CALL_ONLY = True` above sets `max_calls=1` on the resolver, so
+    SpanCall can never emit a second call. Scoring it on multi-call rows would
+    charge it with a structural miss it is not allowed to fix, while the LLM -
+    which happily returns several calls - would be scored generously on the same
+    rows. The training notebook applies this filter (its §4.0), so the paper's
+    1,659 / 2,000-row populations are already single-call; skipping it here
+    would score a different, larger population than the paper reports.
+    """
+    with open(sub_path, encoding="utf-8") as fh:
+        keep = [l for l in fh
+                if l.strip() and len(json.loads(l).get("ground_truth_calls") or []) == 1]
+    with open(sub_path, "w", encoding="utf-8") as fh:
+        fh.writelines(keep)
+    print(f"[data] [SINGLE_CALL_ONLY] {split_name}: kept {len(keep)} single-call rows")
+    return len(keep)
+
+
 SUBSET_PATHS = {}
 for _sp in EVAL_SPLITS:
-    _clean = os.path.join(RESULTS_DIR, f"subset_{_sp}_clean.jsonl")
-    if not os.path.exists(_clean):
+    _sub = os.path.join(RESULTS_DIR, f"subset_{_sp}.jsonl")          # ungated
+    _clean = os.path.join(RESULTS_DIR, f"subset_{_sp}_clean.jsonl")  # gated, SCORED
+    if not os.path.exists(_sub):
         print(f"[data] building stratified subset for {_sp} ...")
         # `limit=None` matters: the signature default is 500 rows, which would
         # quietly shrink the comparison to a sample the paper never reports.
         build_stratified_eval_subset(
             split_name=_sp,
             data_dir=DATA_DIR,
-            out_path=_clean,
+            out_path=_sub,
             limit=None,
             seed=SEED,
         )
+        # Order matters and matches the training notebook: sample -> single-call
+        # -> sanitize gate. The `_clean` file must be the SAME population the
+        # paper's SpanCall numbers were computed on.
+        if SINGLE_CALL_ONLY:
+            _single_call_filter(_sub, _sp)
+    if not os.path.exists(_clean):
+        _step0_sanitize_gate(_sub, _clean, _sp)
     SUBSET_PATHS[_sp] = _clean
     _rows = [json.loads(l) for l in open(_clean, encoding="utf-8") if l.strip()]
     _strata = {}
     for _r in _rows:
         _strata[_r.get("stratum", "?")] = _strata.get(_r.get("stratum", "?"), 0) + 1
-    print(f"[data] {_sp}: {len(_rows)} rows  strata={_strata}")
+
+    # STALE-CACHE GUARD. Both stages above are skipped when the files already
+    # exist, so a `_clean` file produced by an earlier version of this notebook
+    # (or by hand) can predate the single-call filter and quietly put the LLM on
+    # multi-call rows the resolver cannot answer. Detect that instead of
+    # trusting the filename.
+    if SINGLE_CALL_ONLY:
+        _multi = sum(1 for _r in _rows
+                     if len(_r.get("ground_truth_calls") or []) != 1)
+        if _multi:
+            raise SystemExit(
+                f"[data] {_clean} holds {_multi} rows that are not single-call, but "
+                f"SINGLE_CALL_ONLY=True. This is a STALE subset built before the "
+                f"single-call filter existed, and scoring it would compare the arms "
+                f"on a population the paper never used. Delete "
+                f"{os.path.dirname(_clean)}/subset_{_sp}*.jsonl and re-run this cell."
+            )
+
+    _n_scored = len(_limit_rows(_rows))
+    print(f"[data] {_sp}: {len(_rows)} clean rows  strata={_strata}")
+    print(f"[data] {_sp}: {_n_scored} rows will be scored "
+          f"(LLM_LIMIT_FRACTION={LLM_LIMIT_FRACTION})")
+    print(f"[data] {_sp}: population must equal the v3.2 run's n_F denominator;"
+          f" if it does not, the subset files and the frozen predictions came from"
+          f" different data snapshots.")
 
 # Every downstream cell iterates THIS mapping, so both arms are guaranteed the
 # same rows in the same order. A dict, not a set, because order is the contract.
@@ -427,7 +645,7 @@ CODE_MODEL = '''# 2. Define the resolver rebuild recipe from the HF checkpoint.
 # unnecessary ~1.5 GB download plus a model construction we would not use.
 from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer
-import torch, os, sys, json
+import torch, os, sys, json, re
 
 sys.path.insert(0, str(PROJECT_ROOT))
 from span_template.sanitize import SPECIAL_MARKER_TOKENS
@@ -436,6 +654,9 @@ from spancall.lean.model import LeanSpanCallModel
 from spancall.lean.resolver import LeanResolver
 
 RESOLVER = None      # populated only if cell 3 needs to infer
+# The commit sha the weights came from. `None` until `load_resolver()` runs, but
+# always bound so cell 7 can read it whether or not inference happened.
+MODEL_REVISION_RESOLVED = None
 
 
 def load_resolver(verbose: bool = True):
@@ -445,9 +666,17 @@ def load_resolver(verbose: bool = True):
         return RESOLVER
 
     _weights = hf_hub_download(HF_REPO_ID, "model.pt", cache_dir=HF_CACHE_DIR,
-                               token=HF_TOKEN or None)
+                               revision=HF_REVISION, token=HF_TOKEN or None)
     _cfg_p   = hf_hub_download(HF_REPO_ID, "resolve_config.json", cache_dir=HF_CACHE_DIR,
-                               token=HF_TOKEN or None)
+                               revision=HF_REVISION, token=HF_TOKEN or None)
+
+    # The exact commit behind the weights, read back from the cache path with no
+    # extra network call: `hf_hub_download` stores under `snapshots/<sha>/`.
+    # Cell 7 records this in `meta.model_revision`, so a reader can tell which
+    # weights a table belongs to even after the repo moves on.
+    global MODEL_REVISION_RESOLVED
+    _m = re.search(r"[\\/]snapshots[\\/]([0-9a-f]{7,40})[\\/]", _weights)
+    MODEL_REVISION_RESOLVED = _m.group(1) if _m else (HF_REVISION or "(unknown)")
     with open(_cfg_p, encoding="utf-8") as _fh:
         rcfg = json.load(_fh)
     if verbose:
@@ -474,7 +703,8 @@ def load_resolver(verbose: bool = True):
     # it left the matrix 15 rows short and made `load_state_dict` fail with a
     # `tok_embeddings.weight` size mismatch.
     tokenizer = AutoTokenizer.from_pretrained(
-        HF_REPO_ID, cache_dir=HF_CACHE_DIR, use_fast=True, token=HF_TOKEN or None)
+        HF_REPO_ID, revision=HF_REVISION, cache_dir=HF_CACHE_DIR, use_fast=True,
+        token=HF_TOKEN or None)
     encoder = SpanCallTransformerEncoder(
         model_name_or_path=backbone,
         hidden_dropout_prob=0.1,
@@ -569,18 +799,39 @@ the paper.
 
 `results_lean_v3_2/` is **not in git and not on the HuggingFace Hub** — the
 training notebook only copies it to Google Drive. So a bare `git clone` starts
-without it, and the reuse path cannot fire. Set `SPANCALL_V3_2_RESULTS_DIR`
-(or `V3_2_RESULTS_DIR` in the config cell) to the directory holding:
+without it, and the reuse path cannot fire. There are **three** ways to supply
+it, in the order the cell tries them:
+
+| # | how | when to use it |
+| --- | --- | --- |
+| 1 | `SPANCALL_V3_2_RESULTS_DIR` (or `V3_2_RESULTS_DIR` in the config cell) pointing at a directory that already holds the files | local copy; Drive already mounted |
+| 2 | **browser upload, `UPLOAD_V3_2_PREDS=1`** | a fresh Colab VM with no Drive and no clone history — nothing to mount, nothing to find |
+| 3 | re-infer (fallback) | you actually want new SpanCall numbers |
+
+The two files, by exact name — the upload is whitelisted against this table and
+so is the on-disk search, so the two paths cannot disagree:
 
 | split | file |
 | --- | --- |
 | `hermes_eval` | `preds_eval_twostep.jsonl` |
 | `xlam_eval` | `preds_xlam_eval_twostep.jsonl` |
 
-When neither is found the cell says so explicitly and re-infers, and the
-persisted `llm_parity.json` records `spancall_source` so a later reader can tell
-which happened. Comparing a re-inferred SpanCall run against the paper's LLM
-numbers is a mistake the metadata is designed to catch.
+Why the upload is opt-in and why it *moves* the file: `files.upload()` is a
+blocking widget (it would halt "Run all"), and it writes into the current
+directory — which by then is the git checkout, **not** a directory this cell
+searches. A file left there would produce the worst possible outcome: the user
+sees "Saved …", the cell prints "no v3.2 predictions found", and the SpanCall
+column is silently re-inferred. The upload therefore moves a whitelisted file
+into `results_lean_v3_2/`, and every uploaded file gets a `sha256` recorded so
+`llm_parity.json` can state which bytes it scored.
+
+Filename whitelisting cannot catch a Hermes file uploaded under the xLAM name —
+the `sample_id` coverage check below can, and it runs on the uploaded file too.
+
+When none of the three paths is available the cell says so explicitly and
+re-infers, and the persisted `llm_parity.json` records `spancall_source` so a
+later reader can tell which happened. Comparing a re-inferred SpanCall run
+against the paper's LLM numbers is a mistake the metadata is designed to catch.
 
 ### If inference does run
 
@@ -608,7 +859,7 @@ CODE_INFER = '''# 3. Load the SpanCall predictions the v3.2 run already produced
 #   hermes_eval -> preds_eval_twostep.jsonl
 #   xlam_eval   -> preds_xlam_eval_twostep.jsonl
 from spancall.data.schema import UnifiedSample
-import json, os, glob
+import json, os, glob, shutil, hashlib
 
 # `V3_2_RESULTS_DIR` comes from the config cell. `results_lean_v3_2/` is not in
 # git and not on the Hub, so a fresh clone must be pointed at it (Drive mount or
@@ -671,8 +922,7 @@ def _load_preds(path: str) -> dict:
 def _validate_coverage(split_name: str, subset_path: str, by_id: dict) -> None:
     """Both arms must be scored on the same population, or nothing else means anything."""
     rows = [json.loads(l) for l in open(subset_path, encoding="utf-8") if l.strip()]
-    if LLM_LIMIT is not None:
-        rows = rows[: int(LLM_LIMIT)]
+    rows = _limit_rows(rows)          # same cohort-proportional trim as every other cell
     want = [str(r.get("sample_id")) for r in rows]
     missing = [sid for sid in want if sid not in by_id]
     if missing:
@@ -690,8 +940,7 @@ def _validate_coverage(split_name: str, subset_path: str, by_id: dict) -> None:
 def run_spancall_inference(split_name: str, subset_path: str, out_path: str) -> dict:
     """FALLBACK ONLY: mirrors predict_split() from the v3.2 notebook."""
     rows = [json.loads(l) for l in open(subset_path, encoding="utf-8") if l.strip()]
-    if LLM_LIMIT is not None:
-        rows = rows[: int(LLM_LIMIT)]
+    rows = _limit_rows(rows)          # identical trim to the LLM arm
     samples = [UnifiedSample.from_dict(r) for r in rows]
     print(f"[spancall:{split_name}] INFERENCE fallback on {len(samples)} rows ...")
     # Only now do we pay for the download + model build.
@@ -742,14 +991,106 @@ def run_spancall_inference(split_name: str, subset_path: str, out_path: str) -> 
     return by_id
 
 
+# --------------------------------------------------------------------------- #
+# Optional Colab upload: a THIRD way to supply the frozen v3.2 predictions.
+#
+# The two existing ways are a Drive mount (`SPANCALL_V3_2_RESULTS_DIR`) and a
+# local copy. Both need a filesystem the runtime can already see, which a fresh
+# Colab VM does not have. This adds a browser upload without weakening either
+# guarantee:
+#
+#  * OPT-IN (`UPLOAD_V3_2_PREDS=1`). `files.upload()` is a blocking widget: under
+#    "Run all" it stops the kernel until the user clicks. Making it the default
+#    would turn "Run all" into "Run all, then wait forever".
+#  * WHITELISTED BY NAME against `CANDIDATE_PRED_PATHS`. That dict is also what
+#    `_find_existing_preds` searches, so the upload path and the lookup path
+#    cannot disagree about which filename belongs to which split. Anything else
+#    is refused loudly rather than dropped next to the clone.
+#  * MOVED into `RESULTS_V3_2`. `files.upload()` writes to the CWD, which after
+#    `os.chdir(PROJECT_ROOT)` is the git checkout - NOT a directory
+#    `_find_existing_preds` searches. Without the move the user would see
+#    "Saved ..." and the very next lines would print "no v3.2 predictions found"
+#    and RE-INFER, silently replacing the paper's SpanCall column with a fresh
+#    one. That is the divergence this whole cell is written to prevent.
+#  * CONTENT IS STILL VALIDATED BY `_validate_coverage` below. A Hermes file
+#    uploaded under the xLAM name cannot be caught by a filename whitelist; the
+#    sample_id coverage check is the thing that actually fails, and it is the
+#    same check the on-disk paths go through.
+#  * PROVENANCE is recorded as a sha256 prefix, so `llm_parity.json` can say
+#    which bytes it scored long after the Colab runtime is gone.
+# --------------------------------------------------------------------------- #
+UPLOADED_PROVENANCE = {}
+
+
+def _sha256(path: str) -> str:
+    _h = hashlib.sha256()
+    with open(path, "rb") as _fh:
+        for _chunk in iter(lambda: _fh.read(1 << 20), b""):
+            _h.update(_chunk)
+    return _h.hexdigest()
+
+
+UPLOAD_V3_2_PREDS = os.environ.get("UPLOAD_V3_2_PREDS", "0").strip().lower() not in (
+    "", "0", "false", "no")
+try:                                   # absent outside Colab / nbconvert / CI
+    from google.colab import files as _colab_files
+    IN_COLAB = True
+except ImportError:
+    _colab_files = None
+    IN_COLAB = False
+
+if not UPLOAD_V3_2_PREDS:
+    print("[upload] off (set UPLOAD_V3_2_PREDS=1 to upload predictions in the browser)")
+elif not IN_COLAB:
+    print("[upload] UPLOAD_V3_2_PREDS=1 but this is not Colab -> using files already "
+          "on disk")
+else:
+    _WANTED = {f for _fs in CANDIDATE_PRED_PATHS.values() for f in _fs}
+    print(f"[upload] pick {sorted(_WANTED)} (Ctrl-C / Cancel to skip)")
+    try:
+        _uploaded = _colab_files.upload() or {}
+    except Exception as _exc:          # a cancelled widget must not kill the cell
+        _uploaded = {}
+        print(f"[upload] cancelled ({type(_exc).__name__}); continuing with disk state")
+
+    _dest = RESULTS_V3_2
+    os.makedirs(_dest, exist_ok=True)
+    for _fn, _blob in _uploaded.items():
+        if _fn not in _WANTED:
+            print(f"[upload] IGNORED {_fn} ({len(_blob)} bytes): not one of "
+                  f"{sorted(_WANTED)}. Rename it and re-run if it is a v3.2 preds file.")
+            continue
+        _src = os.path.join(str(PROJECT_ROOT), _fn)     # CWD, because of the chdir
+        _dst = os.path.join(_dest, _fn)
+        if os.path.exists(_dst):
+            print(f"[upload] replacing existing {_dst}")
+        shutil.move(_src, _dst)
+        _split_of = next((_sp for _sp, _fns in CANDIDATE_PRED_PATHS.items() if _fn in _fns),
+                         None)
+        if _split_of is not None:
+            UPLOADED_PROVENANCE[_split_of] = {
+                "path": _dst, "bytes": len(_blob), "sha256": _sha256(_dst)}
+        print(f"[upload] {_fn} -> {_dst}  ({len(_blob)} bytes, "
+              f"sha256={UPLOADED_PROVENANCE.get(_split_of, {}).get('sha256', '?')[:12]})")
+
+
 SPANCALL_PREDS = {}
 SPANCALL_SOURCE = {}     # split -> "reused:<path>" | "recomputed"
 for _sp in EVAL_SPLITS:
     _existing = _find_existing_preds(_sp)
     if _existing is not None:
         SPANCALL_PREDS[_sp] = _load_preds(_existing)
-        SPANCALL_SOURCE[_sp] = f"reused: {_existing}"
-        print(f"[spancall:{_sp}] REUSED {_existing} (no inference)")
+        # Which BYTES were scored, not just which path. An uploaded file has no
+        # git history and no Hub revision behind it, so a sha256 prefix in
+        # `meta.spancall_source` is the only thing that lets a reader verify
+        # later that the paper's SpanCall column came from the published run.
+        _prov = UPLOADED_PROVENANCE.get(_sp)
+        SPANCALL_SOURCE[_sp] = (
+            f"reused: {_existing}"
+            + (f" sha256={_prov['sha256'][:12]}" if _prov else "")
+        )
+        print(f"[spancall:{_sp}] REUSED {_existing} (no inference)"
+              + (f"  sha256={_prov['sha256'][:12]} (uploaded)" if _prov else ""))
     else:
         print(f"[spancall:{_sp}] !! no v3.2 predictions found in {_SEARCH_DIRS}")
         print(f"   {_sp} will be RE-INFERRED, so these SpanCall numbers are NEW and")
@@ -781,6 +1122,38 @@ The base URL is what makes this endpoint-agnostic: point it at your own
 vLLM/SGLang/TGI server (`http://host:8000/v1`), a gateway, or leave it blank for
 `api.openai.com`. The cell refuses to run when no key was provided rather than
 silently producing an all-abstain arm that would flatter SpanCall.
+
+### Checkpointing: a good run is saved, a broken one costs one row
+
+This is the only cell that spends money, so it is written to survive an
+interruption and to *not* re-buy work it already has.
+
+- Every completed row is appended to a checkpoint file and `fsync`-ed
+  **before the next call goes out**, so a crash, a Colab timeout or a closed
+  laptop can lose at most one paid call. The merged
+  `preds_{split}_llm.jsonl` is refreshed atomically every
+  `LLM_CHECKPOINT_EVERY` rows, so a partial run is still scoreable.
+- Re-running the cell with `LLM_RESUME=1` (the default) **resumes**: rows
+  already paid for are read from the checkpoint and only the missing ones are
+  fetched. A complete checkpoint prints
+  `COMPLETE run reused - 0 API calls, $0 spent`, and cells 5-7 re-score it for
+  free. That is how a good run becomes the run you report.
+- Reuse is gated on a **fingerprint** of the model, base URL, temperature, the
+  row set, and every rendered prompt + tool schema. Change any of those and the
+  fingerprint changes, so the notebook starts a separate checkpoint instead of
+  splicing answers from two different prompts into one table. A 10% smoke run
+  and the 100% paper run therefore never share a checkpoint.
+- **Failed calls are not treated as complete.** An error row keeps its place in
+  the denominator but is retried on the next run rather than being frozen into
+  the table as a free abstention.
+- `LLM_RESUME=0` forces a fresh run; the previous artifacts are renamed to
+  `*.bak-<timestamp>` rather than deleted, so a bad knob cannot destroy good
+  data.
+
+If some rows are still missing after a run, the cell raises rather than scoring
+a short prediction list - the evaluator aligns predictions to rows
+positionally, so a missing row would silently shift every later row onto the
+wrong sample.
 
 Two LLM-specific choices that matter for fairness:
 
@@ -823,74 +1196,216 @@ client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL or None,
                 timeout=LLM_TIMEOUT, max_retries=LLM_MAX_RETRIES)
 
 
+def _fingerprint(split_name: str, samples) -> str:
+    """Identity of one exact paid run.
+
+    Reuse is only safe if nothing that changes a completion changed: the model,
+    the endpoint, the temperature, the row set, and the rendered prompt + tool
+    schema of every row. Hashing the prompt is what catches a template edit -
+    without it, a resumed run would silently splice answers produced by two
+    different prompts into a single table.
+    """
+    import hashlib
+    h = hashlib.sha256()
+    h.update(json.dumps({"model": LLM_MODEL, "base_url": LLM_BASE_URL,
+                         "temperature": LLM_TEMPERATURE,
+                         "split": split_name}, sort_keys=True).encode("utf-8"))
+    for s in samples:
+        h.update(str(s.sample_id).encode("utf-8"))
+        h.update(json.dumps({"m": cmp._messages_for(s), "t": cmp._openai_tools(s)},
+                            sort_keys=True).encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def _ckpt_path(out_path: str, fp: str) -> str:
+    """One checkpoint per fingerprint, so a smoke run can never poison a paper run."""
+    return out_path[: -len(".jsonl")] + f".ckpt-{fp}.jsonl"
+
+
+def _is_complete(rec: dict) -> bool:
+    """A row is reusable unless the call itself failed.
+
+    Transient failures are deliberately NOT frozen: an error row is re-attempted
+    on the next run rather than baked into the table as a free abstention.
+    """
+    return not (rec.get("features") or {}).get("llm_error")
+
+
+def _load_ckpt(path: str, fp: str) -> dict:
+    """Rows already paid for under `fp`. Ignores a torn final line."""
+    good = {}
+    if not os.path.exists(path):
+        return good
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue          # killed mid-write; that row is simply re-bought
+            if rec.get("_fingerprint") == fp and rec.get("sample_id") is not None:
+                good[str(rec["sample_id"])] = rec
+    return good
+
+
+def _write_jsonl_atomic(path: str, rows) -> None:
+    """Write via tmp + rename, so a crash never leaves a half-written artifact."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        for rec in rows:
+            fh.write(json.dumps(rec, default=str) + "\\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
 def run_llm(split_name: str, subset_path: str, out_path: str) -> dict:
     rows = [json.loads(l) for l in open(subset_path, encoding="utf-8") if l.strip()]
-    if LLM_LIMIT is not None:
-        rows = rows[: int(LLM_LIMIT)]          # identical trim to the SpanCall arm
+    rows = _limit_rows(rows)          # identical trim to the SpanCall arm
     samples = [UnifiedSample.from_dict(r) for r in rows]
     print(f"[llm:{split_name}] {len(samples)} rows ...")
 
-    by_id = {}
+    fp = _fingerprint(split_name, samples)
+    ckpt = _ckpt_path(out_path, fp)
+    order = [str(s.sample_id) for s in samples]
+
+    def _snapshot(by_id):
+        # Strip the internal key ON EVERY write, not just the final one: a
+        # mid-run crash leaves the artifact in exactly the same shape as a
+        # clean finish, and a copy per row means the returned `by_id` rows are
+        # never mutated behind the caller's back.
+        out = []
+        for _sid in order:
+            if _sid in by_id:
+                _r = dict(by_id[_sid])
+                _r.pop("_fingerprint", None)
+                out.append(_r)
+        return out
+
+    if not LLM_RESUME:
+        # Never destroy a good run just because someone flipped the knob.
+        _stamp = time.strftime("%Y%m%d-%H%M%S")
+        for _p in (ckpt, out_path):
+            if os.path.exists(_p):
+                os.replace(_p, f"{_p}.bak-{_stamp}")
+                print(f"[llm:{split_name}] LLM_RESUME=0 -> kept previous run as "
+                      f"{os.path.basename(_p)}.bak-{_stamp}")
+
+    by_id = _load_ckpt(ckpt, fp)
+    _have = {sid for sid, r in by_id.items() if _is_complete(r)}
+    _todo = [s for s in samples if str(s.sample_id) not in _have]
+    if by_id:
+        print(f"[llm:{split_name}] checkpoint {os.path.basename(ckpt)}: "
+              f"{len(_have)}/{len(samples)} rows already paid for, {len(_todo)} to fetch")
+    if not _todo:
+        LLM_SOURCE[split_name] = (f"checkpoint reuse ({len(_have)}/{len(samples)} rows, "
+                                 f"0 API calls this run, fp={fp})")
+        print(f"[llm:{split_name}] COMPLETE run reused - 0 API calls, $0 spent")
+    else:
+        LLM_SOURCE[split_name] = (f"api ({len(_todo)} fetched this run, "
+                                 f"{len(_have)} resumed, fp={fp})")
+        print(f"[llm:{split_name}] fingerprint {fp}  ckpt -> {ckpt}")
+
     n_err = 0
-    for idx, s in enumerate(samples):
-        if idx and idx % 25 == 0:
-            print(f"[llm:{split_name}] {idx}/{len(samples)} ...")
-        tools = cmp._openai_tools(s)
-        messages = cmp._messages_for(s)
-        t0 = time.perf_counter()
-        try:
-            resp = client.chat.completions.create(
-                model=LLM_MODEL,
-                messages=messages,
-                tools=tools or None,
-                tool_choice="auto" if tools else None,
-                temperature=LLM_TEMPERATURE,
-            )
-        except Exception as exc:  # one bad row must not kill a paid-for run
-            n_err += 1
-            by_id[s.sample_id] = cmp._llm_pred_row(
-                s.sample_id, cmp.LLMResponse(error=f"{type(exc).__name__}: {exc}")
-            )
-            continue
-        latency_ms = (time.perf_counter() - t0) * 1000.0
+    _since = 0
+    # Append + fsync per row: ~1ms against a ~1s completion, so the cost of being
+    # safe is unmeasurable and a crash can never lose more than one paid call.
+    with open(ckpt, "a", encoding="utf-8") as _ck:
+        for idx, s in enumerate(_todo):
+            tools = cmp._openai_tools(s)
+            messages = cmp._messages_for(s)
+            t0 = time.perf_counter()
+            try:
+                resp = client.chat.completions.create(
+                    model=LLM_MODEL,
+                    messages=messages,
+                    tools=tools or None,
+                    tool_choice="auto" if tools else None,
+                    temperature=LLM_TEMPERATURE,
+                )
+            except Exception as exc:  # one bad row must not kill a paid-for run
+                n_err += 1
+                rec = cmp._llm_pred_row(
+                    s.sample_id, cmp.LLMResponse(error=f"{type(exc).__name__}: {exc}")
+                )
+            else:
+                latency_ms = (time.perf_counter() - t0) * 1000.0
+                msg = resp.choices[0].message
+                calls = []
+                for tc in (msg.tool_calls or []):
+                    fn = getattr(tc, "function", None)
+                    if fn is None or not fn.name:
+                        continue
+                    args = fn.arguments
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except json.JSONDecodeError:
+                            # Keep the raw text so the row scores as a wrong VALUE
+                            # instead of vanishing from the denominator.
+                            args = {"_raw": args}
+                    calls.append({"tool_name": fn.name, "payload": dict(args or {})})
+                usage = getattr(resp, "usage", None)
+                rec = cmp._llm_pred_row(
+                    s.sample_id,
+                    cmp.LLMResponse(
+                        tool_calls=calls,
+                        text=(msg.content or ""),
+                        prompt_tokens=int(getattr(usage, "prompt_tokens", 0) or 0),
+                        completion_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
+                        latency_ms=latency_ms,
+                    ),
+                )
 
-        msg = resp.choices[0].message
-        calls = []
-        for tc in (msg.tool_calls or []):
-            fn = getattr(tc, "function", None)
-            if fn is None or not fn.name:
-                continue
-            args = fn.arguments
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except json.JSONDecodeError:
-                    # Keep the raw text so the row scores as a wrong VALUE
-                    # instead of vanishing from the denominator.
-                    args = {"_raw": args}
-            calls.append({"tool_name": fn.name, "payload": dict(args or {})})
+            rec["_fingerprint"] = fp
+            by_id[str(s.sample_id)] = rec
+            _ck.write(json.dumps(rec, default=str) + "\\n")
+            _ck.flush()
+            os.fsync(_ck.fileno())
 
-        usage = getattr(resp, "usage", None)
-        by_id[s.sample_id] = cmp._llm_pred_row(
-            s.sample_id,
-            cmp.LLMResponse(
-                tool_calls=calls,
-                text=(msg.content or ""),
-                prompt_tokens=int(getattr(usage, "prompt_tokens", 0) or 0),
-                completion_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
-                latency_ms=latency_ms,
-            ),
+            _since += 1
+            if _since >= LLM_CHECKPOINT_EVERY:
+                _since = 0
+                # Refresh the merged artifact mid-run so the work is scoreable
+                # even if the process dies before the final write.
+                _write_jsonl_atomic(out_path, _snapshot(by_id))
+                print(f"[llm:{split_name}] {idx + 1}/{len(_todo)} new rows "
+                      f"({len(by_id)}/{len(samples)} total) -> {os.path.basename(out_path)}")
+
+    out_rows = _snapshot(by_id)    # clean rows, in subset order
+
+    _missing = [sid for sid in order if sid not in by_id]
+    if _missing:
+        raise SystemExit(
+            f"[llm:{split_name}] {len(_missing)}/{len(order)} rows have NO prediction "
+            f"(first: {_missing[0]}). A partial row set would shift every later row in "
+            f"the positional scorer, so it is refused. Re-run cell 4: it resumes from "
+            f"{ckpt} and only fetches what is missing."
         )
 
-    with open(out_path, "w", encoding="utf-8") as fh:
-        for sid, rec in by_id.items():
-            fh.write(json.dumps(rec, default=str) + "\\n")
+    _write_jsonl_atomic(out_path, out_rows)
 
-    n_hit = sum(1 for r in by_id.values() if r.get("hit"))
-    tok_in = sum(int((r.get("features") or {}).get("prompt_tokens", 0)) for r in by_id.values())
-    tok_out = sum(int((r.get("features") or {}).get("completion_tokens", 0)) for r in by_id.values())
-    print(f"[llm:{split_name}] committed={n_hit}/{len(by_id)}  errors={n_err}  "
+    n_hit = sum(1 for r in out_rows if r.get("hit"))
+    tok_in = sum(int((r.get("features") or {}).get("prompt_tokens", 0)) for r in out_rows)
+    tok_out = sum(int((r.get("features") or {}).get("completion_tokens", 0)) for r in out_rows)
+    print(f"[llm:{split_name}] committed={n_hit}/{len(out_rows)}  errors={n_err}  "
           f"tok_in={tok_in}  tok_out={tok_out}")
+    if n_err:
+        # Surface the distinct provider messages: an auth/quota/model-name
+        # problem fails EVERY row with the same text, and a zero-metric LLM row
+        # is the downstream symptom, not the cause.
+        _msgs = {}
+        for r in out_rows:
+            _e = (r.get("features") or {}).get("llm_error")
+            if _e:
+                _msgs[_e] = _msgs.get(_e, 0) + 1
+        for _m, _c in sorted(_msgs.items(), key=lambda kv: -kv[1])[:5]:
+            print(f"[llm:{split_name}] !! provider error x{_c}: {_m[:200]}")
+    _left = sum(1 for r in out_rows if not _is_complete(r))
+    if _left:
+        print(f"[llm:{split_name}] !! {_left} row(s) failed and stay checkpointed as "
+              f"incomplete. Re-run cell 4 to retry only those (the "
+              f"{len(out_rows) - _left} good rows are reused for free).")
+    print(f"[llm:{split_name}] saved -> {out_path}  (resume state: {ckpt})")
     return by_id
 
 
@@ -910,25 +1425,136 @@ sample and produce a plausible-looking but wrong table.
 Reported per split: `n_F`, `exact_F`, `hit_F`, `param_F1_F`, `call_set`,
 `false_hit_on_A` (does a system answer a turn it *should* abstain on), plus the
 LLM's latency and token totals.
+
+### Latency is reported as a distribution, not a mean
+
+Both arms record `latency_ms` per row, so the notebook prints mean / p50 / p90 /
+p95 / p99 / max per function call, then p90 again per **corpus × tool-count
+bucket**. A mean answers "which arm is slower on average"; a paper claim about
+serving cost needs the tail, because that is what a p99 SLO is written against.
+
+Percentiles are **nearest-rank** (no interpolation): p90 is the smallest observed
+latency such that at least 90% of calls are at or below it. Exact, so the two
+arms on identical rows are directly comparable, and a 231-row smoke run cannot
+invent a percentile from a fitted distribution.
+
+Rows with `latency_ms == 0` are **excluded**, and `n_timed` says how many
+survived. Zero means the call was never timed — an errored LLM response, or a
+reused SpanCall prediction written before timings were recorded. Counting those
+as 0 ms would make a broken arm look *faster*, which is the one error direction
+that flatters a baseline.
 """
 
 CODE_SCORE = '''# 5. Score SpanCall and the LLM on identical rows.
 from spancall.eval.toolcall.evaluator import ToolCallEvaluator
 from spancall.data.schema import UnifiedSample
-import json, os
+import json, os, math
 
 def _load_rows(path):
     return [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]
+
+
+def _lat_stats(preds, ids=None):
+    """Latency distribution per function call (one call per row: SINGLE_CALL_ONLY).
+
+    Percentiles use the nearest-rank definition: p90 is the smallest observed
+    latency such that at least 90% of the calls are at or below it. With a few
+    hundred rows this is what a reader means by "p90", and it is exact (no
+    interpolation), so two systems on the same rows are directly comparable.
+
+    Zero-latency rows are dropped and `n_timed` reports the survivors. Those are
+    rows the system never timed: an errored LLM call, or a reused SpanCall
+    prediction written before timings were recorded. Averaging them in as 0ms
+    would make a failing arm look FAST, which is the one direction of error that
+    flatters the baseline.
+    """
+    # Prediction dicts are keyed by str(sample_id) (see cell 4 / _load_preds),
+    # while `ids` carries the raw sample_id. Normalise both: on an int-keyed
+    # split a naive `_sid not in ids` would match nothing and report n_timed=0
+    # for a perfectly good arm.
+    _keep = {str(x) for x in ids} if ids is not None else None
+    vals = []
+    for _sid, _p in preds.items():
+        if _keep is not None and str(_sid) not in _keep:
+            continue
+        _v = float((_p or {}).get("latency_ms") or 0.0)
+        if _v > 0:
+            vals.append(_v)
+    if not vals:
+        return {"n_timed": 0}
+    vals.sort()
+
+    def _pct(q):
+        k = max(1, math.ceil(q / 100.0 * len(vals)))
+        return vals[min(k, len(vals)) - 1]
+
+    return {
+        "n_timed": len(vals),
+        "mean": sum(vals) / len(vals),
+        "p50": _pct(50),
+        "p90": _pct(90),
+        "p95": _pct(95),
+        "p99": _pct(99),
+        "max": vals[-1],
+    }
+
+
+def _print_latency(sys_metrics, split_name):
+    """Two views: the distribution per arm, then p90 per corpus x tool bucket."""
+    _hdr = (f"{'system':<22}{'n_timed':>8}{'mean':>9}{'p50':>8}"
+            f"{'p90':>8}{'p95':>8}{'p99':>8}{'max':>9}")
+    print("\\nLATENCY PER FUNCTION CALL (ms) - " + split_name)
+    print("=" * len(_hdr))
+    print(_hdr)
+    print("-" * len(_hdr))
+    for _name, _m in sys_metrics.items():
+        _t = _m.get("timing") or {}
+        if not _t.get("n_timed"):
+            print(f"{_name:<22}{'0':>8}   (nothing timed; see the error rows)")
+            continue
+        print(f"{_name:<22}{_t['n_timed']:>8}"
+              f"{_t['mean']:>9.1f}{_t['p50']:>8.1f}{_t['p90']:>8.1f}"
+              f"{_t['p95']:>8.1f}{_t['p99']:>8.1f}{_t['max']:>9.1f}")
+    print("-" * len(_hdr))
+    print("Nearest-rank percentiles over positive per-row latencies. LLM latency")
+    print("includes the network round trip; SpanCall's is local decode time.")
+
+
+def _print_latency_pivot(sys_metrics, rows, ids):
+    """p90 latency per (corpus x tool-count bucket), the paper's slice axis.
+
+    A single p90 hides the fact that both arms slow down as the candidate list
+    grows. If SpanCall's p90 grows with the tool count and the LLM's does not,
+    that is a real finding; if both are flat, the latency claim is not
+    slice-dependent and should not be presented as if it were.
+    """
+    _slices = cmp._slices(rows, ids)
+    if not _slices:
+        return
+    _names = list(sys_metrics.keys())
+    _w = max(len(k) for k in _slices)
+    print("\\np90 LATENCY BY CORPUS x TOOL-COUNT BUCKET (ms)")
+    print("-" * (_w + 8 + 16 * len(_names)))
+    print(f"{'slice':<{_w}}{'n':>8}" + "".join(f"{n[:14]:>16}" for n in _names))
+    for _key, _sids in _slices.items():
+        _sel = set(_sids)
+        _cells = []
+        for _n in _names:
+            _t = (sys_metrics[_n].get("latency_by_slice") or {}).get(_key) or {}
+            _cells.append(f"{_t['p90']:.1f}" if _t.get("n_timed") else "n/a")
+        print(f"{_key:<{_w}}{len(_sids):>8}" + "".join(f"{c:>16}" for c in _cells))
+    print("-" * (_w + 8 + 16 * len(_names)))
+    print("Cells marked n/a had no timed call on those rows.")
+
 
 SYSTEMS = {}      # split -> {system_name -> metrics}
 PIVOTS  = {}      # split -> {system_name -> {"corpus|bucket" -> metrics}}
 
 for _sp in EVAL_SPLITS:
-    _rows = _load_rows(SUBSET_PATHS[_sp])
-    if LLM_LIMIT is not None:
-        _rows = _rows[: int(LLM_LIMIT)]
+    _rows = _limit_rows(_load_rows(SUBSET_PATHS[_sp]))
     _samples = [UnifiedSample.from_dict(r) for r in _rows]
     _ids = [s.sample_id for s in _samples]
+    _slices = cmp._slices(_rows, _ids)
 
     _sys = {}
     for _name, _preds in (
@@ -938,23 +1564,28 @@ for _sp in EVAL_SPLITS:
         _m = cmp.score(_samples, _preds, ids=_ids)
         if not _m:
             continue
-        _lat = [float((p or {}).get("latency_ms") or 0.0) for p in _preds.values()]
         _tok_in  = sum(int(((p or {}).get("features") or {}).get("prompt_tokens", 0)) for p in _preds.values())
         _tok_out = sum(int(((p or {}).get("features") or {}).get("completion_tokens", 0)) for p in _preds.values())
-        _m["timing"] = {"mean_latency_ms": (sum(_lat) / len(_lat)) if _lat else 0.0}
+        _tim = _lat_stats(_preds, ids=set(_ids))
+        # `mean_latency_ms` is kept as the key the persisted artifact and the
+        # paper table already read; the percentiles ride alongside it.
+        _m["timing"] = dict(_tim, mean_latency_ms=_tim.get("mean", 0.0))
         _m["cost"] = {"n_llm_calls": (len(_preds) if _name.startswith("llm:") else 0),
                       "prompt_tokens": _tok_in, "completion_tokens": _tok_out}
         _sys[_name] = _m
 
         # Per (corpus x tool-count bucket) cells, same edges as the paper's pivot.
         _pivot = {}
-        for _key, _sids in cmp._slices(_rows, _ids).items():
+        for _key, _sids in _slices.items():
             _sel_ids = set(_sids)
             _sel = [s for s in _samples if s.sample_id in _sel_ids]
             _cell = cmp.score(_sel, _preds, ids=_sids)
             if _cell:
                 _pivot[_key] = _cell
         _sys[_name]["pivot"] = _pivot
+        _sys[_name]["latency_by_slice"] = {
+            _key: _lat_stats(_preds, ids=set(_sids)) for _key, _sids in _slices.items()
+        }
 
     SYSTEMS[_sp] = _sys
     cmp._print_pivot(_sys, list(_sys.keys()))
@@ -985,6 +1616,11 @@ for _sp in EVAL_SPLITS:
     print("-" * len(_hdr))
     print("hit_F is a COMMITMENT rate. The LLM commits on nearly every row, so its")
     print("hit_F and SpanCall's hit_F are not the same quantity - compare exact_F.")
+
+    # Latency gets its own table: a mean hides the tail, and the tail is the
+    # whole point of comparing a local decoder with a network round trip.
+    _print_latency(_sys, _sp)
+    _print_latency_pivot(_sys, _rows, _ids)
     print(f"[score] {_sp}: {len(_ids)} rows scored for {len(_sys)} systems")
 '''
 
@@ -1011,9 +1647,9 @@ import json
 COMPLEXITY = {}   # split -> {"normal"|"complex" -> {system -> metrics}}
 
 for _sp in EVAL_SPLITS:
-    _rows = [json.loads(l) for l in open(SUBSET_PATHS[_sp], encoding="utf-8") if l.strip()]
-    if LLM_LIMIT is not None:
-        _rows = _rows[: int(LLM_LIMIT)]
+    _rows = _limit_rows(
+        [json.loads(l) for l in open(SUBSET_PATHS[_sp], encoding="utf-8") if l.strip()]
+    )
     _samples = [UnifiedSample.from_dict(r) for r in _rows]
 
     _by_cx = {"normal": [], "complex": []}
@@ -1057,6 +1693,72 @@ record so any number can be re-derived without re-paying for LLM tokens.
 The Markdown block below is shaped like the paper's headline table so it can be
 copied into `research_paper/sections/05_results.tex` directly. It replaces the
 `B1a` row.
+
+### Getting the artifacts off the VM
+
+`DOWNLOAD_RESULTS=1` bundles `llm_parity.json` and the per-split
+`preds_{split}_llm.jsonl` files into **one** zip and hands it to the browser.
+One zip, not one download per file: Chrome blocks the second automatic
+download, so a per-file loop would deliver only the first artifact and then look
+like it had worked.
+
+Two deliberate exclusions:
+
+- `*.ckpt-*.jsonl` — checkpoint rows carry `_fingerprint` and any `llm_error`,
+  so a half-failed run would read as a result once it left the VM. Cell 4 is the
+  resume mechanism; the merged `preds_*.jsonl` is the result.
+- `subset_*.jsonl` — large, and fully rebuildable by cell 1.
+
+### Publishing next to the weights: `PUSH_RESULTS_TO_HUB`
+
+`DOWNLOAD_RESULTS` gets the artifacts to one browser. `PUSH_RESULTS_TO_HUB=1`
+puts them **where the model lives**, under `eval/llm_baseline/<run_tag>/` in
+`HF_REPO_ID` — a folder a third party can cite and fetch without asking you.
+
+Three properties are deliberate:
+
+- **It never writes to the repo root.** `path_in_repo` keeps the eval tree
+  disjoint from `model.pt`, `resolve_config.json` and the model card §7
+  generates. A root-level push would overwrite the card, and would make
+  `snapshot_download()` hand prediction rows to anyone who only wanted weights.
+- **`<run_tag>` contains the fraction and the seed**, e.g.
+  `eval/llm_baseline/qwen3.7-flash-f0.1-seed42/`. A smoke run lands in its own
+  folder and can never overwrite the 100% run the paper cites. `llm_parity.json`
+  carries `meta.run_tag` and `meta.hub_eval_prefix`, so a table found later
+  points back at its own location.
+- **The commit message names the model revision.** Every push records which
+  weights the numbers describe.
+
+### Pinning the weights (`HF_REVISION`)
+
+A model repo's `HEAD` moves on every §7 re-push, so `HF_REPO_ID` names a repo,
+not a model. The two are easy to conflate and expensive to get wrong: an eval
+scored against one commit and cited against `main` is unreproducible.
+
+- `HF_REVISION = "<commit sha or tag>"` makes the run reproducible. Do this for
+  anything you intend to publish.
+- Leaving it `None` follows `HEAD`. That is fine for a smoke run, and cell 7
+  still records the sha it actually scored — read back from the snapshot cache
+  path, so no extra network call — into `meta.spancall_revision`. The field is
+  `(HEAD, unpinned)` only when inference never ran, i.e. when cell 3 reused the
+  frozen predictions and no checkpoint was ever downloaded.
+
+### Bringing the paid rows back
+
+The upload in cell 3 covers only the **SpanCall** side. A fresh Colab runtime
+has no LLM checkpoint, so re-running cell 4 at `LLM_LIMIT_FRACTION=1.0`
+**re-buys every row**. If you already have a finished `preds_{split}_llm.jsonl`,
+copy it into `RESULTS_DIR` before running cell 4: the fingerprint check then
+matches and cell 4 prints `COMPLETE run reused - 0 API calls, $0 spent`.
+
+If you published a previous run, you can also fetch it back by revision instead
+of by hand:
+
+```python
+from huggingface_hub import snapshot_download
+snapshot_download(HF_REPO_ID, repo_type="model", revision=REV,
+                  allow_patterns="eval/llm_baseline/*/*.jsonl")
+```
 """
 
 CODE_PERSIST = '''# 7. Write JSON artifacts and print a paper-shaped table.
@@ -1064,26 +1766,51 @@ import json, os
 
 
 def _eval_rows(path):
-    """The rows that were actually scored, i.e. after the LLM_LIMIT trim."""
-    rows = [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]
-    return rows if LLM_LIMIT is None else rows[: int(LLM_LIMIT)]
+    """The rows that were actually scored, i.e. after the fraction trim."""
+    return _limit_rows([json.loads(l) for l in open(path, encoding="utf-8") if l.strip()])
 
 
 _out = os.path.join(RESULTS_DIR, "llm_parity.json")
+
+# `<model>/<fraction>/<seed>`: the tag a run is published under. It carries the
+# fraction on purpose - a 10% smoke run and the 100% run must not collide in
+# `eval/llm_baseline/`, or the smoke numbers would overwrite the paper's.
+RUN_TAG = "{}-{}-seed{}".format(
+    LLM_MODEL.replace("/", "_"),
+    ("full" if LLM_LIMIT_FRACTION >= 1.0 else "f{:g}".format(LLM_LIMIT_FRACTION)),
+    SEED,
+)
+HUB_EVAL_PREFIX = "eval/llm_baseline/{}".format(RUN_TAG)
+
+# `globals().get`, not a bare name: this cell is exec'd by the offline smoke test
+# with a namespace that only holds the evaluation names, so a direct reference to
+# a cell-1/cell-2 global would raise NameError there and only there. Both names
+# are still resolved from the notebook at run time, which is what matters.
+_rev_resolved = globals().get("MODEL_REVISION_RESOLVED")
+_rev_pinned = globals().get("HF_REVISION")
+
 payload = {
     "meta": {
         "spancall_repo": HF_REPO_ID,
+        # WHICH weights these numbers describe. `spancall_repo` alone is a repo,
+        # not a model: §7 re-pushes move HEAD, so without the sha this table
+        # could silently belong to weights nobody can reproduce.
+        "spancall_revision": _rev_resolved or _rev_pinned or "(HEAD, unpinned)",
+        "spancall_revision_pinned": bool(_rev_pinned),
+        "hub_eval_prefix": HUB_EVAL_PREFIX,
+        "run_tag": RUN_TAG,
         "dataset": HF_DATASET_ID,
         "llm_model": LLM_MODEL,
         "llm_base_url": LLM_BASE_URL or "(sdk default)",
         "llm_temperature": LLM_TEMPERATURE,
-        "llm_limit": LLM_LIMIT,
+        "llm_limit_fraction": LLM_LIMIT_FRACTION,
         "seed": SEED,
         "eval_splits": EVAL_SPLITS,
         "resolve_mode": "two_step",
         "min_joint_margin": MIN_JOINT_MARGIN,
         "n_rows": {sp: len(_eval_rows(SUBSET_PATHS[sp])) for sp in EVAL_SPLITS},
         "spancall_source": SPANCALL_SOURCE,
+        "llm_source": LLM_SOURCE,
         "note": ("One hosted-LLM arm via the OpenAI SDK. Both arms scored by the "
                  "same ToolCallEvaluator on the same rows in the same order. "
                  "No price table is assumed; token counts are measured, USD is not reported."),
@@ -1095,31 +1822,180 @@ with open(_out, "w", encoding="utf-8") as _fh:
     json.dump(payload, _fh, indent=2, default=str)
 print(f"[persist] wrote {_out}")
 
-if LLM_LIMIT is not None:
-    print(f"\\n!! LLM_LIMIT={LLM_LIMIT}: this is a SMOKE RUN on {LLM_LIMIT} rows per split.")
-    print("!! Do not copy these numbers into the paper; re-run with LLM_LIMIT=None.")
+if LLM_LIMIT_FRACTION < 1.0:
+    print(f"\\n!! LLM_LIMIT_FRACTION={LLM_LIMIT_FRACTION}: SMOKE RUN on "
+          f"{LLM_LIMIT_FRACTION:.0%} of each split "
+          f"({payload['meta']['n_rows']}).")
+    print("!! Do not copy these numbers into the paper; re-run with "
+          "LLM_LIMIT_FRACTION=1.0.")
 
 print("\\n" + "=" * 96)
 print("PAPER TABLE (replaces the B1a row) — stratum F metrics")
 print("=" * 96)
 print(f"{'split':<14}{'system':<22}{'n_F':>6}{'exact_F':>10}{'hit_F':>9}"
-      f"{'param_F1':>10}{'false_hit_A':>13}{'lat_ms':>9}{'tok_in':>9}{'tok_out':>9}")
-print("-" * 112)
+      f"{'param_F1':>10}{'false_hit_A':>13}{'lat_ms':>9}{'p90_ms':>9}"
+      f"{'tok_in':>9}{'tok_out':>9}")
+print("-" * 121)
 for _sp in EVAL_SPLITS:
     for _name, _m in SYSTEMS[_sp].items():
         _f = (_m.get("metrics_by_stratum") or {}).get("F", {})
+        _t = _m.get("timing") or {}
         print(f"{_sp:<14}{_name:<22}"
               f"{int(_f.get('n', 0) or 0):>6}"
               f"{cmp._fmt(_f.get('exact_payload_match')):>10}"
               f"{cmp._fmt(_f.get('hit_rate')):>9}"
               f"{cmp._fmt(_f.get('param_f1')):>10}"
               f"{cmp._fmt(_m.get('false_hit_rate_on_a'), 4):>13}"
-              f"{cmp._fmt((_m.get('timing') or {}).get('mean_latency_ms'), 1):>9}"
+              f"{cmp._fmt(_t.get('mean'), 1):>9}"
+              f"{cmp._fmt(_t.get('p90'), 1):>9}"
               f"{int((_m.get('cost') or {}).get('prompt_tokens', 0) or 0):>9}"
               f"{int((_m.get('cost') or {}).get('completion_tokens', 0) or 0):>9}")
-print("-" * 112)
+print("-" * 121)
 print("exact_F / hit_F / param_F1 are stratum F (`F_func` + `F_json`).")
 print("false_hit_A is the share of ungroundable turns the system answered anyway (lower is better).")
+print(f"lat_ms / p90_ms are per-call wall clock over {LLM_LIMIT_FRACTION:.0%} of each split.")
+
+# --------------------------------------------------------------------------- #
+# What counts as a shipment artifact.
+#
+# One definition, used by BOTH transports below, because two copies of a
+# whitelist is how a file ends up in the zip but not in the Hub folder (or the
+# reverse) with nobody noticing.
+#
+# `*.ckpt-*` is excluded on purpose: those rows carry `_fingerprint` and any
+# `llm_error`, so a half-failed run would read as a finished result once it left
+# the VM. `*.bak-*` / `*.tmp*` are previous or partial writes for the same
+# reason.
+# --------------------------------------------------------------------------- #
+def _ship_files(results_dir: str) -> list:
+    keep = ["llm_parity.json"]
+    for _f in sorted(os.listdir(results_dir)):
+        if not (_f.startswith("preds_") and _f.endswith(".jsonl")):
+            continue
+        if ".ckpt-" in _f or ".bak-" in _f or ".tmp" in _f:
+            continue                              # resume state, not a result
+        keep.append(_f)
+    return [_f for _f in keep if os.path.isfile(os.path.join(results_dir, _f))]
+
+
+# --------------------------------------------------------------------------- #
+# Optional Colab download: get the artifacts off the VM in ONE click.
+#
+# Two things this must NOT do:
+#  * call `files.download()` once per artifact - Chrome blocks the 2nd+ automatic
+#    download, so the user would receive only whatever came first;
+#  * leave the zip behind - the next run would archive its own predecessor.
+#
+# `IN_COLAB` is deliberately RE-DETECTED here instead of inherited from cell 3.
+# This cell is exec'd directly by the offline smoke test with a hand-built
+# namespace, so relying on a name bound in another cell would be a NameError
+# there and only there.
+# --------------------------------------------------------------------------- #
+DOWNLOAD_RESULTS = os.environ.get("DOWNLOAD_RESULTS", "0").strip().lower() not in (
+    "", "0", "false", "no")
+try:
+    from google.colab import files as _colab_files
+    _in_colab = True
+except ImportError:
+    _colab_files = None
+    _in_colab = False
+
+if not DOWNLOAD_RESULTS:
+    print(f"\\n[download] off. Artifacts are on disk at {RESULTS_DIR}")
+    print("[download] set DOWNLOAD_RESULTS=1 (Colab) to fetch them as one zip.")
+elif not _in_colab:
+    print(f"\\n[download] DOWNLOAD_RESULTS=1 but this is not Colab -> artifacts stay at "
+          f"{RESULTS_DIR}")
+else:
+    import shutil as _shutil
+    _bundle = os.path.join(RESULTS_DIR, "llm_baseline_artifacts")
+    _shutil.rmtree(_bundle, ignore_errors=True)   # never archive a previous bundle
+    os.makedirs(_bundle, exist_ok=True)
+
+    _keep = _ship_files(RESULTS_DIR)
+    for _f in _keep:
+        _shutil.copy2(os.path.join(RESULTS_DIR, _f), os.path.join(_bundle, _f))
+    print(f"\\n[download] bundling {len(_keep)} file(s): {_keep}")
+
+    _zip = _shutil.make_archive(_bundle, "zip", root_dir=_bundle)
+    print(f"[download] {_zip}  {os.path.getsize(_zip) / 1e6:.2f} MB")
+    _shutil.rmtree(_bundle, ignore_errors=True)   # the zip is the artifact
+    _colab_files.download(_zip)                   # exactly ONE browser download
+    print(f"[download] handed to the browser. Local copy kept at {_zip}")
+
+
+# --------------------------------------------------------------------------- #
+# Optional Hub push: publish the artifacts NEXT TO the weights they describe.
+#
+# A model repo has a property the zip does not: it is citable, and the numbers
+# are only meaningful for one specific revision of one specific model. So the
+# results go to `eval/llm_baseline/<run_tag>/` inside HF_REPO_ID rather than to
+# a repo root, for three reasons:
+#
+#  * `path_in_repo` keeps the eval tree disjoint from `model.pt`,
+#    `resolve_config.json` and the generated model card. A root-level push would
+#    overwrite the card §7 just wrote, and would make `snapshot_download()` pull
+#    prediction files for anyone who only wanted weights.
+#  * `<run_tag>` embeds the model name, the fraction and the seed. A
+#    `LLM_LIMIT_FRACTION=0.1` smoke run therefore lands somewhere else and can
+#    never overwrite the 100% run the paper cites.
+#  * the commit message names the revision the table was scored against, so the
+#    repo's own commit log records the evidence chain.
+#
+# OFF by default. A push is public and effectively permanent; making it implicit
+# would let an exploratory run publish under the paper's dataset name.
+#
+# The token is READ FROM THE ENVIRONMENT, not from `HF_TOKEN` in the namespace:
+# cell 1 already exported it there, and a bare name would be a NameError when
+# this cell is exec'd with a hand-built namespace.
+# --------------------------------------------------------------------------- #
+_env = os.environ
+PUSH_RESULTS_TO_HUB = _env.get("PUSH_RESULTS_TO_HUB", "0").strip().lower() not in (
+    "", "0", "false", "no")
+
+if not PUSH_RESULTS_TO_HUB:
+    print("\\n[hub-push] off. Set PUSH_RESULTS_TO_HUB=1 to publish under "
+          f"{HUB_EVAL_PREFIX}/.")
+else:
+    _tok = _env.get("HF_TOKEN") or _env.get("HUGGING_FACE_HUB_TOKEN")
+    _ship = _ship_files(RESULTS_DIR)
+    print(f"\\n[hub-push] target {HF_REPO_ID} :: {HUB_EVAL_PREFIX}/ "
+          f"({len(_ship)} file(s): {_ship})")
+    if not _tok:
+        print("[hub-push] no HF token in the environment -> SKIPPED (files stay local).")
+    elif "llm_parity.json" not in _ship:
+        # Pushing predictions without the table would publish the evidence and
+        # lose the conclusion; refuse rather than create a half-useful folder.
+        print("[hub-push] llm_parity.json is missing -> SKIPPED. Run this cell fully "
+              "first; a partial push is worse than none.")
+    else:
+        try:
+            from huggingface_hub import HfApi
+            _api = HfApi(token=_tok)
+            _api.create_repo(repo_id=HF_REPO_ID, repo_type="model", exist_ok=True)
+            for _f in _ship:
+                _api.upload_file(
+                    path_or_fileobj=os.path.join(RESULTS_DIR, _f),
+                    path_in_repo=f"{HUB_EVAL_PREFIX}/{_f}",
+                    repo_id=HF_REPO_ID,
+                    repo_type="model",
+                    commit_message=(
+                        f"eval: LLM baseline {RUN_TAG} "
+                        f"(model={_rev_resolved or _rev_pinned or 'HEAD'}, "
+                        f"fraction={LLM_LIMIT_FRACTION}, seed={SEED})"
+                    ),
+                )
+                print(f"[hub-push] uploaded {_f}")
+            print(f"[hub-push] done -> https://huggingface.co/{HF_REPO_ID}"
+                  f"/tree/main/{HUB_EVAL_PREFIX}")
+            print("[hub-push] cite it with "
+                  f"`revision={_rev_resolved or _rev_pinned or 'HEAD'}` — "
+                  "this folder describes those weights, not the repo's future HEAD.")
+        except Exception as _exc:
+            # Deliberately non-fatal: the local artifacts are already written, so
+            # a network or permission failure must not mark the run as failed.
+            print(f"[hub-push] FAILED ({type(_exc).__name__}: {_exc})")
+            print(f"[hub-push] local artifacts are intact at {RESULTS_DIR}")
 '''
 
 MD_TAKEAWAY = """## 8. How to read this before putting it in the paper
@@ -1141,9 +2017,24 @@ one fails, the comparison is not publishable and no amount of framing fixes it.
    decline. The LLM will likely be better here, because it can read "there is no
    matching tool" from context. Report it; do not bury it.
 
-Latency and tokens are measured in this run, but the sandbox/network path
-dominates LLM latency, so treat the wall-clock comparison as indicative and the
-token counts as the hard number.
+### On the latency numbers
+
+4. **Report p90, not just the mean — and say what each one measures.** The two
+   figures are not the same quantity. SpanCall's `latency_ms` is local decode
+   time on a GPU; the LLM's is a network round trip to a hosted endpoint plus
+   queueing. That asymmetry is the *finding*, not a flaw in the measurement, but
+   it has to be stated or a reviewer will read "850 ms" as model quality.
+5. **Check `n_timed` before quoting any percentile.** If `n_timed` is 0 the arm
+   made no timed call (see the error rows above), and if it is well below `n`,
+   some rows were never timed. A p90 over 3 surviving rows is not a p90.
+6. **Compare p90 against p50 on both arms.** A similar mean with a much worse
+   p90 means the tail — retries, long candidate lists, provider throttling — is
+   carrying the difference. That is a scheduling claim, not a modelling claim,
+   and it belongs in the discussion rather than the results table.
+
+Token counts remain the hard number for cost, since they do not depend on where
+the notebook was run; wall clock does, and a Colab CPU path will flatter
+SpanCall's p90. Re-measure on the serving hardware before quoting latency.
 """
 
 CELLS: List[Dict[str, Any]] = [

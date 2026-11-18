@@ -108,7 +108,15 @@ def main() -> int:
         results_out = tmp / "results_lean_v3_2_llm"
         results_out.mkdir(parents=True)
 
-        # 3 stratum-F rows (2 scalar/normal, 1 array/complex) + 1 stratum-A row.
+        # 3 stratum-F rows (2 scalar/normal, 1 array/complex) + 2 stratum-A rows.
+        #
+        # The minimal `{"sample_id": s}` fixtures used to live here, but cell 3
+        # no longer only checks key coverage: `_limit_rows` needs rows that
+        # `classify_eval_cohort` can place in a cohort, so the subset must look
+        # like a real one. `a1` carries a GT call whose tool IS offered (an
+        # ungroundable-in-practice turn with a schema match) and `a2` has no GT
+        # tool at all - both land in stratum A, which is what
+        # `false_hit_rate_on_a` is computed over.
         rows = [
             _sample_row("h1", "What's the weather in Hanoi?", "get_weather",
                         {"city": "Hanoi"}, [_WEATHER_TOOL], "F"),
@@ -119,7 +127,9 @@ def main() -> int:
                         {"origin": "SGN", "destination": "HAN",
                          "passengers": ["an", "binh"]},
                         [_FLIGHT_TOOL], "F"),
-            _sample_row("a1", "Do the thing with the stuff.", None, {},
+            _sample_row("a1", "Do the thing with the stuff.", "get_weather",
+                        {"city": "Hanoi"}, [_WEATHER_TOOL, _FLIGHT_TOOL], "A"),
+            _sample_row("a2", "Never mind, cancel that.", None, {},
                         [_WEATHER_TOOL, _FLIGHT_TOOL], "A"),
         ]
         subset_path = subset_dir / "subset_hermes_eval_clean.jsonl"
@@ -141,8 +151,11 @@ def main() -> int:
                    "payload": {"origin": "SGN", "destination": "HAN",
                                "passengers": ["an", "binh"]},
                    "latency_ms": 13.0, "status": "hit"},
-            # A row: correct behaviour is abstain
+            # A rows: correct behaviour is abstain
             "a1": {"sample_id": "a1", "stratum": "A", "hit": False,
+                   "tool_name": None, "payload": None,
+                   "latency_ms": 9.0, "status": "abstain"},
+            "a2": {"sample_id": "a2", "stratum": "A", "hit": False,
                    "tool_name": None, "payload": None,
                    "latency_ms": 9.0, "status": "abstain"},
         }
@@ -157,7 +170,13 @@ def main() -> int:
             "h3": [{"tool_name": "book_flight",
                     "payload": {"origin": "SGN", "destination": "HAN"}}],
             "a1": [{"tool_name": "get_weather", "payload": {"city": "Hanoi"}}],
+            "a2": [{"tool_name": "book_flight", "payload": {"origin": "SGN"}}],
         }
+        # Deliberately SPREAD latencies: a constant would make every percentile
+        # equal and silently "pass" regardless of the arithmetic.
+        #   sorted: 700, 800, 850, 900, 1200  ->  mean 890, p50 850, p90 1200
+        llm_latency = {"h1": 800.0, "h2": 900.0, "h3": 1200.0,
+                       "a1": 700.0, "a2": 850.0}
         llm_preds = {}
         for sid, calls in llm_specs.items():
             resp = cmp.LLMResponse(
@@ -165,7 +184,7 @@ def main() -> int:
                 text="",
                 prompt_tokens=100,
                 completion_tokens=20,
-                latency_ms=850.0,
+                latency_ms=llm_latency[sid],
                 error=None,
             )
             llm_preds[sid] = cmp._llm_pred_row(sid, resp)
@@ -187,11 +206,23 @@ def main() -> int:
             "LLM_MODEL": "fake-hosted-llm",
             "LLM_BASE_URL": "",          # cell 7 records this; blank = SDK default
             "LLM_TEMPERATURE": 0.0,
-            "LLM_LIMIT": None,
+            # Cells 5-7 trim with `_limit_rows`, which cell 0 defines. 1.0 keeps
+            # the fixture intact; the trim behaviour itself is covered by
+            # `smoke_llm_baseline_reuse.py`.
+            "LLM_LIMIT_FRACTION": 1.0,
+            # Cell 0 declares this and cell 4 fills it; cell 7 persists it.
+            "LLM_SOURCE": {"hermes_eval": "checkpoint reuse (5/5 rows, 0 API calls, fp=deadbeef)"},
             "SEED": 42,
             "MIN_JOINT_MARGIN": 0.02,
             "_base_url": None,
         }
+        # Inject the shipped cell-0 helper rather than a local reimplementation.
+        _nb = json.loads(NB.read_text(encoding="utf-8"))
+        _c0src = "".join(
+            [c for c in _nb["cells"] if c["cell_type"] == "code"][0]["source"]
+        )
+        _cut = _c0src.index("def _limit_rows")
+        exec(compile(_c0src[_cut:_c0src.index("# Print shapes")], "<_limit_rows>", "exec"), ns)
 
         def run(idx: int, label: str) -> None:
             print(f"\n[exec] cell {idx} ({label})")
@@ -220,8 +251,10 @@ def main() -> int:
               f"SpanCall exact_F == 2/3 (got {sp_f['exact_payload_match']})")
         check(abs(llm_f["exact_payload_match"] - 1 / 3) < 1e-9,
               f"LLM exact_F == 1/3 (got {llm_f['exact_payload_match']})")
-        check(int(sp["total_samples"]) == 4 and int(llm["total_samples"]) == 4,
-              "both systems scored all 4 rows including stratum A")
+        # All 5 fixture rows are scored on BOTH arms - that is the fairness
+        # contract. Stratum A rows enter through false_hit_rate_on_a, not n_F.
+        check(int(sp["total_samples"]) == 5 and int(llm["total_samples"]) == 5,
+              "both systems scored all 5 rows including stratum A")
 
         # The A row: SpanCall abstains (0.0), the LLM answers anyway (1.0).
         check(abs(float(sp["false_hit_rate_on_a"]) - 0.0) < 1e-9,
@@ -229,11 +262,42 @@ def main() -> int:
         check(abs(float(llm["false_hit_rate_on_a"]) - 1.0) < 1e-9,
               f"LLM false_hit_A == 1.0 (got {llm['false_hit_rate_on_a']})")
 
-        # Latency + token bookkeeping.
-        check(abs(sp["timing"]["mean_latency_ms"] - 11.25) < 1e-6,
-              f"SpanCall mean latency 11.25ms (got {sp['timing']['mean_latency_ms']})")
-        check(llm["cost"]["n_llm_calls"] == 4, "LLM cost counts 4 calls")
-        check(llm["cost"]["prompt_tokens"] == 400, "LLM prompt tokens summed (400)")
+        # Latency + token bookkeeping. SpanCall sorted latencies: 9, 9, 11, 12, 13
+        # -> mean 10.8, p50 11, p90 13 (nearest rank: ceil(0.9*5)=5 -> index 4).
+        check(abs(sp["timing"]["mean_latency_ms"] - 10.8) < 1e-6,
+              f"SpanCall mean latency 10.8ms (got {sp['timing']['mean_latency_ms']})")
+        check(abs(sp["timing"]["mean"] - 10.8) < 1e-6,
+              f"timing.mean mirrors mean_latency_ms (got {sp['timing']['mean']})")
+        check(int(sp["timing"]["n_timed"]) == 5,
+              f"SpanCall timed every row (got {sp['timing']['n_timed']})")
+        check(abs(sp["timing"]["p50"] - 11.0) < 1e-6,
+              f"SpanCall p50 == 11.0 (got {sp['timing']['p50']})")
+        check(abs(sp["timing"]["p90"] - 13.0) < 1e-6,
+              f"SpanCall p90 == 13.0 (got {sp['timing']['p90']})")
+        check(abs(sp["timing"]["max"] - 13.0) < 1e-6,
+              f"SpanCall max == 13.0 (got {sp['timing']['max']})")
+
+        # LLM sorted latencies: 700, 800, 850, 900, 1200
+        # -> mean 890, p50 850, p90 1200, p99 1200.
+        check(abs(llm["timing"]["mean"] - 890.0) < 1e-6,
+              f"LLM mean == 890.0 (got {llm['timing']['mean']})")
+        check(abs(llm["timing"]["p50"] - 850.0) < 1e-6,
+              f"LLM p50 == 850.0 (got {llm['timing']['p50']})")
+        check(abs(llm["timing"]["p90"] - 1200.0) < 1e-6,
+              f"LLM p90 == 1200.0 (got {llm['timing']['p90']})")
+        check(abs(llm["timing"]["p99"] - 1200.0) < 1e-6,
+              f"LLM p99 == 1200.0 (got {llm['timing']['p99']})")
+        # p90 > mean on this fixture: the tail must not be averaged away.
+        check(llm["timing"]["p90"] > llm["timing"]["mean"],
+              "LLM p90 exceeds its mean, so the tail is visible (not leaked into the mean)")
+
+        # Per-slice p90 must agree with the global p90 when there is one slice.
+        _slice = llm.get("latency_by_slice") or {}
+        check(len(_slice) == 1 and abs(next(iter(_slice.values()))["p90"] - 1200.0) < 1e-6,
+              f"per-slice p90 matches the global p90: { {k: v.get('p90') for k, v in _slice.items()} }")
+
+        check(llm["cost"]["n_llm_calls"] == 5, "LLM cost counts 5 calls")
+        check(llm["cost"]["prompt_tokens"] == 500, "LLM prompt tokens summed (500)")
         check(sp["cost"]["n_llm_calls"] == 0, "SpanCall reports 0 LLM calls")
         check("pivot" in sp and len(sp["pivot"]) >= 1,
               f"pivot cells built: {sorted(sp['pivot'])}")
@@ -241,9 +305,10 @@ def main() -> int:
         print("\n[assert] complexity")
         cx = ns["COMPLEXITY"]["hermes_eval"]
         check(set(cx) == {"normal", "complex"}, f"both cohorts populated: {sorted(cx)}")
-        # h1,h2,a1 -> normal (scalar-only); h3 -> complex (array arg)
-        check(int(cx["normal"]["spancall_two_step"]["total_samples"]) == 3,
-              "normal cohort has 3 rows")
+        # h1,h2,a1,a2 -> normal (scalar-only, or no GT call to classify);
+        # h3 -> complex (array-valued `passengers` argument).
+        check(int(cx["normal"]["spancall_two_step"]["total_samples"]) == 4,
+              "normal cohort has 4 rows")
         check(int(cx["complex"]["spancall_two_step"]["total_samples"]) == 1,
               "complex cohort has 1 row")
 
@@ -251,10 +316,12 @@ def main() -> int:
         out = results_out / "llm_parity.json"
         check(out.is_file(), f"llm_parity.json written -> {out}")
         payload = json.loads(out.read_text(encoding="utf-8"))
-        check(payload["meta"]["n_rows"]["hermes_eval"] == 4,
+        check(payload["meta"]["n_rows"]["hermes_eval"] == 5,
               f"meta n_rows is post-trim row count (got {payload['meta']['n_rows']})")
         check(payload["meta"]["spancall_source"] == {"hermes_eval": "reused: synthetic"},
               "meta records how the SpanCall side was obtained")
+        check("checkpoint reuse" in payload["meta"]["llm_source"]["hermes_eval"],
+              "meta records that the paid rows came from a checkpoint")
         check(payload["meta"]["llm_model"] == "fake-hosted-llm",
               "meta records the LLM model")
         check("systems" in payload and "complexity" in payload,
@@ -262,6 +329,17 @@ def main() -> int:
         check(isinstance(payload["systems"]["hermes_eval"]
                          ["spancall_two_step"]["metrics_by_stratum"]["F"]["n"], (int, float)),
               "JSON is serialisable (default=str handled enums)")
+
+        # The latency distribution must survive the JSON round trip: it is what
+        # the paper table and any downstream plotting reads.
+        _pt = payload["systems"]["hermes_eval"]["llm:fake-hosted-llm"]["timing"]
+        check(set(("p50", "p90", "p95", "p99", "max", "n_timed")) <= set(_pt),
+              f"persisted timing carries the full distribution: {sorted(_pt)}")
+        check(abs(_pt["p90"] - 1200.0) < 1e-6,
+              f"persisted LLM p90 == 1200.0 (got {_pt['p90']})")
+        _ps = payload["systems"]["hermes_eval"]["llm:fake-hosted-llm"]["latency_by_slice"]
+        check(len(_ps) == 1 and abs(next(iter(_ps.values()))["p90"] - 1200.0) < 1e-6,
+              f"persisted per-slice p90 survives: { {k: v.get('p90') for k, v in _ps.items()} }")
 
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

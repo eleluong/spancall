@@ -123,7 +123,7 @@ def main() -> int:
     ns, asked, out = _run(
         {
             "HF_TOKEN": "hf_from_env",
-            "BASE_LLM_MODEL": "gpt-4o-mini",
+            "BASE_LLM_MODEL": "qwen3.7-flash",
             "BASE_URL": "https://example.test/v1",
             "API_KEY": "sk-from-env",
         },
@@ -133,7 +133,7 @@ def main() -> int:
     check(ns["HF_TOKEN"] == "hf_from_env", "1a env HF_TOKEN wins")
     check(ns["LLM_API_KEY"] == "sk-from-env", "1b env API_KEY wins over .env")
     check(ns["LLM_BASE_URL"] == "https://example.test/v1", "1c env BASE_URL wins over .env")
-    check(ns["LLM_MODEL_ID"] == "gpt-4o-mini", "1d env BASE_LLM_MODEL honoured")
+    check(ns["LLM_MODEL_ID"] == "qwen3.7-flash", "1d env BASE_LLM_MODEL honoured")
     check(not asked, f"1e no prompt when everything is set (got {asked})")
     check("hf_from_env" not in out, "1f HF token never printed")
     check("sk-from-env" not in out, "1g API key never printed")

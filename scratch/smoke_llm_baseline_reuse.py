@@ -9,7 +9,9 @@ Verifies, with no network and no GPU:
   4. `_validate_coverage` raises SystemExit when a row is missing
      (this is the guard that stops the two arms being scored on
      different populations).
-  5. `LLM_LIMIT` trims the coverage check to the same prefix.
+  5. `LLM_LIMIT_FRACTION` trims the coverage check to the same
+     COHORT-PROPORTIONAL sample (not a head-slice: the subset writes one
+     contiguous block per cohort, so a prefix would be all `F_func`).
 """
 
 from __future__ import annotations
@@ -24,7 +26,18 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
+from spancall.lean.eval_p1 import classify_eval_cohort  # noqa: E402
+
 NB = REPO / "notebooks" / "spancall_lean_v3_2_llm_baseline.ipynb"
+
+
+def _limit_rows_from_notebook() -> str:
+    """The REAL `_limit_rows` from cell 0, so this test cannot drift from it."""
+    nb = json.loads(NB.read_text(encoding="utf-8"))
+    code = [c for c in nb["cells"] if c["cell_type"] == "code"]
+    src = "".join(code[0]["source"])
+    start = src.index("def _limit_rows")
+    return src[start:src.index("# Print shapes")]
 
 
 def _cell3_source() -> str:
@@ -47,6 +60,17 @@ def _write_jsonl(path: Path, rows) -> None:
     with path.open("w", encoding="utf-8") as fh:
         for r in rows:
             fh.write(json.dumps(r) + "\n")
+
+
+def _sub_row(sid: str, stratum: str = "F", tool: str = "get_weather") -> dict:
+    """A subset row `classify_eval_cohort` can place in a real cohort."""
+    return {
+        "sample_id": sid,
+        "stratum": stratum,
+        "utterance": "weather please",
+        "tools": [{"name": tool, "description": "d", "parameters": []}],
+        "ground_truth_calls": [{"tool_name": tool, "arguments": {"city": "Hanoi"}}],
+    }
 
 
 def _pred(sid: str, hit: bool, tool: str, stratum: str = "F") -> dict:
@@ -77,22 +101,33 @@ def main() -> int:
         results_out = tmp / "results_lean_v3_2_llm"
         results_out.mkdir(parents=True)
 
-        hermes_ids = ["h1", "h2", "h3"]
+        # Three cohorts on purpose: `_limit_rows` samples PER COHORT, which is
+        # only observable when the file holds more than one. With a single-cohort
+        # fixture every proportionality assertion is vacuous.
+        hermes_rows = [
+            _sub_row("h1"),                       # F_func
+            _sub_row("h2"),                       # F_func
+            _sub_row("h3"),                       # F_func
+            _sub_row("h4", "F", "json_output"),   # F_json
+            _sub_row("h5", "F", "json_output"),   # F_json
+            _sub_row("h6", "A"),                  # A_clean
+            _sub_row("h7", "A"),                  # A_clean
+        ]
         xlam_ids = ["x1", "x2"]
 
-        _write_jsonl(
-            subset_dir / "subset_hermes_eval_clean.jsonl",
-            [{"sample_id": s} for s in hermes_ids],
-        )
+        _write_jsonl(subset_dir / "subset_hermes_eval_clean.jsonl", hermes_rows)
         _write_jsonl(
             subset_dir / "subset_xlam_eval_clean.jsonl",
-            [{"sample_id": s} for s in xlam_ids],
+            [_sub_row(s) for s in xlam_ids],
         )
         # hermes: the primary candidate path (preds_eval_twostep.jsonl)
         _write_jsonl(
             results_v32 / "preds_eval_twostep.jsonl",
             [_pred("h1", True, "get_weather"), _pred("h2", False, ""),
-             _pred("h3", True, "book_flight"), _pred("h_extra", True, "x")],
+             _pred("h3", True, "book_flight"),
+             _pred("h4", True, "json_output"), _pred("h5", True, "json_output"),
+             _pred("h6", False, ""), _pred("h7", False, ""),
+             _pred("h_extra", True, "x")],
         )
         # xlam: the split-specific candidate path
         _write_jsonl(
@@ -101,6 +136,9 @@ def main() -> int:
         )
 
         # ---- execute cell 3 ---------------------------------------------- #
+        # Cell 3 calls `_limit_rows`, which cell 0 defines. Inject the REAL
+        # cell-0 function rather than a stand-in so the trim under test is the
+        # shipped one.
         ns = {
             "PROJECT_ROOT": str(tmp),
             "RESULTS_DIR": str(results_out),
@@ -110,10 +148,12 @@ def main() -> int:
                 "hermes_eval": str(subset_dir / "subset_hermes_eval_clean.jsonl"),
                 "xlam_eval": str(subset_dir / "subset_xlam_eval_clean.jsonl"),
             },
-            "LLM_LIMIT": None,
+            "LLM_LIMIT_FRACTION": 1.0,
             "EVAL_BATCH_SIZE": 32,
             "EVAL_WORKERS": 4,
+            "os": os, "json": json,
         }
+        exec(compile(_limit_rows_from_notebook(), "<_limit_rows>", "exec"), ns)
         # RESULTS_V3_2 is derived from PROJECT_ROOT inside the cell; make the
         # synthetic dir land exactly where the cell expects it.
         shutil.move(str(results_v32), str(tmp / "results_lean_v3_2"))
@@ -127,8 +167,8 @@ def main() -> int:
         print("\n[assert] outcome")
         check(set(preds) == {"hermes_eval", "xlam_eval"},
               "both splits produced a prediction dict")
-        check(len(preds["hermes_eval"]) == 4,
-              "hermes _load_preds loaded all 4 rows (extra pred kept)")
+        check(len(preds["hermes_eval"]) == 8,
+              "hermes _load_preds loaded all 8 rows (extra pred kept)")
         check(set(preds["xlam_eval"]) == {"x1", "x2"},
               "xlam keys are the str(sample_id)s")
         check(source["hermes_eval"].startswith("reused:"),
@@ -152,27 +192,42 @@ def main() -> int:
         else:
             check(False, "SystemExit raised for missing rows")
 
-        # ---- LLM_LIMIT trims the checked prefix -------------------------- #
-        print("\n[assert] LLM_LIMIT prefix trim")
-        ns["LLM_LIMIT"] = 2
-        try:
-            ns["_validate_coverage"](
-                "trimmed_ok",
-                str(subset_dir / "subset_hermes_eval_clean.jsonl"),
-                {"h1": {}, "h2": {}},
-            )
-            check(True, "limit=2 passes when only h1,h2 are covered")
-        except SystemExit as e:
-            check(False, f"limit=2 should not require h3: {e}")
+        # ---- the fraction trim is COHORT-PROPORTIONAL, not a head-slice --- #
+        print("\n[assert] _limit_rows is cohort-proportional")
+        _rows = [json.loads(l) for l in
+                 open(subset_dir / "subset_hermes_eval_clean.jsonl") if l.strip()]
+        _all = ns["_limit_rows"](_rows, 1.0)
+        check(len(_all) == len(_rows), "fraction=1.0 is a passthrough")
+
+        _frac = ns["_limit_rows"](_rows, 0.34)
+        _coh_all = {classify_eval_cohort(r) for r in _rows}
+        _coh_frac = {classify_eval_cohort(r) for r in _frac}
+        check(0 < len(_frac) < len(_rows),
+              f"fraction<1.0 actually trims ({len(_rows)} -> {len(_frac)} rows)")
+        # The property the old prefix trim could not provide: no cohort starved.
+        check(_coh_frac == _coh_all,
+              f"trim preserves every cohort present in the file ({sorted(_coh_all)})")
+        # The bug this replaced: the subset file is ONE CONTIGUOUS BLOCK PER
+        # COHORT, so a head-slice of the same size covers far fewer cohorts.
+        _coh_head = {classify_eval_cohort(r) for r in _rows[: len(_frac)]}
+        check(len(_coh_head) < len(_coh_frac),
+              f"head-slice covers {len(_coh_head)} cohort(s) vs "
+              f"{len(_coh_frac)} for the trim")
+        check([r["sample_id"] for r in ns["_limit_rows"](_rows, 0.34)]
+              == [r["sample_id"] for r in _frac],
+              "trim is deterministic")
+
+        # coverage still validates against the trimmed population
+        ns["LLM_LIMIT_FRACTION"] = 0.5
         try:
             ns["_validate_coverage"](
                 "trimmed_bad",
                 str(subset_dir / "subset_hermes_eval_clean.jsonl"),
                 {"h1": {}},
             )
-            check(False, "limit=2 should still fail when h2 is missing")
+            check(False, "trim must still fail when a kept row is uncovered")
         except SystemExit:
-            check(True, "limit=2 still fails when h2 is missing")
+            check(True, "trim still fails when a kept row is uncovered")
 
         # ---- V3_2_RESULTS_DIR redirects the lookup ------------------------ #
         # Run the REAL cell-3 header (everything up to `_load_preds`) in a
