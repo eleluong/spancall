@@ -1459,6 +1459,7 @@ class LeanTrainer(BaseTrainer):
             if isinstance(eval_splits, str):
                 eval_splits = [eval_splits]
             eval_limit = getattr(self.config, "eval_limit", 500) if self.config else 500
+            _epoch_eval_recs: List[Dict[str, Any]] = []
             for es in eval_splits:
                 ev_res = self.evaluate(es, limit=eval_limit)
 
@@ -1507,6 +1508,7 @@ class LeanTrainer(BaseTrainer):
                     "mean_n_candidates": _f("mean_n_candidates"),
                 }
                 self.history["epoch_eval"].append(ep_rec)
+                _epoch_eval_recs.append(ep_rec)
                 self._log_event({"event": "epoch_eval", **ep_rec})
                 # `dev/` namespace: this is the LARGE held-out split scored once
                 # per epoch, so it must not share an axis with `probe/`.
@@ -1520,52 +1522,8 @@ class LeanTrainer(BaseTrainer):
                     "train/epoch": epoch,
                 }, step=int(self.global_step))
 
-                cur_metric = _f("exact_call")
-                # A NaN metric (empty split / nothing supervised) must not win the
-                # best-checkpoint race, and must not overwrite a real best.
-                if math.isfinite(cur_metric) and (
-                    not hasattr(self, "_best_curve_metric") or cur_metric > self._best_curve_metric
-                ):
-                    self._best_curve_metric = cur_metric
-                    # Track WHERE in the run the best weights were seen. The stage
-                    # checkpoint written at `train()` time used to be the LAST
-                    # epoch, which is empirically the WORST one (dev metrics peak
-                    # around epoch 2 of 5 and then decay monotonically) -- so any
-                    # consumer that resolved "latest stage checkpoint" silently got
-                    # overfit weights. See `_restore_best_if_requested`.
-                    self._best_epoch = epoch
-                    self._epochs_since_best = 0
-                    self._restore_best = bool(
-                        getattr(getattr(self.config, "optimization", None), "restore_best_on_exit", True)
-                    )
-                    if self.config is not None:
-                        out = Path(self.config.output_dir)
-                        best_cp = out / f"{self.config.experiment_name}_seed{self.config.seed}" / "best_checkpoint"
-                        self.save_checkpoint(str(best_cp))
-                        print(f"[lean-train:{stage}:epoch {epoch}] NEW BEST on {es}: "
-                              f"exact_call={cur_metric:.4f} -> saved to {best_cp}", flush=True)
-                elif math.isfinite(cur_metric):
-                    self._epochs_since_best = int(getattr(self, "_epochs_since_best", 0)) + 1
-                    patience = int(
-                        getattr(getattr(self.config, "optimization", None), "early_stopping_patience", 0) or 0
-                    )
-                    if patience > 0 and self._epochs_since_best >= patience:
-                        tqdm.write(
-                            f"[lean-train:{stage}] early stop at epoch {epoch}/{num_epochs}: "
-                            f"no {es} exact_call improvement for {self._epochs_since_best} epoch(s) "
-                            f"(best={getattr(self, '_best_curve_metric', float('nan')):.4f} "
-                            f"@ epoch {getattr(self, '_best_epoch', '?')}, patience={patience})"
-                        )
-                        self._log_event({
-                            "event": "early_stop", "stage": stage, "epoch": epoch,
-                            "best_epoch": getattr(self, "_best_epoch", None),
-                            "best_metric": getattr(self, "_best_curve_metric", None),
-                            "patience": patience,
-                        })
-                        self._stopped_early = True
-                        break  # leave the eval-splits loop
-                if self._stopped_early:
-                    break  # leave the epoch loop
+            if _epoch_eval_recs and self._update_early_stopping(stage, epoch, num_epochs, _epoch_eval_recs):
+                break  # leave the epoch loop
 
         pbar.close()
         if self._accum_i > 0:
@@ -1630,6 +1588,81 @@ class LeanTrainer(BaseTrainer):
             "best_metric": float(best_metric) if best_metric is not None else float("nan"),
             "restored_best": restored,
         }
+
+    def _update_early_stopping(
+        self,
+        stage: str,
+        epoch: int,
+        num_epochs: int,
+        epoch_eval_recs: List[Dict[str, Any]],
+    ) -> bool:
+        """Update best-checkpoint tracking and early stopping after epoch eval.
+
+        Returns ``True`` when training should stop early.
+        """
+        opt = getattr(self.config, "optimization", None) if self.config is not None else None
+        es_agg = str(getattr(opt, "early_stopping_agg", "first") or "first").strip().lower()
+        es_min_delta = float(getattr(opt, "early_stopping_min_delta", 0.0) or 0.0)
+
+        if es_agg == "macro_mean":
+            finite_ec = [r["exact_call"] for r in epoch_eval_recs if math.isfinite(r["exact_call"])]
+            finite_loss = [r["eval_loss"] for r in epoch_eval_recs if math.isfinite(r["eval_loss"])]
+            cur_metric = (sum(finite_ec) / len(finite_ec)) if finite_ec else float("nan")
+            macro_loss = (sum(finite_loss) / len(finite_loss)) if finite_loss else float("nan")
+            metric_label = "macro(" + "+".join(r["split"] for r in epoch_eval_recs) + ")"
+            self._log_event({
+                "event": "epoch_eval_macro",
+                "stage": stage,
+                "epoch": epoch,
+                "splits": [r["split"] for r in epoch_eval_recs],
+                "macro_exact_call": cur_metric,
+                "macro_eval_loss": macro_loss,
+            })
+            self._wandb_log({
+                "dev/macro_exact_call": cur_metric,
+                "dev/macro_eval_loss": macro_loss,
+                "train/epoch": epoch,
+            }, step=int(self.global_step))
+        else:
+            cur_metric = epoch_eval_recs[0]["exact_call"]
+            metric_label = epoch_eval_recs[0]["split"]
+
+        is_better = math.isfinite(cur_metric) and (
+            not hasattr(self, "_best_curve_metric")
+            or cur_metric > self._best_curve_metric + es_min_delta
+        )
+        if is_better:
+            self._best_curve_metric = cur_metric
+            self._best_epoch = epoch
+            self._epochs_since_best = 0
+            self._restore_best = bool(getattr(opt, "restore_best_on_exit", True))
+            if self.config is not None:
+                out = Path(self.config.output_dir)
+                best_cp = out / f"{self.config.experiment_name}_seed{self.config.seed}" / "best_checkpoint"
+                self.save_checkpoint(str(best_cp))
+                print(
+                    f"[lean-train:{stage}:epoch {epoch}] NEW BEST on {metric_label}: "
+                    f"exact_call={cur_metric:.4f} -> saved to {best_cp}",
+                    flush=True,
+                )
+        elif math.isfinite(cur_metric):
+            self._epochs_since_best = int(getattr(self, "_epochs_since_best", 0)) + 1
+            patience = int(getattr(opt, "early_stopping_patience", 0) or 0)
+            if patience > 0 and self._epochs_since_best >= patience:
+                tqdm.write(
+                    f"[lean-train:{stage}] early stop at epoch {epoch}/{num_epochs}: "
+                    f"no {metric_label} exact_call improvement for {self._epochs_since_best} epoch(s) "
+                    f"(best={getattr(self, '_best_curve_metric', float('nan')):.4f} "
+                    f"@ epoch {getattr(self, '_best_epoch', '?')}, patience={patience})"
+                )
+                self._log_event({
+                    "event": "early_stop", "stage": stage, "epoch": epoch,
+                    "best_epoch": getattr(self, "_best_epoch", None),
+                    "best_metric": getattr(self, "_best_curve_metric", None),
+                    "patience": patience,
+                })
+                self._stopped_early = True
+        return bool(getattr(self, "_stopped_early", False))
 
     def train(self, stages: Optional[Sequence[str]] = None) -> Dict[str, Any]:
         """Run stages (default ('T2',)); returns summary dict."""

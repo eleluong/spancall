@@ -511,3 +511,62 @@ def test_deep_equal_corners() -> None:
     assert _deep_equal("false", False) is True  # A3: bool string coercion
     assert _deep_equal("xyz", 1) is False
     assert _deep_equal(None, None) is True
+
+
+# --------------------------------------------------------------------------- #
+# Fair sequential contract: right tool -> right params -> good function call
+# --------------------------------------------------------------------------- #
+
+
+def test_wrong_tool_never_counts_as_exact_or_param_f1() -> None:
+    tool = _weather()
+    samples = [_sample("f", Stratum.F, tool, GroundTruthCall("weather", {"city": "SF"}))]
+    predictions = [{"hit": True, "tool_name": "cancel_flight", "payload": {"city": "SF"}}]
+    m = ToolCallEvaluator().evaluate(samples, predictions)
+    F = m.metrics_by_stratum["F"]
+    assert m.tool_accuracy == 0.0
+    assert F["tool_accuracy"] == 0.0
+    assert m.exact_payload_match == 0.0
+    assert F["exact_payload_match"] == 0.0
+    assert m.param_f1 == 0.0
+    assert F["param_f1"] == 0.0
+
+
+def test_abstained_partial_payload_gets_no_param_f1_credit() -> None:
+    """SpanCall populates payload_partial on abstain; LLM does not. Neither may earn param_f1."""
+    tool = _weather()
+    samples = [_sample("f", Stratum.F, tool, GroundTruthCall("weather", {"city": "SF"}))]
+    predictions = [{
+        "hit": False,
+        "tool_name": "weather",
+        "payload": None,
+        "payload_partial": {"city": "SF"},
+    }]
+    m = ToolCallEvaluator().evaluate(samples, predictions)
+    F = m.metrics_by_stratum["F"]
+    assert m.tool_accuracy == 0.0
+    assert F["tool_accuracy"] == 0.0
+    assert m.exact_payload_match == 0.0
+    assert F["exact_payload_match"] == 0.0
+    assert m.param_f1 == 0.0
+    assert F["param_f1"] == 0.0
+
+
+def test_right_tool_right_params_is_exact_function_call() -> None:
+    tool = _weather()
+    samples = [
+        _sample("f-ok", Stratum.F, tool, GroundTruthCall("weather", {"city": "SF"})),
+        _sample("a-abs", Stratum.A, tool, None),
+    ]
+    predictions = [
+        {"hit": True, "tool_name": "weather", "payload": {"city": "SF"}},
+        {"hit": False, "tool_name": "weather", "payload": None, "payload_partial": {"city": "SF"}},
+    ]
+    m = ToolCallEvaluator().evaluate(samples, predictions)
+    assert m.tool_accuracy == 1.0
+    assert m.exact_payload_match == 1.0
+    assert m.metrics_by_stratum["F"]["tool_accuracy"] == 1.0
+    assert m.metrics_by_stratum["F"]["param_f1"] == 1.0
+    assert m.metrics_by_stratum["F"]["exact_payload_match"] == 1.0
+    assert m.metrics_by_stratum["A"]["tool_accuracy"] == 1.0
+    assert m.metrics_by_stratum["A"]["exact_payload_match"] == 1.0

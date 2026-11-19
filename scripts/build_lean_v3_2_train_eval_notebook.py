@@ -172,8 +172,15 @@ DATA_FRACTION = 1.0
 TENSORIZE_WORKERS = max(1, min(os.cpu_count() or 1, 16))
 EVAL_LIMIT        = 2000
 TEST_LIMIT        = 600
-EVAL_BATCH_SIZE   = 32
+EVAL_BATCH_SIZE   = int(os.environ.get("EVAL_BATCH_SIZE", "8"))   # inference only; small on purpose, see note
 EVAL_WORKERS      = 4
+# NOTE (latency): SpanCall's per-row `latency_ms` is an AMORTISED cost
+# (batch_forward_ms / rows_in_batch + per-row work), so it shrinks as the batch
+# grows and a batch of 32 flatters it. Evaluation therefore uses a small batch
+# (4-8) to stay closer to serving conditions. Training batch sizes
+# (MICRO_BATCH_SIZE / EFFECTIVE_BATCH_SIZE) are unaffected. Predictions can also
+# differ by a row or two between batch sizes (bf16 + padding), so report every
+# number from ONE run at ONE batch size.
 
 # ---- Lean v3: mid-training probe eval (T13) -------------------------------
 # A SMALL, fixed set scored every PROBE_EVERY_STEPS optimiser steps so

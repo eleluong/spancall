@@ -91,6 +91,9 @@ class OptimizationConfig:
     # epoch's weights back so the stage checkpoint is NOT the overfit final epoch.
     early_stopping_patience: int = 0
     early_stopping_min_delta: float = 1e-4
+    # "first" = legacy per-split check; "macro_mean" = unweighted mean of
+    # exact_call across all eval_splits (v3.3 balanced Hermes/xLAM dev).
+    early_stopping_agg: str = "first"
     restore_best_on_exit: bool = True
     # v3.1: favor H3 pointer training over already-saturated H1 tool selection
     lambda_pointer: float = 2.0

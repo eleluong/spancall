@@ -345,21 +345,31 @@ class ToolCallEvaluator(BaseToolCallEvaluator):
         if gt_schema is None and sample.tools:
             gt_schema = sample.tools[0]
         equal = payload_equal(gt_payload, payload, gt_schema)
-        correct = bool(equal and (gt_tool is None or tool_name == gt_tool))
+        if gt_tool is not None:
+            tool_correct = bool(hit and tool_name == gt_tool)
+            correct = bool(equal and tool_name == gt_tool)
+        else:
+            tool_correct = bool(not hit)
+            correct = bool(not hit and equal)
 
+        # Fair parameter F1: score only committed `payload` (not uncommitted
+        # `payload_partial` on abstentions, which only SpanCall populates), and
+        # award parameter credit only when the predicted tool matches `gt_tool`.
+        scored_payload = payload if (hit and isinstance(payload, dict)) else None
         n_gt_params = 0
         n_pred_params = 0
         n_correct_params = 0
         if gt_payload and isinstance(gt_payload, dict):
             n_gt_params = len(gt_payload)
-            if payload_partial and isinstance(payload_partial, dict):
-                n_pred_params = len(payload_partial)
-                for k, v_gt in gt_payload.items():
-                    if k in payload_partial and _deep_equal(payload_partial[k], v_gt):
-                        n_correct_params += 1
+            if scored_payload:
+                n_pred_params = len(scored_payload)
+                if gt_tool is None or tool_name == gt_tool:
+                    for k, v_gt in gt_payload.items():
+                        if k in scored_payload and _deep_equal(scored_payload[k], v_gt):
+                            n_correct_params += 1
         elif not gt_payload:
-            if payload_partial and isinstance(payload_partial, dict):
-                n_pred_params = len(payload_partial)
+            if scored_payload:
+                n_pred_params = len(scored_payload)
 
         has_partial = bool(payload_partial and len(payload_partial) > 0)
         status = pred.get("status", "hit" if hit else ("partial" if has_partial else "abstain"))
@@ -411,6 +421,7 @@ class ToolCallEvaluator(BaseToolCallEvaluator):
             "payload_partial": payload_partial,
             "gt_payload": gt_payload,
             "payload_equal": equal,
+            "tool_correct": tool_correct,
             "correct": correct,
             "gate_correct": gate_correct,
             "confidence": float(pred.get("confidence") or pred.get("accept_probability") or 0.0),
@@ -513,6 +524,7 @@ class ToolCallEvaluator(BaseToolCallEvaluator):
         if n == 0:
             return {
                 "n": 0.0,
+                "tool_accuracy": 0.0,
                 "exact_payload_match": 0.0,
                 "hit_rate": 0.0,
                 "precision_at_hit": 0.0,
@@ -537,7 +549,8 @@ class ToolCallEvaluator(BaseToolCallEvaluator):
         n_collapse = sum(1 for r in sel if r.get("collapse_hit"))
         return {
             "n": float(n),
-            "exact_payload_match": sum(1.0 for r in sel if r["payload_equal"]) / n,
+            "tool_accuracy": sum(1.0 for r in sel if r.get("tool_correct")) / n,
+            "exact_payload_match": sum(1.0 for r in sel if r["correct"]) / n,
             "hit_rate": n_hits / n,
             "precision_at_hit": (sum(1.0 for r in hits if r["gate_correct"]) / n_hits) if n_hits else 0.0,
             "false_hit_rate_on_a": (n_hits / n) if (stratum == Stratum.A) else 0.0,
@@ -558,8 +571,8 @@ class ToolCallEvaluator(BaseToolCallEvaluator):
         n = len(sel)
         if n == 0:
             return
-        m.tool_accuracy = sum(1.0 for r in sel if r["tool_name"] == r["gt_tool"]) / n
-        m.per_param_accuracy = sum(1.0 for r in sel if r["payload_equal"]) / n
+        m.tool_accuracy = sum(1.0 for r in sel if r.get("tool_correct")) / n
+        m.per_param_accuracy = sum(1.0 for r in sel if r["correct"]) / n
         m.exact_payload_match = m.per_param_accuracy
         n_hits = sum(1 for r in sel if r["hit"])
         m.hit_rate = n_hits / n

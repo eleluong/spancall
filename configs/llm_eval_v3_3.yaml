@@ -1,0 +1,51 @@
+# Local multi-model LLM evaluation registry for SpanCall Lean v3.3.
+#
+# Run all enabled models against the frozen Tier 1 fair eval benchmark:
+#   .venv/bin/python scripts/eval_llm_local.py --config configs/llm_eval_v3_3.yaml
+#
+# Or run a subset of models:
+#   .venv/bin/python scripts/eval_llm_local.py --config configs/llm_eval_v3_3.yaml --only gpt-oss-120b
+#
+# Secrets NEVER live in this file; each entry names environment variables
+# (loaded from the shell or repo-root .env).
+
+eval_dir: data/eval_v3_3
+results_dir: results_lean_v3_3
+splits:
+  - fair_hermes_eval
+  - fair_xlam_eval
+
+defaults:
+  temperature: 0.0
+  max_tokens: 1024
+  timeout: 120.0
+  concurrency: 8
+  max_retries: 4
+
+models:
+  - slug: gpt-oss-120b
+    model: openai/gpt-oss-120b
+    base_url_env: LLM_BASE_URL
+    api_key_env: LLM_API_KEY
+    enabled: true
+
+  - slug: qwen3-32b
+    model: Qwen/Qwen3-32B
+    base_url_env: LLM_BASE_URL
+    api_key_env: LLM_API_KEY
+    enabled: false
+
+  - slug: gpt-4o-mini
+    model: gpt-4o-mini
+    base_url_env: OPENAI_BASE_URL
+    api_key_env: OPENAI_API_KEY
+    enabled: false
+
+  - slug: local-vllm
+    model: local-model
+    base_url: http://localhost:8000/v1
+    api_key_env: LOCAL_LLM_API_KEY
+    default_api_key: EMPTY
+    concurrency: 4
+    enabled: false
+

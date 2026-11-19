@@ -319,9 +319,9 @@ LLM_BASE_URL  = _resolve("LLM_BASE_URL", "BASE_URL", default="",
 LLM_API_KEY   = _resolve("LLM_API_KEY", "OPENAI_API_KEY", "API_KEY", default="",
                          secret=True, label="LLM API key")
 LLM_TEMPERATURE = 0.0   # greedy: a temperature sweep is a separate experiment
-LLM_TIMEOUT     = 120.0
-LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "6"))
-LLM_RETRY_BASE_SLEEP = float(os.environ.get("LLM_RETRY_BASE_SLEEP", "2.0"))
+LLM_TIMEOUT     = 180.0
+LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "10"))
+LLM_RETRY_BASE_SLEEP = float(os.environ.get("LLM_RETRY_BASE_SLEEP", "10.0"))
 LLM_RETRY_MAX_SLEEP  = float(os.environ.get("LLM_RETRY_MAX_SLEEP", "60.0"))
 LLM_SLEEP_BETWEEN_CALLS = float(os.environ.get("LLM_SLEEP_BETWEEN_CALLS", "0.25"))
 
@@ -349,7 +349,9 @@ LLM_CHECKPOINT_EVERY = int(os.environ.get("LLM_CHECKPOINT_EVERY", "25"))
 LLM_SOURCE = {}
 
 # SpanCall inference knobs (mirrored from the v3.2 notebook so the two agree).
-EVAL_BATCH_SIZE = 32
+# Small eval batch on purpose: SpanCall's latency_ms is amortised over the batch
+# (batch_forward_ms / rows), so a large batch flatters it. Inference only.
+EVAL_BATCH_SIZE = int(os.environ.get("EVAL_BATCH_SIZE", "8"))
 EVAL_WORKERS    = 4
 MIN_JOINT_MARGIN = float(os.environ.get("MIN_JOINT_MARGIN", "0.02"))
 SINGLE_CALL_ONLY = True
@@ -1966,6 +1968,317 @@ for _sp in EVAL_SPLITS:
     print("-" * 76)
 '''
 
+MD_STAGED = """## 6b. Staged diagnostic — Tool selection vs. Parameter extraction (0 API calls)
+
+Decomposes the already-collected predictions into:
+1. **Step 1 (Tool Selection)** over all Stratum F rows and native multi-tool rows ($T \\ge 2$).
+2. **Step 2 (Parameter Extraction)** conditioned on `hit=True` and `pred_tool == gt_tool`, split into `ALL`, `normal`, and `complex`.
+3. **Step 3 (Stratum F Attribution)** into mutually exclusive buckets (`EXACT`, `WRONG_PARAM`, `WRONG_TOOL`, `NO_CALL/ABS`), plus LLM non-parameter failure reasons/examples.
+"""
+
+CODE_STAGED = '''# 6b. Post-hoc Staged Diagnostic (0 API calls) using cached predictions.
+import json
+from collections import Counter
+from spancall.data.schema import UnifiedSample
+from spancall.lean.eval_p1 import classify_sample_complexity
+
+STAGED = {}   # split -> {"step1": ..., "step2": ..., "step3": ..., "llm_failures": ...}
+
+
+def _is_F(s):
+    return getattr(s.stratum, "value", str(s.stratum)) == "F"
+
+
+def _gt_tool(s):
+    return s.ground_truth_calls[0].tool_name if s.ground_truth_calls else None
+
+
+def _pred_tool(p):
+    return (p.get("tool_name") or p.get("tool")) if p else None
+
+
+def _payload_equal_row(s, preds):
+    """True if the evaluator's payload_equal holds for this single row (tool NOT checked)."""
+    m = cmp.score([s], preds, ids=[s.sample_id])
+    f = (m.get("metrics_by_stratum") or {}).get("F", {})
+    return float(f.get("exact_payload_match") or 0.0) > 0.5
+
+
+for _sp in EVAL_SPLITS:
+    _raw_rows = _limit_rows(
+        [json.loads(l) for l in open(SUBSET_PATHS[_sp], encoding="utf-8") if l.strip()]
+    )
+    _samples = [UnifiedSample.from_dict(r) for r in _raw_rows]
+    _cx_by_id = {s.sample_id: classify_sample_complexity(r) for r, s in zip(_raw_rows, _samples)}
+    _f_samples = [s for s in _samples if _is_F(s)]
+    _f_multi = [s for s in _f_samples if len(s.tools or []) >= 2]
+
+    print("\\n" + "=" * 96)
+    print(f"STAGED DIAGNOSTIC — {_sp}  (Stratum F: n={len(_f_samples)}, native multi-tool T>=2: n={len(_f_multi)})")
+    print("=" * 96)
+
+    # ── STEP 1: TOOL SELECTION ──────────────────────────────────────────────
+    print("\\n[Step 1] Tool Selection on Stratum F")
+    print(f"{'system':<26}{'n_F':>6}{'hit_F':>8}{'tool_any':>10}{'tool&hit':>10}{'tool|hit':>10}{'T>=2_hit':>10}")
+    print("-" * 80)
+    _step1 = {}
+    for _name, _preds in (
+        ("spancall_two_step", SPANCALL_PREDS[_sp]),
+        (f"llm:{LLM_MODEL}",  LLM_PREDS[_sp]),
+    ):
+        n_f = len(_f_samples)
+        n_hit = n_t_any = n_t_hit = 0
+        for s in _f_samples:
+            p = _preds.get(s.sample_id) or {}
+            hit = bool(p.get("hit"))
+            ok_t = (_pred_tool(p) == _gt_tool(s))
+            n_hit += int(hit)
+            n_t_any += int(ok_t)
+            n_t_hit += int(hit and ok_t)
+
+        n_m = len(_f_multi)
+        n_m_ok = sum(
+            1 for s in _f_multi
+            if bool((_preds.get(s.sample_id) or {}).get("hit"))
+            and _pred_tool(_preds.get(s.sample_id)) == _gt_tool(s)
+        )
+        _step1[_name] = {
+            "n_F": n_f,
+            "hit_F": n_hit / n_f if n_f else 0.0,
+            "tool_any": n_t_any / n_f if n_f else 0.0,
+            "tool_and_hit": n_t_hit / n_f if n_f else 0.0,
+            "tool_given_hit": n_t_hit / n_hit if n_hit else 0.0,
+            "multi_t_hit": n_m_ok / n_m if n_m else 0.0,
+        }
+        print(
+            f"{_name:<26}{n_f:>6}"
+            f"{_step1[_name]['hit_F']:>8.3f}"
+            f"{_step1[_name]['tool_any']:>10.3f}"
+            f"{_step1[_name]['tool_and_hit']:>10.3f}"
+            f"{_step1[_name]['tool_given_hit']:>10.3f}"
+            f"{_step1[_name]['multi_t_hit']:>10.3f}"
+        )
+
+    # ── STEP 2: PARAM EXTRACTION GIVEN CORRECT TOOL (HIT & PRED_TOOL == GT) ─
+    print("\\n[Step 2] Parameter Extraction Conditioned on Correct Tool (hit=True & tool_ok)")
+    print(f"{'system':<26}{'slice':<10}{'n_ok':>6}{'exact|t':>10}{'p_prec':>9}{'p_rec':>9}{'p_F1':>9}")
+    print("-" * 79)
+    _step2 = {}
+    for _name, _preds in (
+        ("spancall_two_step", SPANCALL_PREDS[_sp]),
+        (f"llm:{LLM_MODEL}",  LLM_PREDS[_sp]),
+    ):
+        _step2[_name] = {}
+        _ok_all = [
+            s for s in _f_samples
+            if bool((_preds.get(s.sample_id) or {}).get("hit"))
+            and _pred_tool(_preds.get(s.sample_id)) == _gt_tool(s)
+        ]
+        for _sl_name, _sel in (
+            ("ALL",     _ok_all),
+            ("normal",  [s for s in _ok_all if _cx_by_id[s.sample_id] == "normal"]),
+            ("complex", [s for s in _ok_all if _cx_by_id[s.sample_id] == "complex"]),
+        ):
+            if not _sel:
+                continue
+            _m = cmp.score(_sel, _preds, ids=[s.sample_id for s in _sel])
+            _f = (_m.get("metrics_by_stratum") or {}).get("F", {})
+            _step2[_name][_sl_name] = {
+                "n_ok": len(_sel),
+                "exact_given_t": _f.get("exact_payload_match"),
+                "param_precision": _f.get("param_precision"),
+                "param_recall": _f.get("param_recall"),
+                "param_f1": _f.get("param_f1"),
+            }
+            print(
+                f"{_name:<26}{_sl_name:<10}{len(_sel):>6}"
+                f"{cmp._fmt(_f.get('exact_payload_match')):>10}"
+                f"{cmp._fmt(_f.get('param_precision')):>9}"
+                f"{cmp._fmt(_f.get('param_recall')):>9}"
+                f"{cmp._fmt(_f.get('param_f1')):>9}"
+            )
+
+    # ── STEP 3: STRATUM F WATERFALL / ERROR ATTRIBUTION ─────────────────────
+    # Sequential function-calling contract: Right Tool -> Right Params -> Exact Call.
+    # ToolCallEvaluator's `exact_payload_match` enforces tool_name == gt_tool and
+    # payload_equal, so the buckets below are mutually exclusive and sum to n_F.
+    print("\\n[Step 3] Stratum F Error Attribution (Right Tool -> Right Params -> Exact Call)")
+    print(f"{'system':<26}{'EXACT':>14}{'WRONG_PARAM':>14}{'WRONG_TOOL':>13}{'NO_CALL/ABS':>14}")
+    print("-" * 81)
+    _step3 = {}
+    for _name, _preds in (
+        ("spancall_two_step", SPANCALL_PREDS[_sp]),
+        (f"llm:{LLM_MODEL}",  LLM_PREDS[_sp]),
+    ):
+        n_f = len(_f_samples)
+        n_exact = n_wrong_param = n_wrong_tool = n_no_call = 0
+        for s in _f_samples:
+            p = _preds.get(s.sample_id) or {}
+            if not p.get("hit"):
+                n_no_call += 1
+            elif _pred_tool(p) != _gt_tool(s):
+                n_wrong_tool += 1
+            elif _payload_equal_row(s, _preds):
+                n_exact += 1
+            else:
+                n_wrong_param += 1
+        _step3[_name] = {
+            "exact_tool_and_payload": n_exact,
+            "wrong_param": n_wrong_param,
+            "wrong_tool": n_wrong_tool,
+            "no_call": n_no_call,
+        }
+        print(
+            f"{_name:<26}"
+            f"{n_exact:>6} ({n_exact/n_f:5.1%})"
+            f"{n_wrong_param:>6} ({n_wrong_param/n_f:5.1%})"
+            f"{n_wrong_tool:>5} ({n_wrong_tool/n_f:5.1%})"
+            f"{n_no_call:>6} ({n_no_call/n_f:5.1%})"
+        )
+
+    # Quick peek at LLM abstain/wrong-tool reasons on this split
+    _llm_preds = LLM_PREDS[_sp]
+    _reasons = Counter()
+    _examples = []
+    for s in _f_samples:
+        p = _llm_preds.get(s.sample_id) or {}
+        if not p.get("hit"):
+            _reasons[p.get("abstain_reason") or "no_tool_call"] += 1
+            if len(_examples) < 3:
+                _examples.append(("NO_CALL", s.sample_id, _gt_tool(s), None, (s.utterance or "")[:90]))
+        elif _pred_tool(p) != _gt_tool(s):
+            _reasons["wrong_tool"] += 1
+            if len(_examples) < 6:
+                _examples.append(("WRONG_TOOL", s.sample_id, _gt_tool(s), _pred_tool(p), (s.utterance or "")[:90]))
+    print(f"\\n[LLM non-param failures on {_sp} F]: {dict(_reasons)}")
+    for _ex in _examples[:5]:
+        print(" ", _ex)
+
+    STAGED[_sp] = {
+        "step1": _step1,
+        "step2": _step2,
+        "step3": _step3,
+        "llm_failures": dict(_reasons),
+    }
+'''
+
+MD_STATS = """## 6c. Uncertainty and the hybrid arm (0 API calls)
+
+Two things the headline table cannot show, both computed from the cached predictions:
+
+1. **Bootstrap 95% CIs** for Stratum F `exact_F` per system, and a **paired** CI on
+   the SpanCall − LLM difference (resampling rows, so the shared hard rows cancel).
+   A gap whose paired CI includes 0 should not be called a win or a loss.
+2. **`spancall_plus_llm_fallback`**: SpanCall answers when it commits, the LLM is
+   called only when SpanCall abstains. This is the routing the paper motivates
+   (§3.4, Mode 2) and had not been measured. It reports `exact_F`, `false_hit_A`,
+   and the share of LLM calls and tokens it would still need.
+
+The fallback arm cannot reduce `false_hit_A`: an abstained Stratum A turn that is
+forwarded to the LLM is answered by the LLM. Read the two numbers together.
+"""
+
+CODE_STATS = '''# 6c. Bootstrap CIs + SpanCall->LLM fallback arm (0 API calls, cached predictions).
+import json
+import numpy as np
+from spancall.data.schema import UnifiedSample
+
+BOOT_N = 5000
+STATS = {}   # split -> {"ci": ..., "fallback": ...}
+
+
+def _is_F(s):
+    return getattr(s.stratum, "value", str(s.stratum)) == "F"
+
+
+def _row_exact(s, preds):
+    """1.0 if this single Stratum F row is an exact payload match, else 0.0."""
+    m = cmp.score([s], preds, ids=[s.sample_id])
+    f = (m.get("metrics_by_stratum") or {}).get("F", {})
+    return float(f.get("exact_payload_match") or 0.0)
+
+
+def _boot_ci(x, rng):
+    n = len(x)
+    idx = rng.integers(0, n, size=(BOOT_N, n))
+    means = x[idx].mean(axis=1)
+    return float(x.mean()), float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))
+
+
+for _sp in EVAL_SPLITS:
+    _rows = _limit_rows(
+        [json.loads(l) for l in open(SUBSET_PATHS[_sp], encoding="utf-8") if l.strip()]
+    )
+    _samples = [UnifiedSample.from_dict(r) for r in _rows]
+    _ids = [s.sample_id for s in _samples]
+    _f = [s for s in _samples if _is_F(s)]
+    _sc, _ll = SPANCALL_PREDS[_sp], LLM_PREDS[_sp]
+    _rng = np.random.default_rng(0)
+
+    _x_sc = np.array([_row_exact(s, _sc) for s in _f])
+    _x_ll = np.array([_row_exact(s, _ll) for s in _f])
+    _m_sc, _lo_sc, _hi_sc = _boot_ci(_x_sc, _rng)
+    _m_ll, _lo_ll, _hi_ll = _boot_ci(_x_ll, _rng)
+    _d_m, _d_lo, _d_hi = _boot_ci(_x_sc - _x_ll, _rng)
+
+    print("=" * 84)
+    print(f"{_sp}: Stratum F exact_F with bootstrap 95% CI (n_F={len(_f)}, B={BOOT_N})")
+    print(f"  spancall_two_step        {_m_sc:.3f}  [{_lo_sc:.3f}, {_hi_sc:.3f}]")
+    print(f"  llm:{LLM_MODEL:<20} {_m_ll:.3f}  [{_lo_ll:.3f}, {_hi_ll:.3f}]")
+    _verdict = ("SpanCall better" if _d_lo > 0 else "LLM better" if _d_hi < 0
+                else "CI includes 0: not distinguishable")
+    print(f"  paired diff (SC - LLM)   {_d_m:+.3f}  [{_d_lo:+.3f}, {_d_hi:+.3f}]  -> {_verdict}")
+
+    # ---- fallback arm: SpanCall when it commits, LLM only on SpanCall abstain ----
+    _merged, _n_fb = cmp.merge_with_fallback(_sc, _ll, _ids)
+    _arms = {
+        "spancall_two_step": _sc,
+        f"llm:{LLM_MODEL}": _ll,
+        "spancall_plus_llm_fallback": _merged,
+    }
+    _tok_all = sum(int(((p or {}).get("features") or {}).get("prompt_tokens", 0))
+                   + int(((p or {}).get("features") or {}).get("completion_tokens", 0))
+                   for p in _ll.values())
+    _tok_fb = sum(int(((_ll.get(sid) or {}).get("features") or {}).get("prompt_tokens", 0))
+                  + int(((_ll.get(sid) or {}).get("features") or {}).get("completion_tokens", 0))
+                  for sid in _ids if not (_sc.get(sid) or {}).get("hit"))
+    _calls_share = {
+        "spancall_two_step": 0.0,
+        f"llm:{LLM_MODEL}": 1.0,
+        "spancall_plus_llm_fallback": _n_fb / len(_ids),
+    }
+    _tok_share = {
+        "spancall_two_step": 0.0,
+        f"llm:{LLM_MODEL}": 1.0,
+        "spancall_plus_llm_fallback": (_tok_fb / _tok_all) if _tok_all else 0.0,
+    }
+    print(f"  {'arm':<30}{'exact_F':>9}{'falsehit_A':>12}{'LLM calls':>11}{'LLM tokens':>12}")
+    print("  " + "-" * 72)
+    _fb_out = {}
+    for _name, _p in _arms.items():
+        _m = cmp.score(_samples, _p, ids=_ids)
+        _fs = (_m.get("metrics_by_stratum") or {}).get("F", {})
+        _fb_out[_name] = {
+            "exact_F": _fs.get("exact_payload_match"),
+            "false_hit_A": _m.get("false_hit_rate_on_a"),
+            "llm_call_share": _calls_share[_name],
+            "llm_token_share": _tok_share[_name],
+        }
+        print(f"  {_name:<30}{cmp._fmt(_fs.get('exact_payload_match')):>9}"
+              f"{cmp._fmt(_m.get('false_hit_rate_on_a'), 4):>12}"
+              f"{_calls_share[_name]:>11.1%}{_tok_share[_name]:>12.1%}")
+
+    STATS[_sp] = {
+        "ci": {
+            "n_F": len(_f), "boot_n": BOOT_N,
+            "spancall": [_m_sc, _lo_sc, _hi_sc],
+            "llm": [_m_ll, _lo_ll, _hi_ll],
+            "paired_diff": [_d_m, _d_lo, _d_hi],
+        },
+        "fallback": _fb_out,
+    }
+'''
+
 MD_PERSIST = """## 7. Persist results + the paper-ready table
 
 `llm_parity.json` holds every metric, both arms, both splits, plus the per-row
@@ -2112,6 +2425,10 @@ payload = {
     },
     "systems": SYSTEMS,
     "complexity": COMPLEXITY,
+    # §6b / §6c are optional post-hoc cells; `globals().get` keeps this cell
+    # runnable when they have not been executed (and in the offline smoke test).
+    "staged": globals().get("STAGED"),
+    "stats": globals().get("STATS"),
 }
 with open(_out, "w", encoding="utf-8") as _fh:
     json.dump(payload, _fh, indent=2, default=str)
@@ -2360,6 +2677,10 @@ CELLS: List[Tuple[str, str]] = [
     (CODE, CODE_SCORE),
     (MD, MD_COMPLEXITY),
     (CODE, CODE_COMPLEXITY),
+    (MD, MD_STAGED),
+    (CODE, CODE_STAGED),
+    (MD, MD_STATS),
+    (CODE, CODE_STATS),
     (MD, MD_PERSIST),
     (CODE, CODE_PERSIST),
     (MD, MD_TAKEAWAY),
