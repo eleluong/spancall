@@ -121,3 +121,6 @@ huggingface/
 research_paper
 notebooks/spancall_lean_v3_*.ipynb
 scripts/build_lean_v3_*
+# ...but the builders themselves are the source of truth and ARE tracked, so the
+# notebook text stays reviewable. The generated .ipynb above is what we ignore.
+!scripts/build_lean_v3_2_train_eval_notebook.py

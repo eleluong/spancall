@@ -52,16 +52,34 @@ def _code_cells(path: Path) -> List[str]:
     return ["".join(c["source"]) for c in nb["cells"] if c["cell_type"] == "code"]
 
 
-def _cell0() -> str:
-    return _code_cells(LLM_NB)[0]
+def _find_cell(marker: str) -> str:
+    """The one code cell containing `marker`.
+
+    Located by content, not by index: the setup section is split into §0a
+    (bootstrap magics) and §0b (pure-Python config), and any future cell that
+    gets inserted would otherwise silently re-point these tests at the wrong
+    cell while still passing.
+    """
+    hits = [src for src in _code_cells(LLM_NB) if marker in src]
+    assert len(hits) == 1, (
+        f"expected exactly one code cell containing {marker!r}, found {len(hits)}"
+    )
+    return hits[0]
 
 
-def _cell1() -> str:
-    return _code_cells(LLM_NB)[1]
+def _config_cell() -> str:
+    """§0b: the configuration cell that defines EVAL_LIMIT and `_limit_rows`."""
+    return _find_cell("EVAL_LIMIT = 2000")
 
 
-def _cell3() -> str:
-    return _code_cells(LLM_NB)[3]
+def _data_cell() -> str:
+    """§1: stratify -> single-call filter -> Step-0 sanitize."""
+    return _find_cell("SUBSET_INFO[_sp] = build_stratified_eval_subset(")
+
+
+def _infer_cell() -> str:
+    """§3: load the frozen SpanCall predictions and check coverage."""
+    return _find_cell("def _validate_coverage")
 
 
 def _code_only(src: str) -> str:
@@ -73,10 +91,11 @@ def _code_only(src: str) -> str:
 # The limit is the population definition, and it must match the training run
 # ---------------------------------------------------------------------------
 
-def test_eval_limit_is_defined_in_cell0() -> None:
-    assert re.search(r"^EVAL_LIMIT\s*=\s*(\d+)", _cell0(), re.M), (
-        "cell 0 must define EVAL_LIMIT: it is the population definition, not a "
-        "sampling convenience, and it needs to be visible next to the other knobs."
+def test_eval_limit_is_defined_in_the_config_cell() -> None:
+    assert re.search(r"^EVAL_LIMIT\s*=\s*(\d+)", _config_cell(), re.M), (
+        "the config cell (§0b) must define EVAL_LIMIT: it is the population "
+        "definition, not a sampling convenience, and it needs to be visible next "
+        "to the other knobs."
     )
 
 
@@ -87,7 +106,7 @@ def test_eval_limit_matches_the_training_notebook() -> None:
     nothing in the metrics would reveal it - both would print a well-formed
     table over a different base.
     """
-    m_llm = re.search(r"^EVAL_LIMIT\s*=\s*(\d+)", _cell0(), re.M)
+    m_llm = re.search(r"^EVAL_LIMIT\s*=\s*(\d+)", _config_cell(), re.M)
     assert m_llm, "EVAL_LIMIT missing from the LLM baseline notebook"
     train_src = "\n".join(_code_cells(TRAIN_NB))
     m_train = re.search(r"^EVAL_LIMIT\s*=\s*(\d+)", train_src, re.M)
@@ -102,7 +121,7 @@ def test_eval_limit_matches_the_training_notebook() -> None:
 
 def test_subset_is_built_with_limit_eval_limit_not_none() -> None:
     """`limit=None` samples the whole split - a superset of the paper's sample."""
-    code = _code_only(_cell1())
+    code = _code_only(_data_cell())
     call = re.search(
         r"build_stratified_eval_subset\((.*?)\)\s*\n", code, re.S
     )
@@ -126,7 +145,7 @@ def test_subset_is_not_cached_on_file_existence() -> None:
     silently, and the mismatch would only appear as a coverage error later -
     after the reader had already been told to re-run inference.
     """
-    code = _code_only(_cell1())
+    code = _code_only(_data_cell())
     guarded = re.search(
         r"if\s+not\s+os\.path\.exists\(\s*_sub\s*\)\s*:", code
     )
@@ -138,7 +157,7 @@ def test_subset_is_not_cached_on_file_existence() -> None:
 
 
 def test_single_call_filter_also_runs_unconditionally() -> None:
-    code = _code_only(_cell1())
+    code = _code_only(_data_cell())
     # The filter call must not sit under an `if not os.path.exists(...)` branch.
     lines = code.splitlines()
     for i, line in enumerate(lines):
@@ -165,7 +184,7 @@ def test_single_call_filter_also_runs_unconditionally() -> None:
 
 def _validate_coverage_fn():
     """Extract the shipped `_validate_coverage` and its `_limit_rows` dependency."""
-    c0, c3 = _cell0(), _cell3()
+    c0, c3 = _config_cell(), _infer_cell()
     limit_src = c0[c0.index("def _limit_rows"):c0.index("# Print shapes")]
     start = c3.index("def _validate_coverage")
     end = c3.index("def run_spancall_inference")
@@ -263,7 +282,7 @@ def test_builder_source_passes_limit_eval_limit() -> None:
 
 def test_persisted_metadata_records_the_population(tmp_path) -> None:
     """`llm_parity.json` must say which rows were eligible, not just how many scored."""
-    cell7 = _code_cells(LLM_NB)[7]
+    cell7 = _find_cell('"n_rows_sampled"')
     assert '"eval_limit"' in cell7, (
         "meta must record eval_limit: a reader cannot tell a 2000-row sample from "
         "a 9101-row one by looking at n_rows alone"

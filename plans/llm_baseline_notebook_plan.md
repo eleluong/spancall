@@ -61,9 +61,17 @@ replaced by this LLM once the run is executed.
    prebuilt directory would reintroduce v2.6-shaped labels. So the cell reproduces the v3.2
    notebook's pipeline: pull v1 (Hermes) / v2 (xLAM) canonicals, then
    `scripts/realign_v2.py` into `data/processed_v3_2` (per-split, Hermes and xLAM
-   independently), then `build_stratified_eval_subset(..., limit=None, seed=42)` →
-   `subset_hermes_eval_clean.jsonl` / `subset_xlam_eval_clean.jsonl`. `limit=None` is
-   mandatory: the signature default is 500 rows and would silently shrink the comparison.
+   independently), then `build_stratified_eval_subset(..., limit=EVAL_LIMIT, seed=42)` →
+   `subset_hermes_eval_clean.jsonl` / `subset_xlam_eval_clean.jsonl`.
+
+   **`limit=EVAL_LIMIT` (=2000), not `limit=None`.** This reverses the earlier decision:
+   `EVAL_LIMIT` is the *population definition*, because the frozen v3.2 predictions were
+   produced by sampling `limit=2000`. `limit=None` samples the whole split (9,101 xLAM rows),
+   a strict superset whose first ~22% is what the predictions cover — so the coverage check
+   fails three cells later and blames the predictions, the one thing re-running cannot fix.
+   The subset is also rebuilt **unconditionally**: caching on `os.path.exists()` let a wrongly
+   sampled `_clean` file survive the argument fix. The `limit=None` plan line above was the
+   bug; `tests/test_llm_baseline_population.py` pins the correction.
 4. **SpanCall arm — reuse first.** `hf_hub_download` checkpoint + `resolve_config.json` +
    tokenizer from `convoicon/spancall-lean-v3-2`, but **only lazily** (inside
    `load_resolver()`), because the normal path never calls it. The cell looks for the frozen
@@ -90,6 +98,22 @@ replaced by this LLM once the run is executed.
     table (the LLM's complex-argument performance is the paper's key comparison point).
 8. **Persist** — `results_lean_v3_2_llm/llm_parity.json`, per-split LLM preds JSONL
    (re-scorable), and a summary block ready to drop into `05_results.tex`.
+
+## Builder contract (`scripts/build_llm_baseline_notebook.py`)
+The notebook is generated, never hand-edited, and the builder enforces:
+- **`CELLS: List[Tuple[str, str]]`** — cell text is reviewable Python, layout is one list.
+- **Build-time cell guard** (shared `_guard_code_cells` from the v2.6 builder): every code
+  cell compiles and every free name resolves in notebook order. This is why setup is split
+  into **§0a** (`!git clone` / `%pip`, which the guard SKIPS) and **§0b** (plain Python that
+  re-derives `PROJECT_ROOT`, which the guard CHECKS); a single combined cell would hide
+  `PROJECT_ROOT` from every later cell's check.
+- **`--check`** — compares `(cell_type, source)` against the artifact and exits non-zero
+  naming the file "stale". CI can assert the notebook matches the builder.
+- **Lossless rebuild** — executed `outputs`, `execution_count` and cell ids are reattached by
+  *source content*. This notebook is gitignored, so after a paid run its outputs exist nowhere
+  else; a rebuild that blanked them would erase the only evidence.
+- **Atomic write + validation** — tmp file + `os.replace`, then re-read from disk and
+  `nbformat.validate`, so an interrupted build cannot truncate the artifact.
 
 ## Key fairness contract (stated in the notebook markdown)
 - Both systems see the same utterance, same `recent_context`, same clock, same tool list.
