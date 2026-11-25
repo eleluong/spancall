@@ -18,9 +18,9 @@ library_name: spancall
 
 # SpanCall Lean v3.3 (`convoicon/spancall-lean-v3-3`)
 
-**SpanCall** is a non-autoregressive extractive function-calling model built on [`answerdotai/ModernBERT-large`](https://huggingface.co/answerdotai/ModernBERT-large) (395M parameters) from the paper **"Not Every Tool Call Needs Generation: Function Calling as Span Extraction."**
+**SpanCall** is a non-autoregressive extractive function-calling model built on [`answerdotai/ModernBERT-large`](https://huggingface.co/answerdotai/ModernBERT-large) (395M parameters).
 
-Instead of autoregressively generating JSON tokens, SpanCall jointly encodes candidate tool/parameter schema anchors, the sanitized user utterance, and a canonical literal context pool ($\Omega$), then emits schema-valid JSON in parallel via a tool selection head ($H_1$), a type-filtered boundary-factorized span pointer ($H_3$), and exclusivity-constrained two-step DFS decoding.
+Instead of autoregressively generating JSON tokens, SpanCall jointly encodes candidate tool/parameter schema anchors, the sanitized user utterance, and a canonical literal context pool, then emits schema-valid JSON in parallel using a tool selection head, a type-filtered span pointer head, and exclusivity-constrained two-step decoding.
 
 ---
 
@@ -28,12 +28,12 @@ Instead of autoregressively generating JSON tokens, SpanCall jointly encodes can
 
 | Property | Value |
 | :--- | :--- |
-| **Backbone** | `answerdotai/ModernBERT-large` (395M params, 28 layers, $d = 1024$) |
-| **Heads** | $H_1$: 2-layer GELU MLP tool scorer (`MLP([h_tool; h_cls])`) · $H_3$: boundary-factorized span pointer ($d_h = 256$, learned width bias $r(\min(j-i, W_{\max}))$) |
-| **Sequence & Candidate Budget** | $L_{\max} = 4096$, $W_{\max} = 16$, $C \le 1024$ type-filtered candidate spans |
-| **Context Serialization ($\Omega$)** | `<|ctx_meta|>` (booleans/null), `<|ctx_time|>` (resolved calendar offsets), `<|ctx_enum|>` (deduplicated schema enums), `<|ctx_recent|>` (recent tool outputs); nested `object` parameters flattened to dotted leaves up to depth 3 |
-| **Inference Mode** | `two_step` ($H_1$ selects $\hat{t}$, then re-encodes compact $T = 1$ sequence so the full $C = 1024$ candidate budget serves $\hat{t}$) |
-| **Decoding & Gating** | Value probability aggregation across repeated mentions → exclusivity-constrained joint DFS ($\Delta_{\text{joint}} \ge 0.02$) → strict type casting, unflattening, collapse guard, and deterministic JSON Schema validation |
+| **Backbone** | `answerdotai/ModernBERT-large` (395M params, 28 layers, hidden size 1024) |
+| **Heads** | Tool scorer (`H1`): 2-layer GELU MLP · Span pointer (`H3`): boundary-factorized pointer (`head_dim = 256`, learned span-width bias) |
+| **Sequence & Candidate Budget** | Max length 4096 tokens, max span width 16 tokens, up to 1024 type-filtered candidate spans |
+| **Context Serialization** | `<|ctx_meta|>` (booleans/null), `<|ctx_time|>` (resolved calendar offsets), `<|ctx_enum|>` (deduplicated schema enums), `<|ctx_recent|>` (recent tool outputs); nested `object` parameters flattened to dotted paths up to depth 3 |
+| **Inference Mode** | `two_step` (selects the top tool first, then re-encodes a single-tool sequence so all 1024 candidate slots serve that tool) |
+| **Decoding & Gating** | Value probability aggregation across repeated mentions -> exclusivity-constrained joint search (min margin 0.02) -> strict type casting, unflattening, duplicate-span guard, and JSON Schema validation |
 | **Export Format** | `model.pt` (`state_dict`, load with `weights_only=True`), tokenizer files (with atomic `<|...|>` special marker tokens), `resolve_config.json` |
 
 ---
@@ -42,13 +42,13 @@ Instead of autoregressively generating JSON tokens, SpanCall jointly encodes can
 
 SpanCall is designed for **Stratum F** tool calls—turns where all arguments are directly groundable in the user request, recent dialogue, or schema literals—and excels on **all-scalar (`Normal`)** schemas (`string`, `integer`, `number`, `boolean`, `date`, `enum`).
 
-For production traffic containing complex schemas (`array`, `object`) or ungroundable/compositional turns (**Stratum A**), pair SpanCall with any off-the-shelf LLM using one of two zero-training policies from the paper:
+For production traffic containing complex schemas (`array`, `object`) or ungroundable/compositional turns (**Stratum A**), pair SpanCall with any off-the-shelf LLM using one of the zero-training collaboration policies below:
 
 | Policy | LLM Trigger | What SpanCall Keeps | LLM Mode | Recommended When |
 | :--- | :--- | :--- | :--- | :--- |
-| **Router** | SpanCall abstains | Committed scalar hits | Full $T$-tool FC | Maximum latency/token savings (~80% fewer tokens) on mostly scalar traffic |
-| **Router+Schema** *(default)* | Post-$H_1$ `array`/`object` tool or abstain | All-scalar (`Normal`) hits | Full $T$-tool FC | Highest accuracy (**0.855–0.857** macro EM) & 100% complex recovery (~60% token savings) |
-| **HybridFill+Schema** | Post-$H_1$ `array`/`object` tool or abstain | $H_1$ tool $\hat{t}$ + grounded scalars | Plain JSON (`tools=[]`) | Concise-reasoning LLMs when prompt-token cost or Stratum A safety dominates |
+| **Router** | SpanCall abstains | Committed scalar hits | Full multi-tool FC | Maximum latency/token savings (~80% fewer tokens) on mostly scalar traffic |
+| **Router+Schema** *(default)* | Selected tool has `array`/`object` params, or abstain | All-scalar (`Normal`) hits | Full multi-tool FC | Highest accuracy (**0.855–0.857** macro EM) & 100% complex recovery (~60% token savings) |
+| **HybridFill+Schema** | Selected tool has `array`/`object` params, or abstain | Selected tool + grounded scalars | Plain JSON (`tools=[]`) | Concise-reasoning LLMs when prompt-token cost or ungroundable-turn safety dominates |
 
 ### Out-of-Scope Uses
 - Standalone deployment without an LLM fallback on open-ended prose generation, multi-step arithmetic/compositional arguments, or unanswerable/adversarial traffic (see **Limitations** below).
@@ -91,7 +91,7 @@ For SpanCall alone (no LLM), use `from spancall import load_resolver; resolver =
 - **Optimization:** 3 epochs in `bf16`, effective batch size 128, cosine learning-rate decay with 10% floor, seed `42`.
 - **Model Selection:** Separate held-out dev splits (Hermes 669 rows / 1,239 targets; xLAM 2,384 rows / 4,145 targets) using unweighted macro-average `exact_call`, plus a disjoint 313-row probe evaluated every 2,000 optimizer steps.
 
-| Epoch | Train Loss | Hermes Dev `exact_call` | xLAM Dev `exact_call` | **Macro Dev `exact_call`** | $H_1$ `tool_acc` (H / X) |
+| Epoch | Train Loss | Hermes Dev `exact_call` | xLAM Dev `exact_call` | **Macro Dev `exact_call`** | Tool Acc (H / X) |
 | :---: | :---: | :---: | :---: | :---: | :---: |
 | 1 | 1.503 | `.849` | `.864` | `.857` | `.999` / `.991` |
 | 2 | 0.354 | `.865` | `.871` | `.868` | `.999` / `.995` |
@@ -101,7 +101,7 @@ For SpanCall alone (no LLM), use `from spancall import load_resolver; resolver =
 
 ## Evaluation Results
 
-### Tier 1 Matched Fair Eval ($n = 1{,}735$ per corpus, $n_F = 1{,}277$, $n_A = 458$)
+### Tier 1 Matched Fair Eval (1,735 rows per corpus: 1,277 groundable, 458 ungroundable)
 
 | System | Hermes `exact_F` | xLAM `exact_F` | **Macro `exact_F`** | Macro `param_F1` | Macro Complex `exact_F` | `false_hit_A` ↓ | Mean Lat. (ms) | API Tokens / Turn |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -119,13 +119,13 @@ For SpanCall alone (no LLM), use `from spancall import load_resolver; resolver =
 
 ### Normal (All-Scalar) vs. Complex (`array`/`object`) & Error Funnel
 
-- **Normal all-scalar calls** ($n_F = 1{,}108$ per corpus, 86.8% of Stratum F): SpanCall achieves **0.798** on Hermes (vs. 0.360 / 0.397 for Gemma 4 / `gpt-oss-120b`) and **0.840** on xLAM (vs. 0.755 / 0.755).
-- **Complex calls** ($n_F = 169$ per corpus): SpanCall drops to **0.385** (Hermes) and **0.278** (xLAM), while LLMs reach 0.568–0.586 (Hermes) and 0.923 (xLAM)—motivating `Router+Schema`.
+- **Normal all-scalar calls** (1,108 per corpus, 86.8% of groundable turns): SpanCall achieves **0.798** on Hermes (vs. 0.360 / 0.397 for Gemma 4 / `gpt-oss-120b`) and **0.840** on xLAM (vs. 0.755 / 0.755).
+- **Complex calls** (169 per corpus): SpanCall drops to **0.385** (Hermes) and **0.278** (xLAM), while LLMs reach 0.568–0.586 (Hermes) and 0.923 (xLAM)—motivating `Router+Schema`.
 - **Precision upon commitment (`P@hit`) & swaps:** SpanCall reaches **0.806** (Hermes) and **0.824** (xLAM) `P@hit` with **0** duplicate-span collapse and only **4** (Hermes) / **34** (xLAM) entity swaps (vs. 76–79 and 136–162 for the LLMs).
 
 ### Tier 2 Full Splits: Zero-Shot OOD & Adversarial Generalization (34,969 Rows)
 
-| Split | $n$ | $n_F$ | `exact_F` | `hit_F` | `param_F1` | `false_hit_A` | Mean Lat. (ms) |
+| Split | Total | Groundable | `exact_F` | `hit_F` | `param_F1` | `false_hit_A` | Mean Lat. (ms) |
 | :--- | ---: | ---: | :---: | :---: | :---: | :---: | :---: |
 | Hermes ID eval | 1,829 | 1,367 | `.708` | `.873` | `.776` | `.636` | 127.6 |
 | xLAM ID eval | 6,811 | 4,571 | `.757` | `.871` | `.793` | `.661` | 46.9 |
@@ -146,17 +146,4 @@ For SpanCall alone (no LLM), use `from spancall import load_resolver; resolver =
 1. **Abstention on ungroundable turns (Stratum A):** Standalone semantic abstention remains weak (`false_hit_on_A` 0.638–0.690 on Tier 1; 0.788–0.816 on adversarial splits). Explicit Stratum A negative supervision is needed before standalone deployment on high-risk or unanswerable traffic.
 2. **Complex argument structures:** Linear span extraction cannot reliably model multi-span list cardinality (`array`) or nested `object` grouping; use `Router+Schema` or `HybridFill+Schema` to delegate complex schemas to an LLM.
 3. **Single training seed:** Trained with seed `42` (statistical significance on Tier 1 is assessed via 10,000-resample paired bootstrap CIs, not multi-seed training runs).
-4. **Single-call scope:** Trained and evaluated on single-call Hermes V1 and xLAM-60k turns; multi-turn stateful benchmarks (BFCL, $\tau$-bench, ToolSandbox) are future work.
-
----
-
-## Citation
-
-```bibtex
-@misc{spancall2026,
-  title  = {Not Every Tool Call Needs Generation: Function Calling as Span Extraction},
-  author = {Anonymous Submission},
-  year   = {2026},
-  note   = {Preprint}
-}
-```
+4. **Single-call scope:** Trained and evaluated on single-call Hermes V1 and xLAM-60k turns; multi-turn stateful benchmarks (BFCL, tau-bench, ToolSandbox) are future work.
