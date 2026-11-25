@@ -76,4 +76,5 @@ See [`README.md`](README.md), [`MODEL_CARD.md`](MODEL_CARD.md), [`docs/experimen
 
 1. **Explicit Stratum A negative supervision:** Train dedicated abstention / refusal supervision on ungroundable and adversarial turns to close the standalone `false_hit_on_A` gap (0.638–0.690 on Tier 1; 0.788–0.816 on adversarial).
 2. **Multi-turn stateful agentic benchmarks:** Evaluate `Router+Schema` and `HybridFill+Schema` end-to-end on BFCL, $\tau$-bench, and ToolSandbox.
-3. **Multi-seed & CPU/edge benchmarking:** Measure training-run variance across multiple seeds and benchmark single-request CPU / ONNX INT8 latency alongside GPU batch serving.
+3. **Long-context 32K bidirectional MLM backbone (`dmis-lab/UltraBERT-380M`):** Evaluate `dmis-lab/UltraBERT-380M` (*UltraBERT: Beyond the Limit of BERT Pre-Training*, arXiv:2610.15028 — 380M params, $d=1024$, 24 layers, RoPE/SwiGLU/RMSNorm, alternating local-128 & global attention, native **32,768** context, decoupled 5%/50% MLM heads) as a drop-in 32K replacement for `ModernBERT-large` on long multi-turn agentic trajectories without the token-boundary degradation seen with contrastive embedding backbones.
+4. **Multi-seed & CPU/edge benchmarking:** Measure training-run variance across multiple seeds and benchmark single-request CPU / ONNX INT8 latency alongside GPU batch serving.

@@ -6,7 +6,7 @@
 
 ## Core Design Constraints
 
-1. **Backbone:** Stay on MLM-pretrained `answerdotai/ModernBERT-large` (native 8,192-token window). Contrastive embedding backbones (e.g. `Qwen3-Embedding-0.6B`) degraded token-boundary span extraction in prior experiments.
+1. **Backbone:** Stay on MLM-pretrained `answerdotai/ModernBERT-large` (native 8,192-token window) for fast warm-start iteration. Contrastive embedding backbones (e.g. `Qwen3-Embedding-0.6B`) degraded token-boundary span extraction in prior experiments. **Future 32K candidate:** `dmis-lab/UltraBERT-380M` (arXiv:2610.15028 — 380M params, $d=1024$, 24 layers, native **32K** context, alternating local-128 + global attention, decoupled 5%/50% MLM pre-training for classification + retrieval) is the primary drop-in candidate if Stage 3 diagnostics show trajectories exceeding 8K tokens.
 2. **Execution model:** Single tool call per turn, multi-turn trajectory (ReAct / interactive user–agent–tool loop). Keep `SINGLE_CALL_ONLY=True` and the proven two-step $H_1 \to H_3$ architecture.
 3. **Evidence-first iteration:** Build the agent and measure failure modes on $\tau$-bench with the existing `v3.3` checkpoint *before* changing training recipes or data mixes.
 4. **Paper-grade data hygiene:** Any Stage 4 training uses only published, citable datasets (zero custom synthesis) and stays strictly disjoint from $\tau$-bench (`retail`, `airline`) and BFCL v3/v4 eval splits.
