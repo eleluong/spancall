@@ -1,5 +1,8 @@
 # SpanCall Pre-Process and Post-Process Mechanism
 
+> [!NOTE]
+> **Historical Spec Note:** This document specifies the original pre/post-processing contract (several Part C gap rows predate the completed Lean v2/v3.3 implementation). In the **current v3.3 codebase**, candidate masks (`spancall/model/masks.py`), atomic `<|...|>` special tokens (`span_template/sanitize.py`), object-leaf flattening (`spancall/data/flatten.py`), exclusivity DFS decoding (`spancall/lean/decode.py`), strict casting & schema validation (`spancall/infer/cast.py`), two-step focus resolution (`spancall/lean/resolver.py`), and plain-JSON `HybridFill` (`spancall/eval/hybrid_fill.py`) are all implemented and tested. See [`docs/architecture.md`](architecture.md) and [`research_paper/sections/03_methodology.tex`](../research_paper/sections/03_methodology.tex) for the current system.
+
 Companion to [mechanism.md](mechanism.md) (overall flow), [heads.md](heads.md) (what the model outputs) and [proposal.md](proposal.md). The model in the middle is small; **most of the precision comes from the deterministic code around it**. This document specifies that code.
 
 ```mermaid

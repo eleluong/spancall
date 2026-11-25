@@ -91,6 +91,15 @@ def _slugify(model_name: str) -> str:
     return s or "llm"
 
 
+def _env_first(*names: Optional[str]) -> Optional[str]:
+    for n in names:
+        if n:
+            val = os.environ.get(str(n))
+            if val:
+                return val
+    return None
+
+
 def _load_existing_preds(path: Path) -> Dict[str, Dict[str, Any]]:
     if not path.is_file():
         return {}
@@ -147,24 +156,36 @@ def _resolve_model_specs(args: argparse.Namespace) -> List[Dict[str, Any]]:
         for entry in cfg.get("models") or []:
             if not isinstance(entry, dict):
                 continue
-            slug = str(entry.get("slug") or _slugify(entry.get("model", "")))
+            model_val = entry.get("model")
+            if entry.get("model_env"):
+                model_val = _env_first(str(entry["model_env"]), "BASE_LLM_MODEL", "LLM_MODEL") or model_val
+            slug = str(entry.get("slug") or _slugify(model_val or ""))
             if only:
                 if slug not in only:
                     continue
             elif not entry.get("enabled", True):
                 continue
+            if not model_val:
+                raise SystemExit(
+                    f"[eval_llm_local] model not set for '{slug}' "
+                    f"(set 'model' or export {entry.get('model_env') or 'BASE_LLM_MODEL'})."
+                )
             merged = dict(cfg_defaults)
             merged.update(entry)
+            merged["model"] = str(model_val)
             merged["slug"] = slug
             specs.append(merged)
     else:
-        if not args.model:
-            raise SystemExit("Pass either --config <yaml> or --model <model_id>.")
-        slug = args.slug or _slugify(args.model)
+        model_val = args.model or _env_first(args.model_env, "BASE_LLM_MODEL", "LLM_MODEL")
+        if not model_val:
+            raise SystemExit(
+                f"Pass --config <yaml>, --model <model_id>, or set {args.model_env} in .env/environment."
+            )
+        slug = args.slug or _slugify(model_val)
         spec = dict(defaults)
         spec.update({
             "slug": slug,
-            "model": args.model,
+            "model": str(model_val),
             "base_url": args.base_url,
             "base_url_env": args.base_url_env,
             "api_key_env": args.api_key_env,
@@ -180,16 +201,14 @@ def _make_openai_client(spec: Dict[str, Any]) -> Any:
     except ImportError as exc:
         raise SystemExit("openai package is required: pip install openai") from exc
 
-    api_key_env = spec.get("api_key_env") or "OPENAI_API_KEY"
-    api_key = os.environ.get(str(api_key_env)) or spec.get("default_api_key")
+    api_key_env = spec.get("api_key_env") or "API_KEY"
+    api_key = _env_first(str(api_key_env), "API_KEY", "LLM_API_KEY", "OPENAI_API_KEY") or spec.get("default_api_key")
     if not api_key:
         raise SystemExit(
             f"[eval_llm_local] {api_key_env} is not set for model '{spec['slug']}'. "
             f"Export {api_key_env} (or put it in .env), or pass --fake-responses."
         )
-    base_url = spec.get("base_url")
-    if not base_url and spec.get("base_url_env"):
-        base_url = os.environ.get(str(spec["base_url_env"])) or None
+    base_url = spec.get("base_url") or _env_first(spec.get("base_url_env"), "BASE_URL", "LLM_BASE_URL")
     kwargs: Dict[str, Any] = {"api_key": api_key}
     if base_url:
         kwargs["base_url"] = base_url
@@ -358,11 +377,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--results-dir", type=str, default=None, help="Results root (default: results_lean_v3_3)")
     p.add_argument("--splits", nargs="+", default=None, help="Manifest splits to evaluate (default: fair_hermes_eval fair_xlam_eval)")
     # Single-model CLI overrides (used when --config is omitted)
-    p.add_argument("--model", type=str, default=None, help="Model ID for OpenAI-compatible API")
-    p.add_argument("--slug", type=str, default=None, help="Short folder slug for outputs")
+    p.add_argument("--model", type=str, default=None, help="Model ID for OpenAI-compatible API (falls back to --model-env)")
+    p.add_argument("--model-env", type=str, default="BASE_LLM_MODEL", help="Env var holding model ID when --model is omitted")
+    p.add_argument("--slug", type=str, default=None, help="Short folder slug for outputs (default: slugified model name)")
     p.add_argument("--base-url", type=str, default=None, help="Explicit OpenAI-compatible base URL")
-    p.add_argument("--base-url-env", type=str, default="LLM_BASE_URL", help="Env var holding base URL")
-    p.add_argument("--api-key-env", type=str, default="LLM_API_KEY", help="Env var holding API key")
+    p.add_argument("--base-url-env", type=str, default="BASE_URL", help="Env var holding base URL")
+    p.add_argument("--api-key-env", type=str, default="API_KEY", help="Env var holding API key")
     p.add_argument("--default-api-key", type=str, default=None, help="Fallback key (e.g. EMPTY for local vLLM)")
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--max-tokens", type=int, default=1024)

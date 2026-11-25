@@ -5,8 +5,8 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "spancall"
 version = "0.1.0"
-description = "SpanCall: Speculative Fast-Path Tool Calling via Multi-Span Extraction"
-readme = "docs/proposal.md"
+description = "SpanCall: Non-Autoregressive Extractive Function Calling via Multi-Span Extraction"
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "jinja2>=3.1.0",

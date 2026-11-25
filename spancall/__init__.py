@@ -10,3 +10,22 @@ Core modules:
 """
 
 __version__ = "0.1.0"
+
+# Lazy public API so ``import spancall`` stays light (no torch import).
+_PUBLIC = {
+    "SpanCallLLM": "spancall.combine",
+    "CombinePolicy": "spancall.combine",
+    "ToolCallOutcome": "spancall.combine",
+    "coerce_tools": "spancall.combine",
+    "load_resolver": "spancall.hub",
+}
+__all__ = ["__version__", *_PUBLIC]
+
+
+def __getattr__(name: str):
+    if name in _PUBLIC:
+        import importlib
+
+        return getattr(importlib.import_module(_PUBLIC[name]), name)
+    raise AttributeError(f"module 'spancall' has no attribute {name!r}")
+

@@ -54,14 +54,14 @@ utterance
 ```
 
 - Every `<|tool|>`, `<|none|>`, and `<|param|>` token is an atomic special token registered on the tokenizer (`SPECIAL_MARKER_TOKENS`), serving as a **query anchor** where heads read `H`.
-- During training, `ToolPool` (`jitter_pack_tools=True`) packs the ground-truth tool(s) alongside distractor tools so H1 always sees `T >= 2` anchors.
-- At serve time, `LeanResolver.try_resolve_candidates` encodes the multi-tool prompt **once** (`encoded_bundle`) and reuses `(output, H, per_token)` for both H1 tool scoring and H3 parameter extraction.
+- During training, `ToolPool` (`jitter_pack_tools=True`) packs the ground-truth tool(s) alongside up to 6 distractor tools so $H_1$ learns to discriminate across candidate schemas while keeping $T=1$ in-distribution.
+- At serve time (`resolve_mode="two_step"`, default in v3.x), `LeanResolver.try_resolve_candidates` first runs $H_1$ over all $T$ candidate tools to select $\hat{t}$, then re-encodes a compact $T=1$ focus sequence for $\hat{t}$ so the full candidate budget ($C \le 1024$) serves $\hat{t}$'s parameters rather than distractors.
 
 ---
 
 ## 3. Active Head Specifications
 
-Notation: `B` = batch size, `T` = packed tool anchors (including `<|none|>`), `K` = parameter anchors, `C` = candidate spans per parameter (`max_cands = 512`), `L` = sequence length, `d` = encoder hidden size (read dynamically from the backbone config), `d_h` = head projection width (`head_dim = 256`).
+Notation: `B` = batch size, `T` = packed tool anchors (including `<|none|>`), `K` = parameter anchors, `C` = candidate spans per parameter (`max_cands = 1024` in v3.3), `L` = sequence length ($L_{\max} = 4096$), `d` = encoder hidden size (`1024` for `ModernBERT-large`, read dynamically from the backbone config), `d_h` = head projection width (`head_dim = 256`), `W_max` = maximum span width (`16`).
 
 ### 3.1 H1 — `ToolHead` (Softmax) and `BinaryToolHead` (Independent Sigmoid)
 
@@ -78,13 +78,11 @@ $$u_{t} = w_{\text{tool}}^\top\,\text{GELU}(W[\,H_{\tau_t};H_{\text{CLS}}\,])$$
 
 ### 3.2 H3 — `LeanPointerHead` (Boundary-Factorized Candidate Span Scorer)
 
-For each parameter anchor `k` at token index `\pi_k` and each valid candidate span `c = (i_c, j_c)` in `0..C-1`:
+For each parameter anchor `k` at token index `\pi_k` and each valid candidate span `c = (i_c, j_c)` in `0..C-1` (matching [`spancall/lean/model.py`](../spancall/lean/model.py) and `03_methodology.tex`):
 
-$$q_{k} = W_q\,\text{LN}(H_{\pi_k}) \in \mathbb{R}^{d_h}$$
+$$q_{k} = W_q\,\text{LN}(H_{\pi_k}) \in \mathbb{R}^{d_h}, \qquad k_{\text{s}, i} = W_s H_i, \qquad k_{\text{e}, j} = W_e H_j$$
 
-$$s_{k,c} = q_{k}^\top (W_s\,\text{LN}(H_{i_c})), \qquad e_{k,c} = q_{k}^\top (W_e\,\text{LN}(H_{j_c}))$$
-
-$$M(k, c) = \frac{s_{k,c} + e_{k,c}}{\sqrt{d_h}} + r(\min(j_c - i_c, W_{\max}))$$
+$$M(k, c) = \frac{q_k^\top (k_{\text{s}, i_c} + k_{\text{e}, j_c})}{\sqrt{d_h}} + r(\min(j_c - i_c, W_{\max}))$$
 
 - **No abstain column:** Unlike the retired v1 `PointerHead`, `LeanPointerHead` outputs `(B, K, C)` over real candidates only (with `-1e4` on padded candidate slots `c` where `cand_mask[b,k,c] == False`).
 - **Multi-positive loss (`compute_lean_pointer_loss`):**

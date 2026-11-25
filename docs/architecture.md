@@ -1,36 +1,36 @@
 # Codebase Architecture & Research Plan
 
-Describes the repository structure, module contracts, data flow, evaluation methodology and experiment protocol for SpanCall. It complements the design docs:
+Describes the repository structure, module contracts, data flow, evaluation methodology, and experiment protocol for SpanCall (**Lean v3.3**, aligned with [research_paper/main.tex](../research_paper/main.tex)). It complements the companion docs:
 
 | Doc | Scope |
 | --- | --- |
-| [proposal.md](proposal.md) | What we claim and why |
-| [mechanism.md](mechanism.md) | How one-pass resolution works, cost model, experiments E1-E8 |
-| [heads.md](heads.md) | Prediction heads (H1 Tool + H3 Lean Pointer, plus optional/spec heads) |
-| [pipeline_io.md](pipeline_io.md) | Pre/post-process spec |
+| [README.md](../README.md) | Paper overview, headline v3.3 results, quickstart & reproduction |
+| [MODEL_CARD.md](../MODEL_CARD.md) | Pretrained `convoicon/spancall-lean-v3-3` model card |
+| [PROJECT_STATE.md](../PROJECT_STATE.md) | Current v3.3 snapshot, invariants, component status, roadmap |
+| [heads.md](heads.md) | Active prediction heads ($H_1$ Tool + $H_3$ Lean Pointer) |
+| [experiments.md](experiments.md) | Experiment ledger (v2, v3, and completed v3.3 paper results) |
 | [param_extraction_eval_coverage.md](param_extraction_eval_coverage.md) | Retrieval-first contract & honest Part-1/Part-3 metrics |
-| [experiments.md](experiments.md) | Experiment ledger E1-E15 |
-| **this doc** | Codebase layout, shareable boilerplate contracts, Lean workflows |
+| [proposal.md](proposal.md), [mechanism.md](mechanism.md), [pipeline_io.md](pipeline_io.md) | Original pre-implementation design & template specs (historical reference) |
+| **this doc** | Codebase layout, shareable boilerplate contracts, Lean v3.3 workflows |
 
 > [!NOTE]
 > **Architecture Principle — Lean Core + Pluggable Boilerplate:**
-> `span_template/`, `spancall/data/`, `spancall/model/{encoder,masks,heads}.py`, `spancall/infer/{base,cast,clock,export}.py`, `spancall/train/{base,config}.py`, `spancall/eval/`, and `spancall/agent/` provide **version-agnostic ABCs and shared utilities**. Concrete model/training/decoding/resolution versions (such as `spancall/lean/` and future v2.x / v3 iterations) implement these contracts (`BaseResolver`, `BaseTrainer`, `BaseJointDecoder`, `BaseHead`) so new versions drop into the agent router and evaluation harnesses with zero friction.
+> `span_template/`, `spancall/data/`, `spancall/model/{encoder,masks,heads}.py`, `spancall/infer/{base,cast,clock,export}.py`, `spancall/train/{base,config}.py`, `spancall/eval/`, and `spancall/agent/` provide **version-agnostic ABCs and shared utilities**. Concrete model/training/decoding/resolution versions (`spancall/lean/`) implement these contracts (`BaseResolver`, `BaseTrainer`, `BaseJointDecoder`, `BaseHead`) so new versions drop into the agent router and evaluation harnesses with zero friction.
 
 ---
 
-## 1. Research Framing
+## 1. Research Framing (Current Paper)
 
-**Claim:** a compact bidirectional encoder with a boundary-factorized pointer head (`LeanPointerHead`, H3) and tool selection head (`ToolHead` / `BinaryToolHead`, H1) resolves context-ready tool calls (stratum **F**) in a single forward pass, gated by tool probability / joint margin for high precision. Stratum **A** (absent/unresolvable params) or low-margin predictions abstain to the normal LLM.
+**Claim:** A non-autoregressive bidirectional pointer architecture (`ModernBERT-large`, 395M) with an anchor-conditioned tool head ($H_1$), a type-filtered boundary-factorized pointer head ($H_3$), and exclusivity-constrained two-step DFS resolves groundable tool calls (**Stratum F**, especially **Normal** all-scalar calls) in parallel without generation tokens. For **Complex** (`array`/`object`) schemas or ungroundable/abstained turns (**Stratum A**), two zero-training collaboration policies (**Router+Schema** and **HybridFill+Schema**) hand off cleanly to any off-the-shelf LLM.
 
-**Systems compared everywhere:**
+**Systems compared on Tier 1 Fair Eval (`data/eval_v3_3/`):**
 
-| ID | System | Role |
-| --- | --- | --- |
-| **B0** | Normal agent: LLM generates every tool call | Reference quality and cost |
-| **B1** | Cheap baselines: 0.5B constrained generator, regex/rules (`B1aBaseline`) | Fair small-model baseline (E6) |
-| **S** | Agent + SpanCall router (fast path via `BaseResolver`, LLM fallback) | The proposal |
-
-**Layered questions:** does the model extract & select tools accurately (`eval_p1` + `diagnostics`) -> does end-to-end resolution beat the precision gate (`ToolCallEvaluator`) -> does the agent succeed cheaper (`ComparativeEvaluator`).
+| System | Role |
+| --- | --- |
+| **SpanCall (standalone)** | `ModernBERT-large` (395M), two-step decoding, 0 LLM tokens |
+| **LLM-only** | Zero-shot `google/gemma-4-26b-a4b-it` and `openai/gpt-oss-120b` (`tool_choice=auto`) |
+| **Router / Router+Schema** | Abstention-only or post-$H_1$ complex-schema whole-call LLM routing |
+| **HybridFill / HybridFill+Schema** | $H_1$ tool selection + grounded scalars + plain-JSON LLM partial completion (`tools=[]`) |
 
 ---
 
@@ -38,34 +38,40 @@ Describes the repository structure, module contracts, data flow, evaluation meth
 
 ```text
 multi_span_tool_calling/
+├── README.md                      # Paper overview, headline results, reproduction guide
+├── MODEL_CARD.md                  # Hugging Face model card for convoicon/spancall-lean-v3-3
+├── PROJECT_STATE.md               # Current v3.3 snapshot & component status
 ├── pyproject.toml
-├── PROJECT_STATE.md
-├── configs/default.yaml           # data / model / optimization / training / agent
+├── configs/
+│   ├── default.yaml               # Base Lean training/model/agent config
+│   └── llm_eval_v3_3.yaml         # Local multi-model LLM evaluation registry
 ├── data/
-│   ├── processed/                 # Canonical 7-split UnifiedSample JSONL
-│   ├── processed_v2/              # Re-aligned v2 splits (build_input_multi + utt_rel_* + template_stamp.json)
-│   └── tensorized_lean/           # Pre-tensorized Lean split caches
-├── docs/                          # Design docs + this file + experiments.md
-├── plans/                         # Active Lean v2 / v2.1 design plans
+│   ├── processed_v3_3/            # Re-aligned v3.3 Hermes & xLAM splits + template_stamp.json
+│   └── eval_v3_3/                 # Frozen Tier 1 Fair Eval & Tier 2 Full Splits + manifest.json (SHA256)
+├── docs/                          # Architecture, heads, experiments ledger, historical design specs
+├── research_paper/                # ACL LaTeX paper (main.tex, sections/, figures/, Makefile)
+├── results_lean_v3_3/             # Audited v3.3 predictions, metrics, and LaTeX/MD exports
 ├── span_template/                 # Shared grammar: render, parse, sanitize (R7), template stamp
-│   ├── template.py                #   build_input / build_input_multi / resolve_utterance_span / gate_tool_call
+│   ├── template.py                #   build_input_multi / resolve_utterance_span / gate_tool_call
 │   ├── parser.py                  #   marker grammar → extraction legend
 │   ├── sanitize.py                #   P0/P1 normalization + R7 marker rejection
-│   ├── stamp.py                   #   Template-hash stamp verification (S6)
-│   ├── template.jinja / template_multi.jinja
+│   ├── stamp.py                   #   Cryptographic template-hash stamp verification
+│   ├── template_multi.jinja       #   Unified multi-tool marker template
 │   └── test_template.py           #   Golden render/parse + R7 fixtures
 ├── spancall/
-│   ├── data/                      # §4 Shared ingestion, alignment, augmentation, splits, loader stubs
+│   ├── combine.py                 # Public one-call API: SpanCallLLM (6 policies), CombinePolicy, coerce_tools
+│   ├── hub.py                     # Safe Hub/local checkpoint loader (load_resolver, weights_only=True)
+│   ├── data/                      # §4 Shared ingestion (Hermes, xLAM), alignment, object flattening, splits
 │   ├── model/                     # §5.1 Shared encoder, candidate masks, BaseHead, ToolHead, BinaryToolHead
 │   ├── train/                     # §5.2 Shared TrainingConfig + BaseTrainer / BaseCalibrator / CosineWarmupSchedule
 │   ├── infer/                     # §6.1 Shared BaseResolver / BaseResolveResult / BaseJointDecoder, StrictTypeCaster, clock
-│   ├── lean/                      # §5.3 & §6.2 Lean model, loss, tensorizer, trainer, decoder, resolver, eval_p1, diagnostics
-│   ├── agent/                     # §7 Pluggable ToolCallRouter + ReActAgentLoop (accepts any BaseResolver)
-│   └── eval/                      # §8 Offline ToolCallEvaluator + Agentic ComparativeEvaluator & CostModel
-├── scripts/                       # Thin CLIs (prepare_data, realign_v2, probe, train_lean, eval_toolcall, eval_agent)
+│   ├── lean/                      # §5.3 & §6.2 Lean model, loss, tensorizer, trainer, exclusivity DFS decoder, two-step resolver
+│   ├── agent/                     # §7 Pluggable ToolCallRouter, ReActAgentLoop, fill.py, backends, mock tools
+│   └── eval/                      # §8 ToolCallEvaluator, llm_parity.py, hybrid_fill.py, ComparativeEvaluator, CostModel
+├── scripts/                       # Thin CLIs (build_fair_eval_v3_3, eval_llm_local, eval_hybrid_fill, export_v3_3_results, etc.)
 ├── notebooks/
-│   └── spancall_lean_v2_train_eval.ipynb
-└── tests/                         # Unit & integration tests across template, data, lean, infer, agent, eval
+│   └── spancall_lean_v3_3_train_eval.ipynb
+└── tests/                         # Unit & integration tests across template, data, lean, infer, agent, eval, v3.3 pipeline
 ```
 
 Design rules:
@@ -211,9 +217,12 @@ flowchart LR
 | Script | Purpose | Backing modules |
 | --- | --- | --- |
 | `scripts/prepare_data.py` | Ingest, align, augment, schema-disjoint split | `spancall/data/*` |
-| `scripts/realign_v2.py` | Re-align splits with `build_input_multi` + `utt_rel_*` + template stamp & gate | `spancall/data/align.py`, `span_template/stamp.py` |
-| `scripts/probe.py` | E0 traffic & groundability probe | `span_template/*` |
+| `scripts/realign_v2.py` | Re-align splits with `build_input_multi` + `utt_rel_*` + object flattening + template stamp | `spancall/data/align.py`, `spancall/data/flatten.py`, `span_template/stamp.py` |
+| `scripts/build_fair_eval_v3_3.py` | Build frozen Tier 1 matched Fair Eval & Tier 2 full splits with SHA256 `manifest.json` | `spancall/data/*`, `spancall/eval/llm_parity.py` |
+| `scripts/build_lean_v3_3_train_eval_notebook.py` | Generate `notebooks/spancall_lean_v3_3_train_eval.ipynb` (Colab A100 v3.3 training & eval) | `notebooks/` |
 | `scripts/train_lean.py` | Train `LeanSpanCallModel` with `LeanTrainer` | `spancall/lean/*`, `spancall/model/*` |
+| `scripts/eval_llm_local.py` | Evaluate hosted/local LLMs + `Router` / `Router+Schema` on frozen Tier 1 splits | `spancall/eval/llm_parity.py`, `configs/llm_eval_v3_3.yaml` |
+| `scripts/eval_hybrid_fill.py` | Evaluate plain-JSON `HybridFill` and `HybridFill+Schema` policies on frozen Tier 1 splits | `spancall/eval/hybrid_fill.py`, `spancall/agent/fill.py` |
+| `scripts/export_v3_3_results.py` | Audit manifest/coverage parity, run 10k paired bootstrap CIs, export MD/JSON/LaTeX tables | `spancall/eval/llm_parity.py` |
 | `scripts/eval_toolcall.py` | Offline Part-3 tool-call evaluation & B1a baseline | `spancall/eval/toolcall/*` |
-| `scripts/eval_agent.py` | Comparative agent evaluation (B0 vs S via `BaseResolver` / `LeanResolver`) | `spancall/eval/agentic/*`, `spancall/agent/*` |
-| `scripts/build_lean_v2_colab_notebook.py` | Generate `notebooks/spancall_lean_v2_train_eval.ipynb` with AST cell-scope guard | `notebooks/` |
+| `scripts/eval_agent.py` | Comparative agent evaluation via `BaseResolver` / `LeanResolver` | `spancall/eval/agentic/*`, `spancall/agent/*` |

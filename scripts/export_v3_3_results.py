@@ -427,6 +427,323 @@ def _write_audit_md(path: Path, report: Dict[str, Any]) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _pct(v: Any, nd: int = 1) -> str:
+    if v is None:
+        return "—"
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return "—"
+    return "—" if not math.isfinite(f) else f"{f * 100.0:.{nd}f}%"
+
+
+def _pp(v: Any, nd: int = 1) -> str:
+    if v is None:
+        return "—"
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return "—"
+    return "—" if not math.isfinite(f) else f"{f * 100.0:+.{nd}f} pp"
+
+
+def _pretty_system(name: str) -> str:
+    if name == "spancall_v3_3":
+        return "**SpanCall v3.3** (fast path)"
+    if name.startswith("llm:"):
+        return f"LLM (`{name[4:]}`)"
+    if name.startswith("router:"):
+        return f"**Router** (`SC + {name[7:]}`)"
+    return f"`{name}`"
+
+
+def _short_system(name: str) -> str:
+    if name == "spancall_v3_3":
+        return "SpanCall v3.3"
+    if name.startswith("llm:"):
+        return f"LLM ({name[4:]})"
+    if name.startswith("router:"):
+        return f"Router ({name[7:]})"
+    return name
+
+
+def _write_final_report_md(path: Path, report: Dict[str, Any]) -> None:
+    """Write a scannable, side-by-side comparison Markdown report from ``final_report``."""
+    prov = report["provenance"]
+    audit = report["audit"]
+    meta = report.get("run_metadata") or {}
+    tr = report.get("training") or {}
+    headline = report.get("tier1_headline") or []
+    cx_rows = report.get("tier1_complexity") or []
+    bk_rows = report.get("tier1_tool_buckets") or []
+    ood_rows = report.get("tier2_full_ood") or []
+
+    # Index headline by (system, split)
+    h_idx: Dict[Tuple[str, str], Dict[str, Any]] = {(r["system"], r["split"]): r for r in headline}
+    systems_order: List[str] = []
+    for r in headline:
+        if r["system"] not in systems_order:
+            systems_order.append(r["system"])
+
+    # Reference latencies/tokens for speedup & token savings:
+    # - each router:<slug> compares against its OWN paired llm:<slug>
+    # - each llm:<slug> is its own 1.0x / 0.0% baseline
+    # - spancall_v3_3 shows speedup range across all evaluated LLMs
+    llm_systems = [s for s in systems_order if s.startswith("llm:")]
+    primary_llm = llm_systems[0] if llm_systems else None
+    llm_lats = [float(h_idx[(s, "macro_avg")].get("lat_ms_mean") or 0.0) for s in llm_systems if (s, "macro_avg") in h_idx]
+    llm_lats = [x for x in llm_lats if x > 0]
+
+    badge = "✅ PASS" if audit["status"] == "PASS" else (
+        f"⚠️ {audit['status']} ({audit['total_llm_errors']} LLM API errors)"
+        if audit["status"] == "PASS_WITH_LLM_ERRORS"
+        else f"⚠️ {audit['status']}"
+    )
+
+    lines: List[str] = [
+        "# SpanCall Lean v3.3 — Benchmark Report",
+        "",
+        f"> **Audit:** {badge} · **Commit:** `{prov['git_commit']}` · "
+        f"**Eval:** `{prov['eval_dir']}` (1:1 matched Hermes & xLAM) · "
+        f"**Bootstrap:** `{prov['bootstrap_n']:,}` resamples",
+        "",
+        "---",
+        "",
+        "## 1. Headline Comparison (Tier 1 Fair Eval — Side by Side)",
+        "",
+        "Both `fair_hermes_eval` and `fair_xlam_eval` have **identical** size and `(cohort × complexity)` composition.",
+        "",
+        "### 1a. Accuracy (`exact_F` & `param_F1` on Stratum F)",
+        "",
+        "| System | Hermes `exact_F` | xLAM `exact_F` | **Macro `exact_F`** | Hermes `param_F1` | xLAM `param_F1` | **Macro `param_F1`** |",
+        "| :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for sys_name in systems_order:
+        hr = h_idx.get((sys_name, "fair_hermes_eval")) or {}
+        xr = h_idx.get((sys_name, "fair_xlam_eval")) or {}
+        mr = h_idx.get((sys_name, "macro_avg")) or {}
+        lines.append(
+            f"| {_pretty_system(sys_name)} | {_pct(hr.get('exact_F'))} | {_pct(xr.get('exact_F'))} | "
+            f"**{_pct(mr.get('exact_F'))}** | {_pct(hr.get('param_F1'))} | {_pct(xr.get('param_F1'))} | "
+            f"**{_pct(mr.get('param_F1'))}** |"
+        )
+
+    lines += [
+        "",
+        "### 1b. Speed, Cost & Safety (Macro Average across Hermes + xLAM)",
+        "",
+        "| System | Mean Lat. (`p50` / `p90`) | Speedup vs. LLM | Tokens / Row (`in + out`) | Token Savings | LLM Calls | `hit_F` | `false_hit_A` | API Errs |",
+        "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for sys_name in systems_order:
+        mr = h_idx.get((sys_name, "macro_avg")) or {}
+        if not mr:
+            continue
+        lat_m = float(mr.get("lat_ms_mean") or 0.0)
+        lat_str = f"{lat_m:.1f} ms (`{float(mr.get('lat_ms_p50') or 0.0):.1f}` / `{float(mr.get('lat_ms_p90') or 0.0):.1f}`)"
+        tok_tot = float(mr.get("tok_in_mean") or 0.0) + float(mr.get("tok_out_mean") or 0.0)
+        tok_str = f"{tok_tot:.1f} (`{float(mr.get('tok_in_mean') or 0.0):.0f}+{float(mr.get('tok_out_mean') or 0.0):.0f}`)"
+
+        if sys_name.startswith("llm:"):
+            speedup = "1.0×"
+            tok_save = "0.0%"
+        elif sys_name.startswith("router:"):
+            paired = h_idx.get((f"llm:{sys_name[7:]}", "macro_avg")) or {}
+            p_lat = float(paired.get("lat_ms_mean") or 0.0)
+            p_tok = float(paired.get("tok_in_mean") or 0.0) + float(paired.get("tok_out_mean") or 0.0)
+            speedup = f"**{p_lat / lat_m:.1f}×**" if (p_lat > 0 and lat_m > 0) else "—"
+            tok_save = f"**{(1.0 - tok_tot / p_tok) * 100.0:.1f}%**" if p_tok > 0 else "—"
+        else:
+            if llm_lats and lat_m > 0:
+                lo_s, hi_s = min(llm_lats) / lat_m, max(llm_lats) / lat_m
+                speedup = f"**{lo_s:.1f}×**" if abs(hi_s - lo_s) < 0.05 else f"**{lo_s:.1f}–{hi_s:.1f}×**"
+            else:
+                speedup = "—"
+            tok_save = "**100.0%**" if llm_systems else "—"
+
+        fb = mr.get("fallback_rate")
+        llm_calls = "0.0%" if sys_name == "spancall_v3_3" else (_pct(fb) if fb is not None else "—")
+        lines.append(
+            f"| {_pretty_system(sys_name)} | {lat_str} | {speedup} | {tok_str} | {tok_save} | "
+            f"{llm_calls} | {_pct(mr.get('hit_F'))} | {_pct(mr.get('false_hit_A'))} | {int(mr.get('n_errors') or 0)} |"
+        )
+
+    if report.get("tier1_bootstrap_ci"):
+        lines += [
+            "",
+            "### 1c. Paired Bootstrap 95% CIs (`exact_F` Delta)",
+            "",
+            "| Corpus | Comparison | $n_F$ | Delta | 95% CI | Stat. Sig.? |",
+            "| :--- | :--- | ---: | ---: | :---: | :---: |",
+        ]
+        for c in report["tier1_bootstrap_ci"]:
+            corp = "Hermes" if "hermes" in c["split"] else ("xLAM" if "xlam" in c["split"] else c["split"])
+            sig = "✅ Yes" if (c["ci_lo"] > 0 or c["ci_hi"] < 0) else "— Tie"
+            lines.append(
+                f"| {corp} | `{c['comparison']}` | {c['n_F']} | **{_pp(c['diff'])}** | "
+                f"`[{c['ci_lo']*100:+.2f}, {c['ci_hi']*100:+.2f}] pp` | {sig} |"
+            )
+
+    # ---- 2. Normal vs Complex Side-by-Side Pivot -------------------------- #
+    if cx_rows:
+        cx_idx = {(r["split"], r["complexity"], r["system"]): r for r in cx_rows}
+        lines += [
+            "",
+            "---",
+            "",
+            "## 2. Normal vs. Complex Calls (`exact_F` Side by Side)",
+            "",
+            "| Corpus | Type | $n_F$ | " + " | ".join(_short_system(s) for s in systems_order) + " | Δ (`SpanCall − LLM`) |",
+            "| :--- | :--- | ---: | " + " | ".join("---:" for _ in systems_order) + " | ---: |",
+        ]
+        for sp, corp in (("fair_hermes_eval", "Hermes"), ("fair_xlam_eval", "xLAM")):
+            for cx in ("normal", "complex"):
+                n_f = next((cx_idx[(sp, cx, s)]["n_F"] for s in systems_order if (sp, cx, s) in cx_idx), 0)
+                if not n_f:
+                    continue
+                vals = [cx_idx.get((sp, cx, s), {}).get("exact_F") for s in systems_order]
+                best_v = max((v for v in vals if v is not None), default=None)
+                cells = []
+                for v in vals:
+                    s_txt = _pct(v)
+                    cells.append(f"**{s_txt}**" if (v is not None and best_v is not None and abs(v - best_v) < 1e-9) else s_txt)
+                sc_v = cx_idx.get((sp, cx, "spancall_v3_3"), {}).get("exact_F")
+                llm_v = cx_idx.get((sp, cx, primary_llm), {}).get("exact_F") if primary_llm else None
+                delta = _pp(sc_v - llm_v) if (sc_v is not None and llm_v is not None) else "—"
+                lines.append(f"| {corp} | {cx.title()} | {n_f} | " + " | ".join(cells) + f" | {delta} |")
+
+    # ---- 3. Tool-Count Bucket Side-by-Side Pivot -------------------------- #
+    if bk_rows:
+        bk_idx = {(r["split"], r["bucket"], r["system"]): r for r in bk_rows}
+        bucket_order = ["1-2", "3-5", "6-10", "11+", "shared_1-5"]
+        lines += [
+            "",
+            "---",
+            "",
+            "## 3. Tool-Count Bucket Breakdown (`exact_F` Side by Side)",
+            "",
+            "| Corpus | Tools | $n_F$ | " + " | ".join(_short_system(s) for s in systems_order) + " |",
+            "| :--- | :--- | ---: | " + " | ".join("---:" for _ in systems_order) + " |",
+        ]
+        for sp, corp in (("fair_hermes_eval", "Hermes"), ("fair_xlam_eval", "xLAM")):
+            for bk in bucket_order:
+                n_f = next((bk_idx[(sp, bk, s)]["n_F"] for s in systems_order if (sp, bk, s) in bk_idx), 0)
+                if not n_f:
+                    continue
+                vals = [bk_idx.get((sp, bk, s), {}).get("exact_F") for s in systems_order]
+                best_v = max((v for v in vals if v is not None), default=None)
+                cells = []
+                for v in vals:
+                    s_txt = _pct(v)
+                    cells.append(f"**{s_txt}**" if (v is not None and best_v is not None and abs(v - best_v) < 1e-9) else s_txt)
+                bk_label = "**`shared 1-5`**" if bk == "shared_1-5" else f"`{bk}`"
+                lines.append(f"| {corp} | {bk_label} | {n_f} | " + " | ".join(cells) + " |")
+
+    # ---- 4. Tier 2 Full ID, OOD & Adversarial ----------------------------- #
+    if ood_rows:
+        pretty_split = {
+            "full_hermes_eval": ("Hermes", "Full ID Eval"),
+            "full_xlam_eval": ("xLAM", "Full ID Eval"),
+            "full_hermes_test_ood_schema": ("Hermes", "OOD Schema"),
+            "full_xlam_test_ood_schema": ("xLAM", "OOD Schema"),
+            "full_hermes_test_ood_para": ("Hermes", "OOD Paraphrase"),
+            "full_xlam_test_ood_para": ("xLAM", "OOD Paraphrase"),
+            "full_hermes_test_adversarial": ("Hermes", "Adversarial (A-only)"),
+            "full_xlam_test_adversarial": ("xLAM", "Adversarial (A-only)"),
+        }
+        lines += [
+            "",
+            "---",
+            "",
+            "## 4. Full ID, OOD & Adversarial Generalization (SpanCall v3.3)",
+            "",
+            "| Corpus | Split | $n$ | $n_F$ | `exact_F` | `hit_F` | `param_F1` | `false_hit_A` | Mean Lat. (`p50`) |",
+            "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+        for r in ood_rows:
+            corp, label = pretty_split.get(r["split"], ("—", r["split"]))
+            ex_f = "—" if r["n_F"] == 0 else f"**{_pct(r['exact_F'])}**"
+            hit_f = "—" if r["n_F"] == 0 else _pct(r["hit_F"])
+            pf1 = "—" if r["n_F"] == 0 else _pct(r["param_F1"])
+            fha = _pct(r["false_hit_A"]) if r["n_total"] > r["n_F"] else "—"
+            lat = f"{float(r['lat_ms_mean']):.1f} ms (`{float(r['lat_ms_p50']):.1f}`)"
+            lines.append(f"| {corp} | {label} | {r['n_total']:,} | {r['n_F']:,} | {ex_f} | {hit_f} | {pf1} | {fha} | {lat} |")
+
+    # ---- 5. Training & Dev Curves ----------------------------------------- #
+    ep_eval = tr.get("epoch_eval") or []
+    ep_end = {e.get("epoch"): e for e in (tr.get("epoch_end") or [])}
+    ep_macro = {e.get("epoch"): e for e in (tr.get("epoch_eval_macro") or [])}
+    if ep_eval:
+        by_ep: Dict[Any, Dict[str, Dict[str, Any]]] = {}
+        for row in ep_eval:
+            by_ep.setdefault(row.get("epoch"), {})[row.get("split", "")] = row
+        best_ep = max(ep_macro.keys(), key=lambda e: float(ep_macro[e].get("macro_exact_call") or -1.0)) if ep_macro else None
+        lines += [
+            "",
+            "---",
+            "",
+            "## 5. Training & Held-Out Dev Curve",
+            "",
+        ]
+        if meta:
+            tr_raw = meta.get("train_raw_counts") or {}
+            tr_bal = meta.get("train_balanced_counts") or {}
+            lines.append(
+                f"Backbone: `{meta.get('backbone')}` · Balanced 1:1 train: "
+                f"Hermes `{tr_raw.get('hermes', 0):,}` → `{tr_bal.get('hermes', 0):,}`, "
+                f"xLAM `{tr_raw.get('xlam', 0):,}` (`t2 = {tr_bal.get('tensorized_t2', 0):,}` tensorized rows)."
+            )
+            lines.append("")
+        lines += [
+            "| Epoch | Train Loss | `dev_hermes` `exact_call` | `dev_xlam` `exact_call` | **Macro Dev `exact_call`** | Best |",
+            "| :---: | ---: | ---: | ---: | ---: | :---: |",
+        ]
+        for ep in sorted(by_ep.keys()):
+            dh = by_ep[ep].get("dev_hermes") or {}
+            dx = by_ep[ep].get("dev_xlam") or {}
+            mc = (ep_macro.get(ep) or {}).get("macro_exact_call")
+            tl = (ep_end.get(ep) or {}).get("mean_loss")
+            star = "⭐" if ep == best_ep else ""
+            lines.append(
+                f"| {ep} | {_fmt(tl, 4)} | {_pct(dh.get('exact_call'))} | {_pct(dx.get('exact_call'))} | "
+                f"**{_pct(mc)}** | {star} |"
+            )
+
+    # ---- 6. Collapsible Audit & Probe Details ----------------------------- #
+    lines += ["", "---", "", "## 6. Audit Trail & Details", ""]
+    if tr.get("probe_eval"):
+        lines += [
+            "<details>",
+            f"<summary>Mid-training probe curve ({len(tr['probe_eval'])} checkpoints)</summary>",
+            "",
+            "| Opt Step | Epoch | `n` | `exact_call` | `span_acc` | `tool_acc` | `eval_loss` |",
+            "| ---: | :---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+        for p in tr["probe_eval"]:
+            lines.append(
+                f"| {int(p.get('global_step') or 0):,} | {p.get('epoch')} | {int(p.get('n') or 0)} | "
+                f"{_pct(p.get('exact_call'))} | {_pct(p.get('span_acc'))} | {_pct(p.get('tool_acc'))} | {_fmt(p.get('eval_loss'), 4)} |"
+            )
+        lines += ["", "</details>", ""]
+
+    lines += [
+        "<details>",
+        f"<summary>Frozen dataset manifest & SHA256 hashes ({len(report.get('manifest_splits') or {})} splits)</summary>",
+        "",
+        f"- **Manifest SHA256:** `{prov['manifest_sha256']}`",
+        f"- **Template Stamp:** `{prov['template_stamp']}`",
+        f"- **Generated (UTC):** `{prov['generated_at_utc']}`",
+        "",
+        "| Split | Tier | Corpus | `n` | SHA256 (prefix) |",
+        "| :--- | :--- | :--- | ---: | :---: |",
+    ]
+    for sp, m in (report.get("manifest_splits") or {}).items():
+        lines.append(f"| `{sp}` | `{m.get('tier')}` | `{m.get('corpus')}` | {m.get('n_rows'):,} | `{str(m.get('sha256', ''))[:12]}` |")
+    lines += ["", "</details>", ""]
+
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def export_all_results(
     eval_dir: Path,
     results_dir: Path,
@@ -685,6 +1002,7 @@ def export_all_results(
     os.replace(tmp_r, report_path)
 
     _write_audit_md(out_dir / "audit_report.md", report)
+    _write_final_report_md(out_dir / "final_report.md", report)
 
     tables_dir = out_dir / "tables"
     _write_csv(

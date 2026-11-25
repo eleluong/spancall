@@ -198,7 +198,33 @@ different experiments.
 
 | Run ID | Date | Arm pinned | Probe every | Probe overlap w/ dev | Eval slice (corpus rows / empty buckets) | Part 3 exact / set-exact / count-acc | LLM parity (Δ exact on `lean_plus_fallback`) | Agentic: mode1 / mode2 / mode3 success | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| _(pending)_ | | `two_step` | 1000 optimiser steps | must be 0 | from §4.0b (2 splits × 4 buckets, empty skipped) | | | | run [`notebooks/spancall_lean_v3_train_eval.ipynb`](notebooks/spancall_lean_v3_train_eval.ipynb), then [`scripts/compare_llm_spancall.py`](scripts/compare_llm_spancall.py), then the agentic notebook |
+| `v3.3` | 2026-11-20 | `two_step` | 2000 optimiser steps | 0 (313-row disjoint probe) | Tier 1 Fair Eval (`n=1,735` per corpus) + Tier 2 Full Splits (`34,969` rows) | Macro `exact_F`: `0.755` (`0.743` H / `0.766` X) | `Router+Schema`: `0.857` (Gemma 4) / `0.855` (`gpt-oss-120b`); +11.1–11.2 pp over LLMs on xLAM | Offline Tier 1 `Router` / `Router+Schema` / `HybridFill` / `HybridFill+Schema` complete; multi-turn agentic suites (BFCL / $\tau$-bench) are future work | Full audited report in [`results_lean_v3_3/export/final_report.md`](../results_lean_v3_3/export/final_report.md) and §III below |
+
+---
+
+## Section III — Lean v3.3 Paper Benchmark Results (Completed)
+
+Aligned with [`research_paper/sections/05_results.tex`](../research_paper/sections/05_results.tex) and [`07_appendix.tex`](../research_paper/sections/07_appendix.tex).
+
+- **Model & Training:** `answerdotai/ModernBERT-large` (395M, $d=1024$, $L_{\max}=4096$, $W_{\max}=16$, $C \le 1024$, $d_h=256$), 1:1 balanced Hermes V1 (19,096 → 69,412) + xLAM-60k (69,412) = 138,824 records → 117,760 tensorized instances, 3 epochs `bf16`, effective batch 128, cosine decay with 10% floor, seed 42. Macro dev `exact_call`: `0.857 → 0.868 → 0.874` (Epoch 3 restored).
+- **Tier 1 Matched Fair Eval (`data/eval_v3_3/`, $n=1{,}735$ per corpus, $n_F=1{,}277$ [1,108 Normal + 169 Complex], $n_A=458$, 10,000-resample paired bootstrap CIs):**
+
+| System | Hermes `exact_F` | xLAM `exact_F` | **Macro `exact_F`** | Macro Complex `exact_F` | `false_hit_A` ↓ | Mean Lat. (ms) | Mean API Tok / Turn |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **SpanCall v3.3** | `.743` | `.766` | **`.755`** | `.331` | **`.664`** | **77.0** | **0** |
+| `gemma-4-26b-a4b-it` | `.390` | `.778` | `.584` | **`.754`** | `.895` | 7025.6 | 443 |
+| Router (Gemma 4) | `.801` | `.815` | `.808` | `.379` | `.975` | **1364.0** | **88** |
+| **Router+Schema (Gemma 4)** | **`.826`** | **`.889`** | **`.857`** | **`.754`** | `.956` | 2565.6 | 179 |
+| HybridFill (Gemma 4) | `.805` | `.796` | `.800` | `.364` | `.927` | 2958.7 | 225 |
+| HybridFill+Schema (Gemma 4) | `.822` | `.866` | `.844` | `.698` | **`.853`** | 4721.4 | 345 |
+| `gpt-oss-120b` | `.420` | `.777` | `.598` | **`.746`** | `.879` | 2986.7 | 500 |
+| Router (gpt-oss-120b) | `.800` | `.814` | `.807` | `.376` | `.965` | **657.2** | 102 |
+| **Router+Schema (gpt-oss-120b)** | `.821` | **`.889`** | **`.855`** | **`.746`** | `.936` | 1151.1 | 200 |
+| HybridFill (gpt-oss-120b) | `.805` | `.797` | `.801` | `.367` | `.931` | 809.0 | **100** |
+| HybridFill+Schema (gpt-oss-120b) | **`.823`** | `.871` | `.847` | `.710` | **`.862`** | 1446.5 | 177 |
+
+- **Normal vs. Complex (`exact_F`):** SpanCall leads decisively on all-scalar `Normal` calls (`0.798` Hermes vs. `0.360`/`0.397`; `0.840` xLAM vs. `0.755`/`0.755`), while LLMs dominate `Complex` (`array`/`object`) calls (`0.586`/`0.568` Hermes, `0.923` xLAM vs. SpanCall `0.385`/`0.278`).
+- **Tier 2 Full Splits (34,969 rows, standalone SpanCall):** ID eval (`0.708` H / `0.757` X), OOD-Schema (`0.711` H / `0.799` X), OOD-Para (`0.735` H / `0.793` X), Adversarial `false_hit_A` (`0.816` H / `0.788` X).
 
 ---
 

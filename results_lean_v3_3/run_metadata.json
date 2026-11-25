@@ -1,0 +1,25 @@
+{
+  "version": "v3.3",
+  "experiment_name": "spancall_lean_v3_3_modernbert",
+  "seed": 42,
+  "backbone": "answerdotai/ModernBERT-large",
+  "max_seq_len": 4096,
+  "max_cands": 1024,
+  "eval_batch_size": 8,
+  "balance_train_corpora": true,
+  "train_raw_counts": {
+    "hermes": 19096,
+    "xlam": 69412
+  },
+  "train_balanced_counts": {
+    "hermes": 69412,
+    "xlam": 69412,
+    "tensorized_t2": 117760
+  },
+  "dev_counts": {
+    "dev_hermes": 669,
+    "dev_xlam": 2384,
+    "probe": 313
+  },
+  "eval_manifest_template_stamp": "1e62a355a351ae531c64f137a5d66cf873de81c2987829243a1559cda6b25cf2"
+}

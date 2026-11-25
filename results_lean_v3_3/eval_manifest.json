@@ -1,0 +1,411 @@
+{
+  "version": "v3.3",
+  "created_at_utc": "2026-11-19T15:23:45.197247+00:00",
+  "seed": 42,
+  "fair_limit": null,
+  "adv_limit": 5000,
+  "single_call_only": true,
+  "step0_sanitized": true,
+  "source_data_dir": "/content/spancall/data/processed_v3_3",
+  "template_stamp": "1e62a355a351ae531c64f137a5d66cf873de81c2987829243a1559cda6b25cf2",
+  "matched_cell_counts": {
+    "F_func|normal": 1108,
+    "F_func|complex": 169,
+    "A_clean|normal": 119,
+    "A_clean|complex": 168,
+    "A_adv|normal": 106,
+    "A_adv|complex": 65
+  },
+  "filter_stats": {
+    "hermes_eval": {
+      "total_raw": 3426,
+      "dropped_multi_call": 477,
+      "dropped_missing_gt_schema": 644,
+      "dropped_step0_veto": 476,
+      "kept": 1829
+    },
+    "xlam_eval": {
+      "total_raw": 9101,
+      "dropped_multi_call": 0,
+      "dropped_missing_gt_schema": 0,
+      "dropped_step0_veto": 2290,
+      "kept": 6811
+    },
+    "hermes_test_ood_schema": {
+      "total_raw": 3437,
+      "dropped_multi_call": 677,
+      "dropped_missing_gt_schema": 691,
+      "dropped_step0_veto": 470,
+      "kept": 1599
+    },
+    "xlam_test_ood_schema": {
+      "total_raw": 9814,
+      "dropped_multi_call": 0,
+      "dropped_missing_gt_schema": 0,
+      "dropped_step0_veto": 2587,
+      "kept": 7227
+    },
+    "hermes_test_ood_para": {
+      "total_raw": 1558,
+      "dropped_multi_call": 216,
+      "dropped_missing_gt_schema": 0,
+      "dropped_step0_veto": 0,
+      "kept": 1342
+    },
+    "xlam_test_ood_para": {
+      "total_raw": 6876,
+      "dropped_multi_call": 0,
+      "dropped_missing_gt_schema": 0,
+      "dropped_step0_veto": 0,
+      "kept": 6876
+    },
+    "hermes_test_adversarial": {
+      "total_raw": 30934,
+      "dropped_multi_call": 4379,
+      "dropped_missing_gt_schema": 5332,
+      "dropped_step0_veto": 16938,
+      "kept": 4285
+    },
+    "xlam_test_adversarial": {
+      "total_raw": 88327,
+      "dropped_multi_call": 0,
+      "dropped_missing_gt_schema": 0,
+      "dropped_step0_veto": 78197,
+      "kept": 10130
+    }
+  },
+  "splits": {
+    "full_hermes_eval": {
+      "n_rows": 1829,
+      "sample_id_hash": "dad6593a751b25a977c4f472459f555f8570513814c6700551933a032ebfeb4d",
+      "cohort_counts": {
+        "A_adv": 175,
+        "A_clean": 287,
+        "F_func": 1277,
+        "F_json": 90
+      },
+      "complexity_counts": {
+        "complex": 437,
+        "normal": 1392
+      },
+      "tool_bucket_counts": {
+        "1-2": 1677,
+        "3-5": 151,
+        "6-10": 1
+      },
+      "cell_counts": {
+        "A_adv|complex": 69,
+        "A_adv|normal": 106,
+        "A_clean|complex": 168,
+        "A_clean|normal": 119,
+        "F_func|complex": 169,
+        "F_func|normal": 1108,
+        "F_json|complex": 31,
+        "F_json|normal": 59
+      },
+      "filename": "full_hermes_eval.jsonl",
+      "tier": "tier2_full",
+      "corpus": "hermes",
+      "sha256": "df46d8dfcb9c8a364adc67bb95275d7e56c4d2833ea3791a7af8bda6d1b76886"
+    },
+    "full_xlam_eval": {
+      "n_rows": 6811,
+      "sample_id_hash": "6382c70232e045869250783e28f6e7e9623fc300916583f7c4d2fd90df02ece4",
+      "cohort_counts": {
+        "A_adv": 396,
+        "A_clean": 1844,
+        "F_func": 4571
+      },
+      "complexity_counts": {
+        "complex": 1009,
+        "normal": 5802
+      },
+      "tool_bucket_counts": {
+        "1-2": 2694,
+        "3-5": 3462,
+        "6-10": 655
+      },
+      "cell_counts": {
+        "A_adv|complex": 65,
+        "A_adv|normal": 331,
+        "A_clean|complex": 175,
+        "A_clean|normal": 1669,
+        "F_func|complex": 769,
+        "F_func|normal": 3802
+      },
+      "filename": "full_xlam_eval.jsonl",
+      "tier": "tier2_full",
+      "corpus": "xlam",
+      "sha256": "dbf27d300a9c63bc9c988e036775b98d24bf3a5be50f5924a994c83e21735b11"
+    },
+    "full_hermes_test_ood_schema": {
+      "n_rows": 1599,
+      "sample_id_hash": "1ea2052ae09332830f436c7f492a730cd97e541504ebeade76d9513890235962",
+      "cohort_counts": {
+        "A_adv": 145,
+        "A_clean": 250,
+        "F_func": 1204
+      },
+      "complexity_counts": {
+        "complex": 342,
+        "normal": 1257
+      },
+      "tool_bucket_counts": {
+        "1-2": 1446,
+        "3-5": 153
+      },
+      "cell_counts": {
+        "A_adv|complex": 38,
+        "A_adv|normal": 107,
+        "A_clean|complex": 115,
+        "A_clean|normal": 135,
+        "F_func|complex": 189,
+        "F_func|normal": 1015
+      },
+      "filename": "full_hermes_test_ood_schema.jsonl",
+      "tier": "tier2_full",
+      "corpus": "hermes",
+      "sha256": "bd8fbfc36b34b365341d62f8ba2aef5483367fe5d7d87f2350fde7f51bef1bdc"
+    },
+    "full_xlam_test_ood_schema": {
+      "n_rows": 7227,
+      "sample_id_hash": "3a39109b00fce74ec0fe332a5d52127b77bc1b37cf0acb63fc140b7db40fd335",
+      "cohort_counts": {
+        "A_adv": 402,
+        "A_clean": 1815,
+        "F_func": 5010
+      },
+      "complexity_counts": {
+        "normal": 7227
+      },
+      "tool_bucket_counts": {
+        "1-2": 2974,
+        "3-5": 3836,
+        "6-10": 417
+      },
+      "cell_counts": {
+        "A_adv|normal": 402,
+        "A_clean|normal": 1815,
+        "F_func|normal": 5010
+      },
+      "filename": "full_xlam_test_ood_schema.jsonl",
+      "tier": "tier2_full",
+      "corpus": "xlam",
+      "sha256": "4fd3efe0742a6934bbc64f1332225fbae9deae0273825075984e5598afa924e4"
+    },
+    "full_hermes_test_ood_para": {
+      "n_rows": 1342,
+      "sample_id_hash": "ad482805ef1781484dcafcab2d3ad816e9ec7abc62cab51aa5c6c5c6aae38281",
+      "cohort_counts": {
+        "A_clean": 1,
+        "F_func": 1287,
+        "F_json": 54
+      },
+      "complexity_counts": {
+        "complex": 154,
+        "normal": 1188
+      },
+      "tool_bucket_counts": {
+        "1-2": 1247,
+        "3-5": 95
+      },
+      "cell_counts": {
+        "A_clean|complex": 1,
+        "F_func|complex": 148,
+        "F_func|normal": 1139,
+        "F_json|complex": 5,
+        "F_json|normal": 49
+      },
+      "filename": "full_hermes_test_ood_para.jsonl",
+      "tier": "tier2_full",
+      "corpus": "hermes",
+      "sha256": "1ad9247f0adbdbcdbc56e819689d78f70b02c3a7c58b4501df1f493b53fc44ef"
+    },
+    "full_xlam_test_ood_para": {
+      "n_rows": 6876,
+      "sample_id_hash": "5f9b0688b0a9d04faf56a989364734cddde7bb056c943958ef30f4f5672b5703",
+      "cohort_counts": {
+        "A_clean": 8,
+        "F_func": 6868
+      },
+      "complexity_counts": {
+        "complex": 420,
+        "normal": 6456
+      },
+      "tool_bucket_counts": {
+        "1-2": 2771,
+        "3-5": 3561,
+        "6-10": 544
+      },
+      "cell_counts": {
+        "A_clean|complex": 8,
+        "F_func|complex": 412,
+        "F_func|normal": 6456
+      },
+      "filename": "full_xlam_test_ood_para.jsonl",
+      "tier": "tier2_full",
+      "corpus": "xlam",
+      "sha256": "452e0947f908f7b47705ccf37dbdfd885f3b38304e123a835daa761263465aca"
+    },
+    "full_hermes_test_adversarial": {
+      "n_rows": 4285,
+      "sample_id_hash": "b134e207ab0945333832fe8be20634a89e94c5708edce17cbeec8095bcf0dee9",
+      "cohort_counts": {
+        "A_adv": 4285
+      },
+      "complexity_counts": {
+        "complex": 1151,
+        "normal": 3134
+      },
+      "tool_bucket_counts": {
+        "1-2": 3912,
+        "3-5": 371,
+        "6-10": 2
+      },
+      "cell_counts": {
+        "A_adv|complex": 1151,
+        "A_adv|normal": 3134
+      },
+      "filename": "full_hermes_test_adversarial.jsonl",
+      "tier": "tier2_full",
+      "corpus": "hermes",
+      "sha256": "3d0ee362c72480503d97ac0928a94fbc253556efabb21907ae62da4f14b1c052"
+    },
+    "full_xlam_test_adversarial": {
+      "n_rows": 5000,
+      "sample_id_hash": "f7cecfeb431a158648925d8c902d23abd20ed2c8512ef71e4e0d9ba8e629f17f",
+      "cohort_counts": {
+        "A_adv": 5000
+      },
+      "complexity_counts": {
+        "complex": 747,
+        "normal": 4253
+      },
+      "tool_bucket_counts": {
+        "1-2": 2043,
+        "3-5": 2493,
+        "6-10": 464
+      },
+      "cell_counts": {
+        "A_adv|complex": 747,
+        "A_adv|normal": 4253
+      },
+      "filename": "full_xlam_test_adversarial.jsonl",
+      "tier": "tier2_full",
+      "corpus": "xlam",
+      "sha256": "8a3e3eae389bda2ad66e6d6f6fd32841baa49c49ca9069cd31ac3ea0f36ab9bd"
+    },
+    "fair_hermes_eval": {
+      "n_rows": 1735,
+      "sample_id_hash": "83774378f2c4d3b65808c7519de22d3500e0cadfe4cb9a0a46cd9e58eb3e07ef",
+      "cohort_counts": {
+        "A_adv": 171,
+        "A_clean": 287,
+        "F_func": 1277
+      },
+      "complexity_counts": {
+        "complex": 402,
+        "normal": 1333
+      },
+      "tool_bucket_counts": {
+        "1-2": 1583,
+        "3-5": 151,
+        "6-10": 1
+      },
+      "cell_counts": {
+        "A_adv|complex": 65,
+        "A_adv|normal": 106,
+        "A_clean|complex": 168,
+        "A_clean|normal": 119,
+        "F_func|complex": 169,
+        "F_func|normal": 1108
+      },
+      "filename": "fair_hermes_eval.jsonl",
+      "tier": "tier1_fair",
+      "corpus": "hermes",
+      "sha256": "72f80719c27556581857052316456d7e2d9d6b8c8beddb8dfd5e875db8b5e5f3"
+    },
+    "fair_xlam_eval": {
+      "n_rows": 1735,
+      "sample_id_hash": "00643855a42408a3bd333159212e124f9d107166a156235c6b6f158c86670b4a",
+      "cohort_counts": {
+        "A_adv": 171,
+        "A_clean": 287,
+        "F_func": 1277
+      },
+      "complexity_counts": {
+        "complex": 402,
+        "normal": 1333
+      },
+      "tool_bucket_counts": {
+        "1-2": 713,
+        "3-5": 856,
+        "6-10": 166
+      },
+      "cell_counts": {
+        "A_adv|complex": 65,
+        "A_adv|normal": 106,
+        "A_clean|complex": 168,
+        "A_clean|normal": 119,
+        "F_func|complex": 169,
+        "F_func|normal": 1108
+      },
+      "filename": "fair_xlam_eval.jsonl",
+      "tier": "tier1_fair",
+      "corpus": "xlam",
+      "sha256": "b34ca47b7e99f94ba862f6a97fb7a1cfd777b4a18d8e9acd0ae1403aca9f8b1a"
+    },
+    "fair_eval_combined": {
+      "n_rows": 3470,
+      "sample_id_hash": "e45f1bbfe6a156584fed3c057485e65823322e179c235ee2f527f6cb14cb3423",
+      "cohort_counts": {
+        "A_adv": 342,
+        "A_clean": 574,
+        "F_func": 2554
+      },
+      "complexity_counts": {
+        "complex": 804,
+        "normal": 2666
+      },
+      "tool_bucket_counts": {
+        "1-2": 2296,
+        "3-5": 1007,
+        "6-10": 167
+      },
+      "cell_counts": {
+        "A_adv|complex": 130,
+        "A_adv|normal": 212,
+        "A_clean|complex": 336,
+        "A_clean|normal": 238,
+        "F_func|complex": 338,
+        "F_func|normal": 2216
+      },
+      "filename": "fair_eval_combined.jsonl",
+      "tier": "tier1_fair",
+      "corpus": "combined",
+      "sha256": "7acbac7caa3becd49e2d551ea0d26d50b811bfd0b3309e99f7358314a97a67ce"
+    },
+    "hermes_eval_f_json": {
+      "n_rows": 90,
+      "sample_id_hash": "5136656ee974529e2a1dcae45fc0adf1a8850eececbc4db663a8ab0237d363fc",
+      "cohort_counts": {
+        "F_json": 90
+      },
+      "complexity_counts": {
+        "complex": 31,
+        "normal": 59
+      },
+      "tool_bucket_counts": {
+        "1-2": 90
+      },
+      "cell_counts": {
+        "F_json|complex": 31,
+        "F_json|normal": 59
+      },
+      "filename": "hermes_eval_f_json.jsonl",
+      "tier": "auxiliary",
+      "corpus": "hermes",
+      "sha256": "2b091ba29f07b503145bbeb3a4946bf47ab4b5b0581eaf632e5fd38a189ebc28"
+    }
+  }
+}

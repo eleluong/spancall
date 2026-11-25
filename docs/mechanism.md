@@ -1,5 +1,8 @@
 # SpanCall Mechanism: How a Full-Parameter Call Is Resolved in One Pass
 
+> [!NOTE]
+> **Historical Design Spec:** This document captures the early v1/v2 mechanism design (including `[PARAM]` bracket notation, ~150M / `Qwen3-Embedding-0.6B` sizing, and no-hybrid scoping). For the **current v3.3 implementation and paper** (`ModernBERT-large` 395M, `<|...|>` atomic markers, object-leaf flattening, two-step $T=1$ focus decoding, and zero-training `Router+Schema` / `HybridFill+Schema` collaboration), see [`README.md`](../README.md), [`MODEL_CARD.md`](../MODEL_CARD.md), [`docs/heads.md`](heads.md), and [`research_paper/sections/03_methodology.tex`](../research_paper/sections/03_methodology.tex).
+
 Companion to [proposal.md](proposal.md). The proposal says *what* we claim; this document says *how it works*, mechanically, and where it can break.
 
 ---

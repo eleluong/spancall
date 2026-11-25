@@ -1,6 +1,15 @@
-# Research & System Proposal: **SpanCall** (Revised — Speculative Fast Path for Tool-Calling)
+# Research & System Proposal: **SpanCall** (Historical Pre-Implementation Proposal)
 
-**Title:** *SpanCall: A Lightweight High-Confidence Fast Path for Context-Ready Tool Calls, with Full Abstention to Normal LLM Tool-Calling*
+> [!NOTE]
+> **Historical Design Document:** This file is the original pre-implementation proposal. For the **current paper, implemented Lean v3.3 architecture, and benchmark results**, see [`README.md`](../README.md), [`MODEL_CARD.md`](../MODEL_CARD.md), [`docs/architecture.md`](architecture.md), and [`research_paper/main.tex`](../research_paper/main.tex).
+>
+> Key evolutions from this proposal to the published v3.3 system:
+> - **Backbone:** `answerdotai/ModernBERT-large` (395M, $d=1024$, $L_{\max}=4096$) rather than ~150M / DeBERTa-v3-base.
+> - **Marker grammar:** atomic `<|...|>` special tokens (`template_multi.jinja`, `build_input_multi`) plus depth-3 nested `object` leaf flattening (`spancall/data/flatten.py`).
+> - **Decoding:** two-step $T=1$ focus re-encoding (`resolve_mode="two_step"`) with exclusivity-constrained DFS ($\Delta_{\text{joint}} \ge 0.02$).
+> - **LLM collaboration:** alongside whole-call abstention routing (`Router`), the current paper introduces zero-training post-$H_1$ schema-type routing (`Router+Schema`) and plain-JSON partial completion (`HybridFill` / `HybridFill+Schema`).
+
+**Original Proposal Title:** *SpanCall: A Lightweight High-Confidence Fast Path for Context-Ready Tool Calls, with Full Abstention to Normal LLM Tool-Calling*
 
 ---
 

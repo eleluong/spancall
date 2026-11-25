@@ -24,15 +24,16 @@ defaults:
 
 models:
   - slug: gpt-oss-120b
+    model_env: BASE_LLM_MODEL
     model: openai/gpt-oss-120b
-    base_url_env: LLM_BASE_URL
-    api_key_env: LLM_API_KEY
+    base_url_env: BASE_URL
+    api_key_env: API_KEY
     enabled: true
 
   - slug: qwen3-32b
     model: Qwen/Qwen3-32B
-    base_url_env: LLM_BASE_URL
-    api_key_env: LLM_API_KEY
+    base_url_env: BASE_URL
+    api_key_env: API_KEY
     enabled: false
 
   - slug: gpt-4o-mini

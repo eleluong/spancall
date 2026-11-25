@@ -1,112 +1,78 @@
 # SpanCall — Project State
 
-*Snapshot: 2026-11-16 · Lean v3 (two-step-only resolution, corpus × tool-count stratified eval, W&B + mid-training probe eval, three-mode agentic comparison) · 717 local tests passing*
+*Snapshot: 2026-11-25 · Lean v3.3 (paper-aligned: `ModernBERT-large` 395M, 1:1 balanced Hermes V1 + xLAM-60k training, frozen Tier 1 Fair Eval + Tier 2 34,969-row ID/OOD/Adversarial eval, zero-training `Router+Schema` & `HybridFill+Schema` collaboration) · Paper: ["Not Every Tool Call Needs Generation: Function Calling as Span Extraction"](research_paper/main.tex)*
 
 ---
 
 ## 1. What the project is for
 
-**SpanCall** is a research system for a *speculative fast path* for tool-calling agents, as an alternative to letting an autoregressive LLM generate `tool_call` JSON token-by-token (25–35 sequential steps per call).
+**SpanCall** is a non-autoregressive extractive function-calling system built on `answerdotai/ModernBERT-large` (395M, $d=1024$, 28 layers, $L_{\max}=4096$) that replaces sequential JSON decoding on groundable tool calls (**Stratum F**) with a single parallel pointer pass—and pairs cleanly with any off-the-shelf LLM via zero-training schema-aware routing (**Router+Schema**, **HybridFill+Schema**) when a call crosses the extractive boundary (`array`/`object` schemas or abstentions).
 
-### 1.1 Problem
+### 1.1 Core mechanism (Lean v3.3)
 
-Mainstream tool-calling relies on autoregressive LLMs generating JSON token-by-token: flexible, but slow, compute-heavy, and prone to inventing enum values or altering entities. Real production traffic (search filters, CRM, booking, IoT, ERP) is heavily skewed: a large majority of calls reuse a small set of schemas and a smaller set of phrase patterns — verbatim entities, "direct/non-stop", "next week", "business class", "today/tomorrow", literal numbers. These are cases where extractive, span-based prediction is structurally safer and faster than generation.
+1. **Schema-grounded serialization (`span_template/` + `spancall/data/flatten.py`):** Candidate tools (`<|tool|>`), parameters (`<|param|>`), and `<|none|>` anchors are serialized alongside the R7-sanitized utterance and a canonical literal pool $\Omega$ (`<|ctx_meta|>`, `<|ctx_time|>`, `<|ctx_enum|>`, `<|ctx_recent|>`). Nested `object` parameters up to depth 3 are flattened into scalar dotted leaves (`filters.color`) and reconstructed after extraction.
+2. **Anchor-conditioned two-head encoder (`spancall/lean/model.py`, `spancall/model/heads.py`):**
+   - **$H_1$ Tool Head (`ToolHead`):** 2-layer GELU MLP scoring `MLP([h_tool; h_cls])` under randomized multi-tool packing (up to 6 distractors), enabling zero-shot generalization to unseen schemas (>99.5% pre-gate tool accuracy).
+   - **$H_3$ Boundary-Factorized Pointer (`LeanPointerHead`):** Type-filtered candidate scoring ($W_{\max}=16$, $C \le 1024$, $d_h=256$) with learned width bias $r(\min(j-i, W_{\max}))$.
+3. **Exclusivity-constrained two-step DFS (`spancall/lean/decode.py`, `spancall/lean/resolver.py`):** Value probability aggregation across repeated mentions → non-overlapping scalar DFS yielding joint log-margin $\Delta_{\text{joint}} \ge 0.02$ → strict type casting, unflattening, collapse guard, and JSON Schema validation. Two-step focus (`resolve_mode="two_step"`) re-encodes a compact $T=1$ sequence for $\hat{t}$ so the full $C=1024$ candidate budget serves $\hat{t}$.
+4. **Zero-training LLM collaboration (`spancall/eval/llm_parity.py`, `spancall/eval/hybrid_fill.py`, `spancall/agent/`):**
+   - **Router / Router+Schema:** Whole-call speculative routing; `Router+Schema` adds a deterministic post-$H_1$ schema-type gate that delegates declared `array`/`object` tools and abstentions to the LLM (zero ground-truth labels).
+   - **HybridFill / HybridFill+Schema:** Keeps 100% of tool selection on $H_1$ and preserves grounded scalars, invoking the LLM once in plain JSON mode (`tools=[]`, `response_format=json_object`) to fill only unresolved or complex parameters.
 
-### 1.2 Core mechanism (Lean Flow)
+### 1.2 Input contract — unified marker grammar (`span_template/`)
 
-1. For the **easy majority** of tool calls — where every argument is already present, extractable, and context-ready (verbatim entities, literals, booleans, schema enums, literal dates) — a compact bidirectional encoder (`SpanCallTransformerEncoder`) + **Lean 2-head stack** (`ToolHead` / `BinaryToolHead` H1 + `LeanPointerHead` H3) emits the **complete payload in one forward pass**.
-2. Parameter values are **0-indexed span-selection operations** over valid candidates from the utterance + a deterministic **Virtual Context Pool** (anchored dates, booleans, schema enums, recent turns), scored by `LeanPointerHead` with **no in-head abstain shortcut** (preventing the abstain-collapse seen in v1).
-3. **Whole-call gating** is enforced at serve time by `LeanResolver` via H1 tool confidence (`call_min_prob`, `call_min_prob_ratio`, or `BinaryToolHead` `tool_call_threshold`), H3 posterior margin (`min_joint_margin`), and deterministic `StrictTypeCaster` + `SchemaValidator`. If any required parameter fails or confidence falls below gate thresholds, the resolver **abstains entirely** and the agent runs its **normal, unchanged LLM tool call**.
-4. **Pluggable Agent Compatibility:** `ToolCallRouter` and `ReActAgentLoop` program against a version-agnostic `BaseResolver` / `BaseResolveResult` boilerplate contract (`spancall/infer/base.py`), allowing `LeanResolver` (v2) and any future v2.x / v3 resolver to drop in seamlessly.
-
-### 1.3 Input contract — the unified marker grammar template (`span_template/`)
-
-Both alignment/training and online serving render through the unified multi-tool grammar (`build_input_multi`, `span_template/template_multi.jinja`), guarded by a cryptographic template stamp (`span_template/stamp.py`):
+Both alignment/training and online serving render through `build_input_multi` (`span_template/template_multi.jinja`), guarded by a cryptographic template stamp (`span_template/stamp.py`, v3.3 stamp `1e62a355a351...`):
 
 ```text
 <|cls|> <|tool|> ... <|param|> ... <|none|> <|sep|> <|ctx_meta|> <|ctx_time|> <|ctx_enum|> <|sep|> utterance <|sep|> <|ctx_recent|> <|eos|>
 ```
 
-Contract rules R1–R9:
-- **R1/R2** quoting — values are quoted forms; no free text token can be confused with a value
-- **R3** targetable region Ω — only the query + context pool are span-selection targets
-- **R4** equal-value probability aggregation & all-or-nothing whole-call gating
-- **R5** time window — `<|ctx_time|>` holds anchored, pre-resolved dates
-- **R6** enum pool — `<|ctx_enum|>` enumerates the schemas' allowed values
-- **R7** sanitization — enforced in `span_template/sanitize.py` before rendering
-- **R8** entry-snapped spans — span boundaries snap to token entries
-- **R9** validity masks — only valid candidate positions score (`CandidateMaskBuilder`)
+---
+
+## 2. Lean v3.3 Paper Benchmark Summary (Completed)
+
+- **Training:** 1:1 balanced Hermes V1 (19,096 → 69,412 with distinct distractor-packing seeds) + xLAM-60k (69,412) = 138,824 records → **117,760** tensorized training instances; `ModernBERT-large` fine-tuned 3 epochs (`bf16`, effective batch 128, cosine decay with 10% floor, seed 42). Held-out macro dev `exact_call` rises monotonically `0.857 → 0.868 → 0.874` (Epoch 3 restored).
+- **Tier 1 Matched Fair Eval (`data/eval_v3_3/`, $n=1{,}735$ per corpus, $n_F=1{,}277$ [1,108 Normal + 169 Complex], $n_A=458$):**
+  - **Standalone SpanCall:** **0.755** macro `exact_F` (0.743 Hermes / 0.766 xLAM), **0.801** macro `param_F1`, **77.0 ms** mean latency (Colab A100, batch 8), **0** generation tokens, **0** duplicate-span collapse, 4×–19× fewer entity swaps than hosted LLMs. Leads decisively on **Normal all-scalar calls** (0.798 Hermes, 0.840 xLAM vs. 0.360–0.397 and 0.755 for Gemma 4 / `gpt-oss-120b`).
+  - **Router (abstention-only):** **0.807–0.808** macro `exact_F` (~80% token savings, 4.5×–5.2× lower mean latency).
+  - **Router+Schema (post-$H_1$ schema gate):** **0.857** (Gemma 4) / **0.855** (`gpt-oss-120b`) macro `exact_F` (**0.889** on xLAM, +11.1–11.2 pp over either LLM), 100% complex recovery, **~60%** API token savings.
+  - **HybridFill+Schema (plain-JSON partial fill):** **0.844** (Gemma 4) / **0.847** (`gpt-oss-120b`) macro `exact_F`, 38%–61% lower xLAM prompt tokens, lowest Stratum A false calls (**0.853–0.862**, safer than both standalone LLMs), and 64.5% total token reduction on concise-reasoning `gpt-oss-120b`.
+- **Tier 2 Full Splits (34,969 rows):** Zero-shot OOD-Schema (`0.711` Hermes / `0.799` xLAM) and OOD-Para (`0.735` / `0.793`) match or exceed ID eval (`0.708` / `0.757`). Standalone Stratum A abstention remains the main open gap (`false_hit_on_A` 0.638–0.690 on Tier 1; 0.788–0.816 on adversarial splits).
+
+See [`README.md`](README.md), [`MODEL_CARD.md`](MODEL_CARD.md), [`docs/experiments.md`](docs/experiments.md), and [`results_lean_v3_3/export/final_report.md`](results_lean_v3_3/export/final_report.md) for complete tables.
 
 ---
 
-## 2. Implemented Stack & Key Milestones
+## 3. Lean v3.x Engineering Invariants
 
-### 2.1 Hermes Function-Calling V1 Integration & v2 Re-Alignment (`spancall/data/`)
-
-- `spancall/data/sources/hermes.py` (`HermesLoader`) ingests all 5 configs of `NousResearch/hermes-function-calling-v1` (10,693 rows, 92.4% ingestion, zero silent drops) into canonical `UnifiedSample` records.
-- `spancall/data/partition.py` (`partition_schema_disjoint`) splits schemas disjointly across `train / dev / calib / eval / test_ood_schema / test_ood_para / test_adversarial`.
-- **Lean v2 Re-alignment (`scripts/realign_v2.py` + `spancall/data/align.py`):**
-  - Renders with `build_input_multi` (matching tensorize and resolver grammar) and emits render-invariant `utt_rel_start` / `utt_rel_end` offsets alongside absolute offsets into `data/processed_v2/`.
-  - Stamps datasets with `template_stamp.json` (`span_template/stamp.py`) and enforces `utterance_span_stale_rate < 0.02` before training.
-
-### 2.2 Lean Model, Loss, Tensorizer, and Trainer (`spancall/lean/`)
-
-- `spancall/lean/model.py` — `LeanPointerHead` (0-indexed `(B, K, C)` span scorer) + `LeanSpanCallModel` (`encoder` + `ToolHead` or `BinaryToolHead` + `LeanPointerHead`).
-- `spancall/lean/loss.py` — `LeanLossContainer`: multi-positive pointer cross-entropy (`PAD_INDEX = -1` ignored) + single/multi-call softmax CE or independent binary BCE (`use_binary_tool_head=True`).
-- `spancall/lean/tensorize.py` — `tensorize_sample_lean`, `ToolPool` (`jitter_pack_tools=True` distractor tool packing), `LeanBatchCollate` with explicit `PAD_INDEX_KEYS`.
-- `spancall/lean/trainer.py` + `scripts/train_lean.py` — `LeanTrainer`: length-bucketed micro-batching, slot-weighted `_MicroLossAccumulator` (batch-composition-invariant train/eval loss), differential LR + layerwise decay, optional LoRA (`use_lora`), early stopping (`early_stopping_patience`, `restore_best_on_exit`).
-
-### 2.3 Lean Decoder, Resolver, Part-1 Eval & Diagnostics (`spancall/lean/`)
-
-- `spancall/lean/decode.py` — `LeanJointDecoder`: equal-value aggregation (R4), top-K collapse, DFS exclusivity-constrained assignment, and `joint_margin`.
-- `spancall/lean/resolver.py` — `LeanResolver`: single-pass multi-tool encoding reuse (`encoded_bundle`), multi-call emission (`max_calls`, `call_min_prob`, `call_min_prob_ratio`, or sigmoid `tool_call_threshold`), calibrated `min_joint_margin` gate (W2), `StrictTypeCaster` + `SchemaValidator`, and render-invariant candidate parity tracking.
-- `spancall/lean/eval_p1.py` & `spancall/lean/diagnostics.py` — Part-1 retrieval-first evaluation (`eval_param_extraction_lean`), `run_diagnostics`, `analyze_predictions`, and `audit_gt_offsets`.
-
-### 2.4 Shareable Boilerplate & Pluggable Agent Harness (`spancall/infer/`, `spancall/agent/`, `spancall/eval/`)
-
-- **Shareable ABCs:** `BaseDatasetLoader`, `BaseAligner`, `BaseAugmenter` (`spancall/data/base.py` + loader shells in `spancall/data/sources/`), `BaseEncoder` (`spancall/model/encoder.py`), `BaseHead` (`spancall/model/heads.py`), `BaseResolver`, `BaseResolveResult`, `BaseJointDecoder`, `BaseTypeCaster`, `BaseExporter` (`spancall/infer/`), `BaseTrainer`, `BaseCalibrator`, `CosineWarmupSchedule` (`spancall/train/`).
-- **Agent Router & Loop (`spancall/agent/`):** `ToolCallRouter` (`LLM_ONLY`, `SPANCALL_ONLY`, `ROUTER`, `HYBRID_FILL`, `SHADOW`; `s_skip`, `s_inject`), `ReActAgentLoop`, `UniversalAPIBackend` / `LocalVLLMBackend`, `MockBookingEnvironment`.
-- **Offline & Agentic Evaluators (`spancall/eval/`):** `ToolCallEvaluator` (Part-3 7-bucket taxonomy, risk-coverage, ECE, `B1aBaseline`), `ComparativeEvaluator` (10k paired bootstrap CI, non-inferiority test), `MultiSeedAgentEvaluator`, `CostModel`.
-
-### 2.5 Lean v3 Protocol (`notebooks/*_v3_*.ipynb`, `scripts/`)
-
-v3 changes the **reporting contract**, not just the numbers, so its results are not diffable against v2.x columns. Seven invariants:
-
-1. **Two-step only.** `single_pass` is retired, not deprioritised: `LeanResolver` resolves `tool → params` in two decodes. `LeanResolver.__init__` now **defaults `resolve_mode` to `two_step`**, and `single_pass` remains constructible only when named, so a run cannot inherit the retired arm by omission. Consumers still pin the mode explicitly — the train/eval notebook in the resolver construction, the agentic notebook in the rebuild path, and `resolve_config.json` in the export — so the mode a run used is readable at the call site rather than inferred from a library default.
-2. **`head_dim` is architecture.** The HF export writes `head_dim` into `resolve_config.json`. A consumer that rebuilds `LeanSpanCallModel` without it silently gets the 256 default and loads a state dict with `strict=False` while leaving `pointer_head` mis-dimensioned; the agentic notebook therefore reads the exported value and **aborts** if any `pointer_head` / `tool_head` key fails to load.
-3. **Hub weights are loaded with `weights_only=True`.** `model.pt` crosses a trust boundary (it is fetched over the network), so the agentic reload unpickles it with arbitrary code execution disabled and **aborts** rather than falling back to `weights_only=False` if the file is not a plain tensor dict. A pickle from the Hub runs with the notebook's credentials in scope; "my own repo" is not an enforcement policy.
-4. **Mid-training probe eval.** `LeanTrainer` evaluates a small probe set every `probe_every_steps` (1000) **optimiser** steps rather than once per epoch, appending `event="probe_eval"` records to `train_log.jsonl` and logging `probe/*` to W&B (`probe/eval_loss`, `probe/exact_call`, `probe/span_acc`, `probe/tool_acc`). The probe set (`PROBE_SPLIT="probe"`, `PROBE_N=300`) is drawn from `PROBE_SOURCES` and filtered against the dev `sample_id` set; `overlap_with_dev` is **printed, not asserted**, so it must be read as 0 before the curve is trusted. It is a cadence signal, never a substitute for the large eval.
-5. **Stratified eval.** Corpus separation is at the **split** level, not a nested key: `hermes_eval` and `xlam_eval` are scored as their own slices, each carrying one corpus. Tool-count buckets come from `TOOL_BUCKET_EDGES` (`1-2`, `3-5`, `6-10`, `11+`) and land in the **filename** (`toolcall_metrics_<split>_<bucket>_<system>.json`). §4.0b prints the eval-set corpus × bucket **row counts** before any metric table, and §5c prints the corpus × bucket metric pivot — so a flat aggregate cannot hide a bucket regression, and a slice that gained 20-distractor-tool rows cannot be mistaken for a model improvement.
-6. **LLM parity.** `scripts/compare_llm_spancall.py` scores an LLM and the lean path on the *same* samples through the same `ToolCallEvaluator`, adds a SpanCall→LLM fallback merge arm, and prints the corpus × bucket pivot. Credentials come from the environment only.
-7. **Three agentic modes (on the `v3.2` checkpoint).** `spancall_lean_v3_2_agentic.ipynb` loads `convoicon/spancall-lean-v3-2` and compares exactly three integrations: `LLM_ONLY`, `ROUTER` (SpanCall with full LLM fallback on abstain), and `HYBRID_FILL` (SpanCall predicts the call skeleton, the LLM fills only `unresolved_param_names`, `merge_filled_arguments` never overwriting a resolved value, schema validation falling back to the full LLM call on failure). `spancall/agent/fill.py` holds the helpers. The resolver is built from `resolve_config.json`, with `max_cands=1024` pinned explicitly (it is a resolver search width, absent from the export, and the library default of 2048 is not the `v3.2` value), and both collapse guards defaulting to `True`. Credentials follow the same env → `.env` → prompt order as the other `v3.2` notebooks.
-
-Notebooks that require API keys (LLM calls, HF push, W&B) are **never committed** — `.gitignore` excludes `notebooks/*_llm_*.ipynb`, `notebooks/*_hf_push*.ipynb`, `notebooks/*_agentic*.ipynb`, and `wandb/`.
+1. **Two-step only.** `LeanResolver` defaults `resolve_mode="two_step"` (`tool → params` with $T=1$ focus re-encode); `single_pass` is retired.
+2. **`head_dim` & `max_cands` are explicit in `resolve_config.json`.** Consumers rebuild `LeanSpanCallModel` and `LeanResolver` from `resolve_config.json` (`head_dim=256`, `max_cands=1024`, `min_joint_margin=0.02`, `collapse_guard=True`, `prevent_param_collapse=True`).
+3. **Safe Hub loading.** `spancall.hub.load_resolver` loads `model.pt` with `torch.load(..., weights_only=True)`. (The legacy `LeanResolver.load_checkpoint` still uses `weights_only=False`; use `load_resolver` for untrusted/Hub weights.)
+4. **Frozen manifest integrity.** `data/eval_v3_3/manifest.json` locks SHA256 hashes of all 12 eval splits and the template stamp; `scripts/export_v3_3_results.py` enforces byte-identical parity between Colab SpanCall runs and local LLM runs.
+5. **Secret hygiene.** API keys live only in environment variables or gitignored `.env` (see `.env.example`); notebooks with API keys are gitignored.
 
 ---
 
-## 3. Component Status Overview
+## 4. Component Status Overview
 
 | Component | Status | Notes |
 | --- | --- | --- |
-| `span_template/` — template render, parser, sanitize, stamp | ✅ | `build_input_multi`, `resolve_utterance_span`, `stamp.py` template hash guard |
-| `spancall/data/` — schema, align, augment, mix, partition, sources | ✅ | `HermesLoader` (5 configs) + v2 `ReverseAligner` (`utt_rel_*`) + shareable loader stubs (`xlam`, `glaive`, `toolbench`, `bfcl`, `tau_bench`) |
+| `span_template/` — template render, parser, sanitize, stamp | ✅ | `build_input_multi`, `resolve_utterance_span`, R7 sanitization, SHA256 template stamp |
+| `spancall/data/` — schema, align, flatten, augment, mix, partition, sources | ✅ | `HermesLoader`, `XLAMLoader`, depth-3 object-leaf flattening (`flatten.py`), render-invariant `utt_rel_*` alignment |
 | `spancall/model/` — `encoder.py`, `masks.py`, `heads.py` | ✅ | `SpanCallTransformerEncoder`, `CandidateMaskBuilder`, `BaseHead`, `ToolHead`, `BinaryToolHead` |
-| `spancall/lean/` — `model`, `loss`, `tensorize`, `trainer`, `decode`, `resolver`, `eval_p1`, `diagnostics` | ✅ | Primary active training, inference, and Part-1 evaluation stack |
-| `spancall/infer/` — `base`, `cast`, `clock`, `export` | ✅ | `BaseResolver` / `BaseResolveResult` boilerplate, `StrictTypeCaster` (Q4/Q5), `SchemaValidator` (Q6), clock utils |
-| `spancall/train/` — `base`, `config` | ✅ | `TrainingConfig` YAML loader + `BaseTrainer`, `BaseCalibrator`, `CosineWarmupSchedule` |
-| `spancall/agent/` & `spancall/eval/` | ✅ | Pluggable `ToolCallRouter`, `ReActAgentLoop`, `ToolCallEvaluator`, `ComparativeEvaluator`, `CostModel` |
-| `notebooks/spancall_lean_v2_train_eval.ipynb` | ✅ | Built and AST-scope-guarded by `scripts/build_lean_v2_colab_notebook.py` |
-| `notebooks/spancall_lean_v3_train_eval.ipynb` | ✅ | Built by `scripts/build_lean_v3_colab_notebook.py`: two-step-only, W&B logging, probe eval every 1k optimiser steps, corpus × tool-count stratification, guarded HF push. Cell guard + 38 v3 regression tests |
-| `notebooks/spancall_lean_v3_2_agentic.ipynb` | ✅ (gitignored) | Built by `scripts/build_lean_v3_agentic_notebook.py`. Targets the **`v3.2`** export (`convoicon/spancall-lean-v3-2`, `results_lean_v3_2/`), pins `max_cands=1024`, and has exactly three modes (`LLM_ONLY`, `ROUTER`, `HYBRID_FILL`). Credentials resolve env → `.env` → prompt (`getpass` for secrets, reported only as `<set>`), so it runs with or without a key. `.gitignore` excludes it |
-| `notebooks/spancall_lean_v3_2_llm_baseline.ipynb` | ✅ (gitignored) | Built by `scripts/build_llm_baseline_notebook.py`. The reviewer-proof replacement for the `B1a` regex baseline: **one** hosted LLM via the **OpenAI SDK** (no litellm, no local weights) scored on the *same rows, same order, same* `ToolCallEvaluator` as the frozen v3.2 predictions. Reuses `scripts/compare_llm_spancall.py` helpers rather than re-implementing them. `EVAL_LIMIT=2000` is pinned to the training notebook's sampling limit because it is the **population definition**, not a knob. Setup is split §0a (`!git clone` / `%pip`) / §0b (pure-Python config) so the build-time name guard can see the names every later cell depends on; `--check` detects drift and a rebuild preserves executed outputs, which are the only copy of a paid run since `.gitignore` excludes the notebook |
-| `scripts/compare_llm_spancall.py` | ✅ | LLM vs SpanCall parity on identical samples through `ToolCallEvaluator`; 4 systems incl. fallback merge, corpus × bucket pivot, env-only keys |
-| `tests/test_notebook_v3_fixes.py` | ✅ | 39 tests: two-step enforcement, `head_dim` round-trip, `weights_only=True` on hub weights, stratification totality, probe/W&B key parity with `TrainingConfig`, three-mode contract, secret scan |
+| `spancall/lean/` — `model`, `loss`, `tensorize`, `trainer`, `decode`, `resolver`, `eval_p1`, `diagnostics` | ✅ | Primary active v3.3 training, two-step inference, and Part-1 evaluation stack |
+| `spancall/infer/` — `base`, `cast`, `clock`, `export` | ✅ | `BaseResolver` / `BaseResolveResult`, `StrictTypeCaster`, `SchemaValidator`, clock utils |
+| `spancall/combine.py`, `spancall/hub.py` | ✅ | Public API: `SpanCallLLM` (6 policies), `load_resolver`; lazy top-level exports (`from spancall import SpanCallLLM`) |
+| `spancall/agent/` — `router`, `loop`, `fill`, `context`, `trace`, `backends`, `tools` | ✅ | Version-agnostic `ToolCallRouter`, `ReActAgentLoop`, `fill.py`, API/local backends |
+| `spancall/eval/` — `toolcall`, `agentic`, `llm_parity`, `hybrid_fill`, `compare`, `cost` | ✅ | `ToolCallEvaluator`, paired bootstrap CIs, `Router`/`Router+Schema`, `HybridFill`/`HybridFill+Schema` |
+| `scripts/` — v3.3 pipeline CLIs | ✅ | `build_fair_eval_v3_3.py`, `build_lean_v3_3_train_eval_notebook.py`, `eval_llm_local.py`, `eval_hybrid_fill.py`, `export_v3_3_results.py` |
+| `research_paper/` — ACL LaTeX manuscript | ✅ | Aligned with v3.3 audited results (`main.tex`, `sections/`, `figures/`, `Makefile`) |
+| `README.md` & `MODEL_CARD.md` | ✅ | Aligned with current paper and `convoicon/spancall-lean-v3-3` checkpoint |
 
 ---
 
-## 4. What's Next (Active Roadmap)
+## 5. Active Roadmap (Post-Paper Next Steps)
 
-1. **Run v3 end-to-end and fill the ledger.** Execute [`notebooks/spancall_lean_v3_train_eval.ipynb`](notebooks/spancall_lean_v3_train_eval.ipynb) on Colab, then record the stratified results in [`docs/experiments.md`](docs/experiments.md) §II.3. The probe curve is the first artifact to inspect: a probe that stops improving while train loss keeps falling is the early-stopping signal that per-epoch eval used to hide.
-2. **LLM-parity sweep ([`scripts/compare_llm_spancall.py`](scripts/compare_llm_spancall.py)).** Run the same-sample comparison across every corpus × tool-count bucket, not just the aggregate. The pivot decides whether the fast path's advantage is concentrated in `1-2` tools or survives into `6-10` / `11+`, which is what the cost model assumes.
-3. **Calibrate the gate per bucket.** If `3-5` / `6-10` show a different precision-coverage curve than `1-2`, `call_min_prob` / `min_joint_margin` need per-bucket values rather than one global conjunction — the v3 eval now produces exactly the cells needed to fit them.
-4. **Agentic three-mode run on a real backend.** The notebook runs live when `API_KEY` is set **and** a one-call probe succeeds; otherwise it falls back to `DeterministicBackend`, which validates plumbing only (mode wiring, fallback, hybrid-fill merge). It prints that caveat beside its numbers and records `backend` / `resolver.kind` in the JSON, so a keyless table can never be mistaken for an LLM-quality result. Re-run all three modes against a hosted LLM on a task suite with non-trivial trajectories before quoting any success-rate or token-cost delta.
+1. **Explicit Stratum A negative supervision:** Train dedicated abstention / refusal supervision on ungroundable and adversarial turns to close the standalone `false_hit_on_A` gap (0.638–0.690 on Tier 1; 0.788–0.816 on adversarial).
+2. **Multi-turn stateful agentic benchmarks:** Evaluate `Router+Schema` and `HybridFill+Schema` end-to-end on BFCL, $\tau$-bench, and ToolSandbox.
+3. **Multi-seed & CPU/edge benchmarking:** Measure training-run variance across multiple seeds and benchmark single-request CPU / ONNX INT8 latency alongside GPU batch serving.

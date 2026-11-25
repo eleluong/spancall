@@ -299,7 +299,7 @@ from spancall.model.masks import CandidateMaskBuilder
 os.makedirs(TENSOR_DIR, exist_ok=True)
 tokenizer = AutoTokenizer.from_pretrained(BACKBONE, use_fast=True)
 tokenizer.add_special_tokens({"additional_special_tokens": list(SPECIAL_MARKER_TOKENS)})
-mask_builder = CandidateMaskBuilder(tokenizer=tokenizer, max_span_width=MAX_SPAN_WIDTH)
+mask_builder = CandidateMaskBuilder(max_seq_len=MAX_SEQ_LEN, max_span_width=MAX_SPAN_WIDTH)
 
 
 def _load_1call_scoreable(path: str) -> Tuple[List[str], Dict[str, int]]:
@@ -350,7 +350,7 @@ if XLAM_TRAIN_ROWS is not None and XLAM_TRAIN_ROWS > 0:
     _x_train_lines = _x_train_lines[: int(XLAM_TRAIN_ROWS)]
 
 _pool_dicts = [json.loads(l) for l in _h_train_lines] + [json.loads(l) for l in _x_train_lines]
-TOOL_POOL = ToolPool.from_samples(_pool_dicts, seed=SEED)
+TOOL_POOL = ToolPool.from_row_dicts(_pool_dicts, seed=SEED)
 print(f"[v3.3] ToolPool built: {len(TOOL_POOL)} unique schemas")
 
 if BALANCE_TRAIN_CORPORA:
@@ -711,6 +711,11 @@ _rcfg = {
 with open(os.path.join(CHECKPOINT_DIR, "resolve_config.json"), "w", encoding="utf-8") as _fh:
     json.dump(_rcfg, _fh, indent=2)
     _fh.write("\n")
+
+# Copy paper-aligned model card into CHECKPOINT_DIR/README.md for Hugging Face Hub
+_model_card_src = PROJECT_ROOT / "MODEL_CARD.md"
+if _model_card_src.is_file():
+    shutil.copy2(_model_card_src, os.path.join(CHECKPOINT_DIR, "README.md"))
 
 if HF_TOKEN and HF_REPO_ID:
     from huggingface_hub import HfApi

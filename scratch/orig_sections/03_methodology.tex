@@ -1,0 +1,59 @@
+\section{The \textsc{SpanCall} Architecture}
+\label{sec:method}
+
+\textsc{SpanCall} is an anchor-conditioned, multi-head bidirectional pointer network. No tool or parameter is baked into its weights: definitions are rendered into the input alongside the utterance, $H_1$ scores tool selection, $H_3$ scores boundary-factorized spans, and a constrained depth-first search (DFS) assembles a conflict-free payload that is then checked against the schema. When extraction does not apply (\textbf{Stratum A}), it declines rather than guesses. Figure~\ref{fig:architecture} shows how the pieces connect.
+
+\subsection{Anchor-conditioned backbone and heads}
+\label{sec:method:model}
+
+For $T$ candidate tools, we prepend query anchors before the dialogue and the targetable span pool $\Omega$: one \texttt{<|tool|>} per tool $t \in \{1,\dots,T\}$, one \texttt{<|param|>} per parameter $p_k \in \{1,\dots,K\}$, and a shared abstention sentinel \texttt{<|none|>}. A single \texttt{ModernBERT-large} pass ($d{=}1024$, 28 layers, 395M parameters, $L_{\max}{=}4096$) attends bidirectionally over anchors and text, yielding $\mathbf{H} \in \mathbb{R}^{L \times d}$, from which two heads read the anchor representations $\mathbf{h}_{\text{cls}}$, $\mathbf{h}_{\text{tool}, t}$, $\mathbf{h}_{\text{param}, k}$, $\mathbf{h}_{\text{none}} \in \mathbb{R}^d$ in parallel.
+
+\paragraph{Tool selection ($H_1$).}
+For each tool anchor, $H_1$ concatenates the local tool representation with a global sequence summary: $z_t^{\text{tool}} = \mathbf{w}_1^\top \sigma(\mathbf{W}_1 [\mathbf{h}_{\text{tool}, t}; \mathbf{h}_{\text{cls}}])$, trained with cross-entropy $\mathcal{L}_{H_1}$ under randomized multi-tool packing (drawing up to 6 distractor tools uniformly per instance). Randomizing the pool size keeps single- and multi-tool layouts in distribution, so the encoder must separate the active tool from distractors rather than learn a positional shortcut.
+
+\paragraph{Type pre-filtering.}
+Before any neural scoring, a deterministic mask builder enumerates a compact candidate pool $\mathcal{C} = \{(i_m, j_m)\}_{m=1}^{C}$ ($W_{\max}{=}16$, $C \le 1024$) and filters each parameter $p_k$ to its type-compatible subset $\mathcal{A}_k \subseteq \mathcal{C}$ from $p_k$'s declared JSON type: numeric spans for \texttt{integer} and \texttt{number}, and boolean or enum anchors for the corresponding types. Incompatible spans never reach $H_3$, so capacity goes only to deciding which compatible span fills which role.
+
+\paragraph{Span pointing ($H_3$).}
+Rather than materialise dense $O(K \cdot C \cdot d)$ span representations, $H_3$ factorizes the score of candidate $c = (i, j) \in \mathcal{A}_k$ for anchor $p_k$ into start and end affinities plus a width prior:
+\begin{equation}
+    M(k, c) = \mathbf{q}_{k,\text{s}}^\top \mathbf{k}_i + \mathbf{q}_{k,\text{e}}^\top \mathbf{k}'_j + r\!\left(\min(j - i, W_{\max})\right)
+\end{equation}
+where $\mathbf{q}_{k,\text{s}}, \mathbf{q}_{k,\text{e}}$ project $\mathbf{h}_{\text{param}, k}$, $\mathbf{k}_i, \mathbf{k}'_j$ are token projections of $\mathbf{h}_i, \mathbf{h}_j$, and $r(\cdot)$ is a width embedding. Absent optional parameters are scored in the same space through a sentinel, $M(k, \varnothing) = \mathbf{q}_{k,\text{none}}^\top \mathbf{h}_{\text{none}}$.
+
+\paragraph{Pointer supervision.}
+We supervise each parameter $p_k$ with cross-entropy over its aligned gold span(s) $\mathcal{G}_k \subseteq \mathcal{A}_k \cup \{\varnothing\}$ (using the top-ranked positive match per slot):
+\begin{equation}
+    \mathcal{L}_{H_3}(k) = -\frac{1}{|\mathcal{G}_k|} \sum_{g \in \mathcal{G}_k} \log \frac{\exp(M(k, g))}{\sum_{c \in \mathcal{A}_k'} \exp(M(k, c))}
+\end{equation}
+with $\mathcal{A}_k' = \mathcal{A}_k \cup \{\varnothing\}$, and train the two heads jointly, $\mathcal{L} = \lambda_{\text{tool}} \mathcal{L}_{H_1} + \frac{\lambda_{\text{ptr}}}{|\mathcal{K}_{\hat{t}}|} \sum_{k \in \mathcal{K}_{\hat{t}}} \mathcal{L}_{H_3}(k)$.
+
+\subsection{Exclusivity-constrained decoding and two-step scaling}
+\label{sec:method:decode}
+
+An independent $\arg\max_c M(k, c)$ per parameter breaks down as soon as two same-type parameters compete for nearby entities: roles get swapped, or the same span is assigned twice---\emph{pointer collapse}. Decoding resolves one globally consistent payload in four stages:
+\begin{enumerate}
+    \item \textbf{Value aggregation.} Spans in $\mathcal{A}_k$ resolving to the same canonical string have their probabilities summed, so evidence across repeated mentions is combined rather than split.
+    \item \textbf{Joint DFS with exclusivity.} Over the scalar parameters of the winning tool $\hat{t} = \arg\max_t z_t^{\text{tool}}$, a branch-and-bound search maximises $\sum_k \log P(c_k \mid p_k)$ subject to pairwise character-span non-overlap. Returning the runner-up $\mathbf{c}^{(2)}$ alongside the optimum $\mathbf{c}^{(1)}$ yields the joint log-margin $\Delta_{\text{joint}}$ at zero extra cost. For \texttt{array} parameters, decoding collects non-overlapping spans scoring above the null sentinel.
+    \item \textbf{Casting and validation.} Selected spans are parsed into native JSON types, dotted object leaves are reassembled into nested dictionaries, and the call is accepted only if it clears schema validation, the collapse guard, and the margin gate ($\Delta_{\text{joint}} \ge 0.02$). Failures abstain rather than guess.
+    \item \textbf{Two-step scaling.} $H_1$ first selects $\hat{t}$ over all $T$ candidate tools; a compact single-tool ($T{=}1$) sequence for $\hat{t}$ is then re-encoded so the entire $C{=}1024$ candidate budget belongs to $\hat{t}$ rather than being divided across distractors.
+\end{enumerate}
+
+\paragraph{Normal vs.\ complex call partitioning.}
+To locate the boundary of the extractive regime, we partition calls by their declared schema types. \emph{Normal} calls contain only scalar parameters---\texttt{string}, \texttt{integer}, \texttt{number}, \texttt{boolean}, \texttt{date}, and \texttt{enum}. \emph{Complex} calls contain at least one \texttt{array}, \texttt{object}, or decomposed object-leaf parameter. Because a tool's parameter types are declared in its schema, a router can check them deterministically once $H_1$ selects $\hat{t}$ (rather than pre-encode across all distractors, \S\ref{sec:results:complexity}).
+
+\subsection{Schema-grounded serialization and object flattening}
+\label{sec:method:input}
+
+$H_3$ copies substrings, so it cannot by itself produce a boolean, an enum member, a resolved date, or a nested object. Rather than complicate the pointer architecture, we make those values targetable in the input:
+\begin{itemize}
+    \item \textbf{Canonical context pool ($\Omega$).} Alongside the sanitized utterance (checked before encoding for marker injection), the serializer appends targetable blocks for boolean/null literals (\texttt{<|ctx\_meta|>}), resolved calendar offsets (\texttt{<|ctx\_time|>}, e.g., \texttt{+1d=2026-10-24}), deduplicated schema enum values (\texttt{<|ctx\_enum|>}), and prior tool outputs (\texttt{<|ctx\_recent|>}).
+    \item \textbf{Object-leaf decomposition.} Nested \texttt{object} parameters down to depth~3 (e.g., \texttt{filters: \{color, size\}}) are flattened into scalar dotted pseudo-parameters (\texttt{filters.color}, \texttt{filters.size}) and reconstructed after extraction. Undecomposable free-form objects are routed to the slow path.
+    \item \textbf{Render-invariant alignment.} Labels are matched against $\Omega$ in priority order (\texttt{enum/bool/null} $\rightarrow$ \texttt{time} $\rightarrow$ \texttt{utterance} $\rightarrow$ \texttt{recent context}) and stored as utterance-relative character offsets so they remain invariant under randomized multi-tool packing.
+\end{itemize}
+Fully alignable calls make up \textbf{Stratum F}; calls with ungroundable arguments make up \textbf{Stratum A}.
+
+\subsection{Routing between the extractor and the LLM}
+\label{sec:method:router}
+
+Since \textsc{SpanCall} accelerates tool calling rather than replacing the LLM, our router supports two speculative fast-path policies alongside \textbf{LLM-only} decoding: (1)~\textbf{Router} (abstention-gated: runs \textsc{SpanCall} first; committed hits execute immediately, abstentions fall back to the LLM), and (2)~\textbf{Router+Schema} (post-$H_1$ schema-gated: after $H_1$ selects $\hat{t}$, inspects $\hat{t}$'s declared schema and routes directly to the LLM whenever $\hat{t}$ contains an \texttt{array}, \texttt{object}, or decomposed object-leaf parameter; all-scalar tools proceed through $H_3$/DFS with abstention fallback). Checking only the $H_1$-selected tool $\hat{t}$ rather than all candidate tools pre-encode prevents complex distractor tools from triggering unnecessary LLM calls, while requiring zero ground-truth access.
