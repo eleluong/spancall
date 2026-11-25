@@ -33,3 +33,13 @@ data = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["span_template*", "spancall*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+norecursedirs = ["archive", ".git", ".venv", "data", "results"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = ["archive", "notebooks", "data", "results"]

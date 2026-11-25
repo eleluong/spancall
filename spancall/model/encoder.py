@@ -19,11 +19,103 @@ Implementation notes (plan §3.2.1):
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, List, Optional
+import importlib.util
+from typing import Any, List, Optional, Union
 
 import torch
 import torch.nn as nn
 from transformers import AutoModel
+
+
+_DTYPE_MAP = {
+    "bf16": torch.bfloat16,
+    "bfloat16": torch.bfloat16,
+    "fp16": torch.float16,
+    "float16": torch.float16,
+    "fp32": torch.float32,
+    "float32": torch.float32,
+}
+
+
+def _flash_attn_available() -> bool:
+    """Return True if ``flash_attn`` is importable in the current environment."""
+    try:
+        return importlib.util.find_spec("flash_attn") is not None
+    except Exception:
+        return False
+
+
+def _cuda_supports_flash_attn(device: Optional[str] = None) -> bool:
+    """Return True if target device is Ampere+ CUDA (SM >= 8.0) and flash_attn is installed."""
+    if device is not None and not str(device).startswith("cuda"):
+        return False
+    if not torch.cuda.is_available():
+        return False
+    if not _flash_attn_available():
+        return False
+    try:
+        major, _minor = torch.cuda.get_device_capability()
+        return int(major) >= 8
+    except Exception:
+        return False
+
+
+def resolve_attn_implementation(
+    attn_implementation: Optional[str] = "auto",
+    *,
+    device: Optional[str] = None,
+) -> Optional[str]:
+    """Resolve ``attn_implementation`` config value to a transformers kernel name.
+
+    - ``"auto"``: ``"flash_attention_2"`` on Ampere+ CUDA with ``flash_attn``
+      installed, else ``"sdpa"``.
+    - ``"flash_attention_2"`` | ``"sdpa"`` | ``"eager"``: passed through verbatim.
+    - ``None`` / ``""``: returns ``None`` (let transformers choose its default).
+    """
+    if attn_implementation is None or str(attn_implementation).strip() == "":
+        return None
+    val = str(attn_implementation).strip().lower()
+    if val == "auto":
+        return "flash_attention_2" if _cuda_supports_flash_attn(device=device) else "sdpa"
+    if val in ("flash_attention_2", "sdpa", "eager"):
+        return val
+    raise ValueError(
+        f"Unsupported attn_implementation {attn_implementation!r}; "
+        "expected one of 'auto', 'flash_attention_2', 'sdpa', 'eager'."
+    )
+
+
+def resolve_torch_dtype(
+    torch_dtype: Optional[Union[str, torch.dtype]] = None,
+    *,
+    attn_implementation: Optional[str] = None,
+    device: Optional[str] = None,
+) -> Optional[torch.dtype]:
+    """Resolve a dtype config string (``bf16``/``fp16``/``fp32``/``auto``) to ``torch.dtype``."""
+    if isinstance(torch_dtype, torch.dtype):
+        return torch_dtype
+    if torch_dtype is None or str(torch_dtype).strip() == "":
+        # FlashAttention-2 requires fp16 or bf16; pick bf16 on Ampere+ CUDA.
+        if attn_implementation == "flash_attention_2":
+            if torch.cuda.is_available() and getattr(torch.cuda, "is_bf16_supported", lambda: False)():
+                return torch.bfloat16
+            return torch.float16
+        return None
+    val = str(torch_dtype).strip().lower()
+    if val == "auto":
+        use_cuda = torch.cuda.is_available() and (device is None or str(device).startswith("cuda"))
+        if attn_implementation == "flash_attention_2" or use_cuda:
+            if torch.cuda.is_available() and getattr(torch.cuda, "is_bf16_supported", lambda: False)():
+                return torch.bfloat16
+            if use_cuda:
+                return torch.float16
+        return None
+    if val in _DTYPE_MAP:
+        return _DTYPE_MAP[val]
+    raise ValueError(
+        f"Unsupported torch_dtype {torch_dtype!r}; "
+        "expected one of 'auto', 'bf16', 'fp16', 'fp32'."
+    )
 
 
 class BaseEncoder(ABC):
@@ -52,8 +144,8 @@ class SpanCallTransformerEncoder(BaseEncoder, nn.Module):
     ----------
     model_name_or_path:
         HuggingFace model id or local path for ``AutoModel.from_pretrained``.
-        Defaults to ``Qwen/Qwen3-Embedding-0.6B`` (hidden d = 1024, 32k window;
-        long_context_fix.md Phase 2).
+        Defaults to ``answerdotai/ModernBERT-large`` (395M, hidden d = 1024,
+        native 8,192-token window).
     hidden_dropout_prob:
         Dropout applied to the contextual representation H in ``forward``.
     tokenizer:
@@ -78,11 +170,13 @@ class SpanCallTransformerEncoder(BaseEncoder, nn.Module):
 
     def __init__(
         self,
-        model_name_or_path: str = "Qwen/Qwen3-Embedding-0.6B",
+        model_name_or_path: str = "answerdotai/ModernBERT-large",
         hidden_dropout_prob: float = 0.1,
         tokenizer: Any = None,
         backbone: Optional[nn.Module] = None,
         bidirectional: bool = True,
+        attn_implementation: Optional[str] = None,
+        torch_dtype: Optional[Union[str, torch.dtype]] = None,
         **from_pretrained_kwargs: Any,
     ) -> None:
         # BaseEncoder is a pure ABC (no __init__); nn.Module.__init__ is next in MRO.
@@ -92,10 +186,24 @@ class SpanCallTransformerEncoder(BaseEncoder, nn.Module):
         self.tokenizer: Any = tokenizer
         self.bidirectional = bidirectional
 
+        resolved_attn = resolve_attn_implementation(attn_implementation)
+        resolved_dtype = resolve_torch_dtype(torch_dtype, attn_implementation=resolved_attn)
+        self.attn_implementation: Optional[str] = resolved_attn
+        self.resolved_torch_dtype: Optional[torch.dtype] = resolved_dtype
+
         if backbone is not None:
             self.backbone: nn.Module = backbone
         else:
-            self.backbone = AutoModel.from_pretrained(model_name_or_path, **from_pretrained_kwargs)
+            load_kwargs = dict(from_pretrained_kwargs)
+            if resolved_attn is not None and "attn_implementation" not in load_kwargs:
+                load_kwargs["attn_implementation"] = resolved_attn
+            if resolved_dtype is not None and "torch_dtype" not in load_kwargs and "dtype" not in load_kwargs:
+                load_kwargs["torch_dtype"] = resolved_dtype
+            self.backbone = AutoModel.from_pretrained(model_name_or_path, **load_kwargs)
+            if self.attn_implementation is None:
+                self.attn_implementation = getattr(
+                    getattr(self.backbone, "config", None), "_attn_implementation", None
+                )
 
         # Disable ModernBERT's automatic torch.compile (reference_compile) when
         # present so variable-length batches and resized embeddings do not

@@ -23,11 +23,13 @@ if TYPE_CHECKING:
 
 
 class RouterMode(str, Enum):
-    LLM_ONLY = "llm_only"             # Baseline B0 (Normal Agent)
-    SPANCALL_ONLY = "spancall_only"   # Fast-path only (diagnostic)
-    ROUTER = "router"                 # Speculative fast path with fallback (System S)
-    HYBRID_FILL = "hybrid_fill"       # SpanCall skeleton + LLM fills ONLY missing params
-    SHADOW = "shadow"                 # LLM answers, SpanCall runs & logs comparisons
+    LLM_ONLY = "llm_only"                      # Baseline B0 (Normal Agent)
+    SPANCALL_ONLY = "spancall_only"            # Fast-path only (diagnostic)
+    ROUTER = "router"                          # Speculative fast path with fallback (System S)
+    ROUTER_SCHEMA = "router_schema"            # Router + post-H1 array/object schema gate
+    HYBRID_FILL = "hybrid_fill"                # SpanCall skeleton + LLM fills ONLY missing params
+    HYBRID_FILL_SCHEMA = "hybrid_fill_schema"  # HybridFill + post-H1 array/object schema gate
+    SHADOW = "shadow"                          # LLM answers, SpanCall runs & logs comparisons
 
 
 class IntegrationVariant(str, Enum):
@@ -44,6 +46,21 @@ def _json_dumps(value: Any) -> str:
         return str(value)
 
 
+def _canonical_call_key(tool_name: Optional[str], arguments: Optional[Dict[str, Any]]) -> Tuple[str, str]:
+    """Canonical hashable key for duplicate-call detection."""
+    return (str(tool_name or ""), _json_dumps(arguments or {}))
+
+
+def _is_complex_schema_tool(tool: Optional[ToolDefinition]) -> bool:
+    """True if the tool declares any ``array`` or ``object`` parameter."""
+    if tool is None:
+        return False
+    for p in tool.parameters:
+        if getattr(p, "param_type", "") in ("array", "object"):
+            return True
+    return False
+
+
 class ToolCallRouter:
     """Manages routing between SpanCall fast-path resolver and LLM backend."""
 
@@ -54,6 +71,7 @@ class ToolCallRouter:
         mode: RouterMode = RouterMode.ROUTER,
         variant: IntegrationVariant = IntegrationVariant.S_SKIP,
         hybrid_fill_optional: bool = False,
+        skip_risk_tiers: Tuple[str, ...] = (),
     ) -> None:
         self.resolver = resolver
         self.llm_backend = llm_backend
@@ -63,6 +81,9 @@ class ToolCallRouter:
         # Optional params are frequently absent from the utterance by design, so
         # asking for them invites hallucinated values; opt in only to measure it.
         self.hybrid_fill_optional = bool(hybrid_fill_optional)
+        # Optional risk-tier gate (e.g. ("high",)) so policy-sensitive write
+        # tools delegate to the LLM for confirmation / policy verification.
+        self.skip_risk_tiers = tuple(str(r).lower() for r in (skip_risk_tiers or ()))
 
     def route_turn(
         self,
@@ -70,6 +91,7 @@ class ToolCallRouter:
         messages: List[Dict[str, Any]],
         available_tools: List[ToolDefinition],
         session_context: Optional[List[Dict[str, Any]]] = None,
+        executed_calls: Optional[set] = None,
     ) -> Tuple[Dict[str, Any], Optional[StepTrace]]:
         """Resolves tool call via fast path or delegates to LLM backend.
 
@@ -123,9 +145,17 @@ class ToolCallRouter:
                 trace,
             )
 
-        # ---- HYBRID_FILL: SpanCall skeleton + LLM fills the gaps only ------ #
-        if mode == RouterMode.HYBRID_FILL:
-            return self._route_hybrid_fill(utterance, messages, available_tools, res, t0)
+        # ---- HYBRID_FILL / HYBRID_FILL_SCHEMA ------------------------------ #
+        if mode in (RouterMode.HYBRID_FILL, RouterMode.HYBRID_FILL_SCHEMA):
+            return self._route_hybrid_fill(
+                utterance,
+                messages,
+                available_tools,
+                res,
+                t0,
+                schema_gate=(mode == RouterMode.HYBRID_FILL_SCHEMA),
+                executed_calls=executed_calls,
+            )
 
         # ---- SHADOW: LLM answers, SpanCall runs + logs comparison ---------- #
         if mode == RouterMode.SHADOW:
@@ -135,43 +165,87 @@ class ToolCallRouter:
             # ``spancall`` stays False — the *executed* call came from the LLM.
             # The SpanCall hypothesis + comparison telemetry live in the
             # ``spancall_*`` keys below (used by shadow-mode calibration).
+            result["spancall_hit"] = bool(res.hit)
             result["spancall_tool"] = res.tool_name
             result["spancall_arguments"] = res.payload
+            result["spancall_abstain_reason"] = getattr(res, "abstain_reason", None)
             # Lazy import: spancall.eval imports spancall.agent (circular at
             # module import time), so payload_equal is resolved per call.
             from spancall.eval.toolcall.evaluator import payload_equal  # noqa: PLC0415
 
             result["spancall_matched"] = bool(
-                res.hit and payload_equal(res.payload, llm_res.get("arguments"))
+                res.hit
+                and res.tool_name == llm_res.get("tool_name")
+                and payload_equal(res.payload, llm_res.get("arguments"))
             )
+            result["shadow_false_hit_on_prose"] = bool(res.hit and not llm_res.get("tool_name"))
             return result, trace
 
-        # ---- ROUTER (System S): SpanCall first, unmodified-LLM fallback ---- #
-        if res.hit:
+        # ---- ROUTER / ROUTER_SCHEMA: SpanCall first, unmodified-LLM fallback #
+        gate_reason = self._post_h1_gate_reason(
+            res,
+            available_tools,
+            schema_gate=(mode == RouterMode.ROUTER_SCHEMA),
+            executed_calls=executed_calls,
+        )
+        if res.hit and gate_reason is None:
             trace = self._trace(t0, utterance, RoutingDecision.SPANCALL_HIT, res)
             return (
                 {"hit": True, "tool_name": res.tool_name, "arguments": res.payload,
                  "payload": res.payload, "spancall": True,
                  "joint_margin": res.joint_margin, "accept_score": res.accept_score,
-                 "features": dict(res.features)},
+                 "features": dict(res.features or {})},
                 trace,
             )
 
-        # SpanCall abstained -> LLM fallback with the UNMODIFIED prompt.
+        # SpanCall abstained or was gated -> LLM fallback with UNMODIFIED prompt.
         llm_res = self._llm_call(messages, available_tools, t0)
         trace = self._trace(t0, utterance, RoutingDecision.LLM_FALLBACK, res, llm_res)
+        if gate_reason is not None:
+            trace.spancall_features["router_gate_reason"] = gate_reason
+        elif getattr(res, "abstain_reason", None):
+            trace.spancall_features["spancall_abstain_reason"] = res.abstain_reason
         return self._llm_result(llm_res, t0, res), trace
 
+    def _post_h1_gate_reason(
+        self,
+        res: Any,
+        available_tools: List[ToolDefinition],
+        *,
+        schema_gate: bool,
+        executed_calls: Optional[set] = None,
+        check_partial_risk: bool = False,
+    ) -> Optional[str]:
+        """Deterministic post-H1 guardrails (complex schema, risk tier, duplicate)."""
+        schema = next((t for t in available_tools if t.name == res.tool_name), None) if res.tool_name else None
+        if (
+            self.skip_risk_tiers
+            and schema is not None
+            and (res.hit or check_partial_risk)
+            and str(getattr(schema, "risk_tier", "low") or "low").lower() in self.skip_risk_tiers
+        ):
+            return f"risk_tier:{schema.risk_tier}"
+        if not res.hit:
+            return None
+        if schema_gate and _is_complex_schema_tool(schema):
+            return "complex_schema"
+        if executed_calls and _canonical_call_key(res.tool_name, res.payload) in executed_calls:
+            return "duplicate_call"
+        return None
+
     # ------------------------------------------------------------------ #
-    # Mode 3: HYBRID_FILL
+    # Mode 3: HYBRID_FILL / HYBRID_FILL_SCHEMA
     # ------------------------------------------------------------------ #
     def _route_hybrid_fill(
         self,
         utterance: str,
         messages: List[Dict[str, Any]],
         available_tools: List[ToolDefinition],
-        res: ResolveResult,
+        res: Any,
         t0: float,
+        *,
+        schema_gate: bool = False,
+        executed_calls: Optional[set] = None,
     ) -> Tuple[Dict[str, Any], Optional[StepTrace]]:
         """SpanCall predicts the call skeleton; the LLM fills ONLY the gaps.
 
@@ -212,8 +286,15 @@ class ToolCallRouter:
             trace = self._trace(t0, utterance, RoutingDecision.LLM_FALLBACK, res, llm_res)
             return self._llm_result(llm_res, t0, res), trace
 
-        # ---- 2. clean SpanCall hit: LLM not needed -------------------------- #
-        if res.hit:
+        # ---- 2. clean SpanCall hit: LLM not needed (unless gated) ----------- #
+        gate_reason = self._post_h1_gate_reason(
+            res,
+            available_tools,
+            schema_gate=schema_gate,
+            executed_calls=executed_calls,
+            check_partial_risk=True,
+        )
+        if res.hit and gate_reason is None:
             trace = self._trace(t0, utterance, RoutingDecision.SPANCALL_HIT, res)
             return (
                 {"hit": True, "tool_name": res.tool_name, "arguments": res.payload,
@@ -223,7 +304,21 @@ class ToolCallRouter:
                 trace,
             )
 
-        known = dict(getattr(res, "payload_partial", None) or {})
+        if gate_reason in ("duplicate_call",) or (gate_reason and gate_reason.startswith("risk_tier:")):
+            llm_res = self._llm_call(messages, available_tools, t0)
+            trace = self._trace(t0, utterance, RoutingDecision.LLM_FALLBACK, res, llm_res)
+            trace.spancall_features["router_gate_reason"] = gate_reason
+            return self._llm_result(llm_res, t0, res), trace
+
+        known = dict(getattr(res, "payload_partial", None) or (res.payload if res.hit else None) or {})
+        if gate_reason == "complex_schema":
+            # Keep grounded scalar params and drop complex params so the LLM fills them.
+            complex_names = {
+                p.name for p in schema.parameters
+                if getattr(p, "param_type", "") in ("array", "object")
+            }
+            for cn in complex_names:
+                known.pop(cn, None)
         # Only REQUIRED gaps are worth an LLM round trip by default: an optional
         # param SpanCall declined to emit is often genuinely absent from the
         # utterance, and asking for it invents values.
@@ -340,11 +435,11 @@ class ToolCallRouter:
     def _llm_result(
         llm_res: Dict[str, Any],
         t0: float,
-        spancall_res: Optional[ResolveResult],
+        spancall_res: Optional[Any],
     ) -> Dict[str, Any]:
         """Normalize a backend result dict into the router result contract."""
         tool_name = llm_res.get("tool_name")
-        return {
+        out: Dict[str, Any] = {
             "hit": bool(tool_name),
             "tool_name": tool_name,
             "arguments": llm_res.get("arguments"),
@@ -353,6 +448,11 @@ class ToolCallRouter:
             "usage": llm_res.get("usage", {}),
             "latency_ms": llm_res.get("latency_ms", (time.perf_counter() - t0) * 1000),
         }
+        if llm_res.get("text") is not None:
+            out["text"] = llm_res.get("text")
+        if llm_res.get("call_id") is not None:
+            out["call_id"] = llm_res.get("call_id")
+        return out
 
     @staticmethod
     def _trace(

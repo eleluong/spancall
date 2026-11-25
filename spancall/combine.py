@@ -229,6 +229,8 @@ class SpanCallLLM:
         policy: Union[CombinePolicy, str] = CombinePolicy.ROUTER_SCHEMA,
         device: Optional[str] = None,
         hf_token: Optional[str] = None,
+        attn_implementation: Optional[str] = "auto",
+        torch_dtype: Optional[str] = None,
         **kwargs: Any,
     ) -> "SpanCallLLM":
         """Load a SpanCall checkpoint (local dir or Hub repo) and attach an LLM.
@@ -243,7 +245,13 @@ class SpanCallLLM:
         resolver = (
             None
             if pol is CombinePolicy.LLM_ONLY
-            else load_resolver(path_or_repo, device=device, token=hf_token)
+            else load_resolver(
+                path_or_repo,
+                device=device,
+                token=hf_token,
+                attn_implementation=attn_implementation,
+                torch_dtype=torch_dtype,
+            )
         )
         if pol is not CombinePolicy.SPANCALL_ONLY:
             if llm is None:

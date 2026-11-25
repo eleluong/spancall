@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from spancall.agent.router import IntegrationVariant, RouterMode, ToolCallRouter
+from spancall.agent.router import (
+    IntegrationVariant,
+    RouterMode,
+    ToolCallRouter,
+    _canonical_call_key,
+)
 from spancall.agent.tools.base import BaseToolEnvironment, ToolExecutionResult
 from spancall.agent.trace import ExecutionTrace, RoutingDecision, StepTrace
 
@@ -61,6 +66,7 @@ class ReActAgentLoop(BaseAgentLoop):
         context_budget_tokens: int = 16384,
         legacy_context: bool = False,
         tokenizer: Optional[Any] = None,
+        prevent_duplicate_calls: bool = True,
     ) -> None:
         self.router = router
         self.environment = environment
@@ -71,6 +77,7 @@ class ReActAgentLoop(BaseAgentLoop):
         self.k_recent = int(k_recent)
         self.context_budget_tokens = int(context_budget_tokens)
         self.legacy_context = bool(legacy_context)
+        self.prevent_duplicate_calls = bool(prevent_duplicate_calls)
         # Real tokenizer => token-accurate budgets. Falls back to the resolver's
         # tokenizer (never the char-level FakeTokenizer, which overcounts ~4x),
         # else the length/4 estimate.
@@ -80,10 +87,18 @@ class ReActAgentLoop(BaseAgentLoop):
                 tokenizer = cand
         self.tokenizer = tokenizer
 
-    def run_task(self, task_instruction: str, task_id: str) -> ExecutionTrace:
+    def run_task(
+        self,
+        task_instruction: str,
+        task_id: str,
+        user_simulator: Optional[Callable[[str, List[Dict[str, Any]]], Optional[str]]] = None,
+    ) -> ExecutionTrace:
         """Executes multi-turn task until completion or max_turns reached.
 
-        Appends TaskSuccess is derived from ``environment.evaluate_task_success``.
+        When ``user_simulator`` is provided (e.g., τ-bench interactive user),
+        any assistant prose turn (non-tool-call) is sent to ``user_simulator``;
+        returning ``None`` or ``"###STOP###"`` ends the conversation, otherwise
+        the simulated user reply is appended as a new ``role: "user"`` turn.
         """
         t0 = time.perf_counter()
         mode: RouterMode = (
@@ -108,6 +123,7 @@ class ReActAgentLoop(BaseAgentLoop):
         )
 
         self.environment.reset()
+        executed_calls: Set[Tuple[str, str]] = set()
         for turn in range(self.max_turns):
             if self.legacy_context:
                 turn_utterance = task_instruction if turn == 0 else ""
@@ -141,30 +157,57 @@ class ReActAgentLoop(BaseAgentLoop):
                 )
 
             # ---- route this turn ------------------------------------------ #
-            result, step = self.router.route_turn(
-                utterance=turn_utterance,
-                messages=messages,
-                available_tools=self.environment.get_available_tools(),
-                session_context=turn_context,
-            )
+            route_kwargs: Dict[str, Any] = {
+                "utterance": turn_utterance,
+                "messages": messages,
+                "available_tools": self.environment.get_available_tools(),
+                "session_context": turn_context,
+            }
+            if self.prevent_duplicate_calls:
+                route_kwargs["executed_calls"] = executed_calls
+            result, step = self.router.route_turn(**route_kwargs)
             step = step or self._bare_trace(turn, turn_utterance, result)
             step.turn_index = turn
             step.context_trimmed = trimmed_count
-            if hasattr(step, "spancall_features") and isinstance(step.spancall_features, dict):
+            if isinstance(step.spancall_features, dict):
                 step.spancall_features.update(recent_features)
                 step.spancall_features["context_trimmed"] = trimmed_count
+                resolver_max_seq = getattr(getattr(self.router, "resolver", None), "max_seq_len", None)
+                seq_tok = (
+                    step.spancall_features.get("seq_tokens")
+                    or step.spancall_features.get("seq_len")
+                    or step.spancall_features.get("num_tokens")
+                )
+                abstain_str = str(step.spancall_features.get("spancall_abstain_reason") or "").lower()
+                if (
+                    step.spancall_features.get("context_overflow_seq")
+                    or "overflow" in abstain_str
+                    or (resolver_max_seq and seq_tok and int(seq_tok) >= int(resolver_max_seq))
+                ):
+                    step.spancall_features["context_overflow_seq"] = True
+                if "shadow_false_hit_on_prose" in result:
+                    step.spancall_features["shadow_false_hit_on_prose"] = bool(
+                        result["shadow_false_hit_on_prose"]
+                    )
+                if "spancall_matched" in result:
+                    step.spancall_features["shadow_matched"] = bool(result["spancall_matched"])
             trace.total_context_trimmed += trimmed_count
+            stop_requested = False
             if result.get("hit"):
                 tool_name = str(result.get("tool_name") or "")
                 arguments = result.get("arguments") or {}
                 step.selected_tool = tool_name
                 step.tool_arguments = dict(arguments)
+                executed_calls.add(_canonical_call_key(tool_name, arguments))
 
-                # ---- s_inject: synthesize the assistant tool_calls message --- #
-                if variant == IntegrationVariant.S_INJECT and result.get("spancall"):
-                    call_id = f"call_spancall_{turn}"
+                # ---- synthesize assistant tool_calls message ---------------- #
+                if variant == IntegrationVariant.S_INJECT:
+                    call_id = str(result.get("call_id") or f"call_spancall_{turn}")
                     inj = self.router.synthesize_injected_call(tool_name, arguments, call_id)
-                    step.spancall_features["injected_call_id"] = call_id
+                    if result.get("text"):
+                        inj["content"] = str(result["text"])
+                    if result.get("spancall"):
+                        step.spancall_features["injected_call_id"] = call_id
                     messages.append(inj)
                     tool_messages = [self.router.synthesize_tool_response(tool_name, None, call_id)]
                 else:
@@ -175,6 +218,18 @@ class ReActAgentLoop(BaseAgentLoop):
                     self.environment.execute(tool_name, arguments)
                 )
                 step.tool_execution_success = exec_result.success
+                # If a mutation changed environment state, allow subsequent
+                # re-reads of read-only (non-high-risk) tools so legitimate
+                # verification lookups are not blocked by the duplicate guard.
+                if exec_result.state_changed and executed_calls:
+                    high_risk_names = {
+                        t.name
+                        for t in self.environment.get_available_tools()
+                        if str(getattr(t, "risk_tier", "low") or "low").lower() == "high"
+                    }
+                    executed_calls = {
+                        ck for ck in executed_calls if ck[0] in high_risk_names
+                    }
                 step.tool_output = (
                     exec_result.output if isinstance(exec_result.output, str)
                     else _stringify(exec_result.output)
@@ -189,23 +244,22 @@ class ReActAgentLoop(BaseAgentLoop):
                     messages.append(
                         self.router.synthesize_tool_response(tool_name, content)
                     )
-
-                # ---- partial-prose from the LLM (rare) ---------------------- #
-                if result.get("text"):
-                    messages.append({"role": "assistant", "content": str(result["text"])})
+                    if result.get("text"):
+                        messages.append({"role": "assistant", "content": str(result["text"])})
             else:
                 # no tool call this turn: LLM prose, or SpanCall abstain
                 text = result.get("text") or (result.get("content") or "")
                 if result.get("tool_name") is None and not text:
                     text = result.get("abstain_reason") or "no tool call"
                 messages.append({"role": "assistant", "content": str(text)})
+                if user_simulator is not None:
+                    user_reply = user_simulator(str(text), list(messages))
+                    if user_reply is None or "###STOP###" in str(user_reply):
+                        stop_requested = True
+                    else:
+                        messages.append({"role": "user", "content": str(user_reply)})
 
             trace.steps.append(step)
-            # HYBRID_FILL DID call the LLM (for the gaps), so it counts toward
-            # the LLM-call total -- but it also counts as a SpanCall step, since
-            # the tool and most arguments came from the fast path. Counting it in
-            # only one bucket would silently inflate or deflate the savings
-            # metric depending on which one a reader looks at.
             trace.total_llm_calls += 1 if step.decision in (
                 RoutingDecision.LLM_FALLBACK, RoutingDecision.SHADOW_COMPARISON,
                 RoutingDecision.HYBRID_FILL) else 0
@@ -219,10 +273,17 @@ class ReActAgentLoop(BaseAgentLoop):
             trace.total_tokens_completion += step.llm_tokens_out
 
             # ---- task-completion check -------------------------------------- #
-            if self.environment.evaluate_task_success():
+            if stop_requested:
+                trace.task_completed = True
+                trace.task_success = bool(self.environment.evaluate_task_success())
+                break
+            if user_simulator is None and self.environment.evaluate_task_success():
                 trace.task_completed = True
                 trace.task_success = True
                 break
+
+        if not trace.task_completed and user_simulator is not None:
+            trace.task_success = bool(self.environment.evaluate_task_success())
 
         trace.total_latency_ms = (time.perf_counter() - t0) * 1000
         if not trace.steps:

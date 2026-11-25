@@ -39,7 +39,7 @@ Both alignment/training and online serving render through `build_input_multi` (`
   - **HybridFill+Schema (plain-JSON partial fill):** **0.844** (Gemma 4) / **0.847** (`gpt-oss-120b`) macro `exact_F`, 38%–61% lower xLAM prompt tokens, lowest Stratum A false calls (**0.853–0.862**, safer than both standalone LLMs), and 64.5% total token reduction on concise-reasoning `gpt-oss-120b`.
 - **Tier 2 Full Splits (34,969 rows):** Zero-shot OOD-Schema (`0.711` Hermes / `0.799` xLAM) and OOD-Para (`0.735` / `0.793`) match or exceed ID eval (`0.708` / `0.757`). Standalone Stratum A abstention remains the main open gap (`false_hit_on_A` 0.638–0.690 on Tier 1; 0.788–0.816 on adversarial splits).
 
-See [`README.md`](README.md), [`MODEL_CARD.md`](MODEL_CARD.md), [`docs/experiments.md`](docs/experiments.md), and [`results_lean_v3_3/export/final_report.md`](results_lean_v3_3/export/final_report.md) for complete tables.
+See [`README.md`](README.md), [`MODEL_CARD.md`](MODEL_CARD.md), [`docs/experiments.md`](docs/experiments.md), and [`results/v3_3/export/final_report.md`](results/v3_3/export/final_report.md) for complete tables.
 
 ---
 
@@ -63,9 +63,10 @@ See [`README.md`](README.md), [`MODEL_CARD.md`](MODEL_CARD.md), [`docs/experimen
 | `spancall/lean/` — `model`, `loss`, `tensorize`, `trainer`, `decode`, `resolver`, `eval_p1`, `diagnostics` | ✅ | Primary active v3.3 training, two-step inference, and Part-1 evaluation stack |
 | `spancall/infer/` — `base`, `cast`, `clock`, `export` | ✅ | `BaseResolver` / `BaseResolveResult`, `StrictTypeCaster`, `SchemaValidator`, clock utils |
 | `spancall/combine.py`, `spancall/hub.py` | ✅ | Public API: `SpanCallLLM` (6 policies), `load_resolver`; lazy top-level exports (`from spancall import SpanCallLLM`) |
-| `spancall/agent/` — `router`, `loop`, `fill`, `context`, `trace`, `backends`, `tools` | ✅ | Version-agnostic `ToolCallRouter`, `ReActAgentLoop`, `fill.py`, API/local backends |
+| `spancall/agent/` — `router`, `loop`, `fill`, `context`, `trace`, `backends`, `tools` | ✅ | Version-agnostic `ToolCallRouter` (`ROUTER_SCHEMA`, `HYBRID_FILL_SCHEMA`, duplicate & `risk_tier` guards), interactive `ReActAgentLoop`, `OpenAIAPIBackend`, `SimpleTauRetailEnvironment` + `TauBenchAgentAdapter` |
 | `spancall/eval/` — `toolcall`, `agentic`, `llm_parity`, `hybrid_fill`, `compare`, `cost` | ✅ | `ToolCallEvaluator`, paired bootstrap CIs, `Router`/`Router+Schema`, `HybridFill`/`HybridFill+Schema` |
-| `scripts/` — v3.3 pipeline CLIs | ✅ | `build_fair_eval_v3_3.py`, `build_lean_v3_3_train_eval_notebook.py`, `eval_llm_local.py`, `eval_hybrid_fill.py`, `export_v3_3_results.py` |
+| `scripts/` — v3.3 & agentic CLIs | ✅ | `build_fair_eval_v3_3.py`, `build_lean_v3_3_train_eval_notebook.py`, `build_tau_bench_agentic_notebook.py`, `eval_tau_bench.py`, `eval_llm_local.py`, `eval_hybrid_fill.py`, `export_v3_3_results.py` |
+| `archive/` — superseded v2.x–v3.2 assets | ✅ | Archived historical notebooks, builders, plans, and legacy notebook tests |
 | `research_paper/` — ACL LaTeX manuscript | ✅ | Aligned with v3.3 audited results (`main.tex`, `sections/`, `figures/`, `Makefile`) |
 | `README.md` & `MODEL_CARD.md` | ✅ | Aligned with current paper and `convoicon/spancall-lean-v3-3` checkpoint |
 

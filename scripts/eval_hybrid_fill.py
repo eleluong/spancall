@@ -295,7 +295,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--api-key-env", type=str, default="API_KEY")
     p.add_argument("--default-api-key", type=str, default=None)
     p.add_argument("--eval-dir", type=str, default="data/eval_v3_3")
-    p.add_argument("--results-dir", type=str, default="results_lean_v3_3")
+    p.add_argument("--results-dir", type=str, default="results/v3_3")
     p.add_argument("--splits", nargs="+", default=["fair_hermes_eval", "fair_xlam_eval"])
     p.add_argument("--modes", nargs="+", choices=list(HYBRID_MODES), default=list(HYBRID_MODES))
     p.add_argument("--limit", type=int, default=None)

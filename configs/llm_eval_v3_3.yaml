@@ -10,7 +10,7 @@
 # (loaded from the shell or repo-root .env).
 
 eval_dir: data/eval_v3_3
-results_dir: results_lean_v3_3
+results_dir: results/v3_3
 splits:
   - fair_hermes_eval
   - fair_xlam_eval

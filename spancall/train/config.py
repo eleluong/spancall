@@ -24,14 +24,17 @@ def _known_kwargs(cls: Type[_T], d: Mapping[str, Any]) -> Dict[str, Any]:
 
 @dataclass
 class ModelConfig:
-    # Qwen3-0.6B embedding model with a 32k window, run bidirectional
-    # (encoder is_causal=False). max_seq_len is the
-    # resolver/trainer guard derived from the backbone — no hardcoded 512 cap.
-    backbone_name: str = "Qwen/Qwen3-Embedding-0.6B"
+    # ModernBERT-large (395M, d=1024, native 8,192 window; v3.3 default 4,096).
+    backbone_name: str = "answerdotai/ModernBERT-large"
     head_dim: int = 256
-    max_seq_len: int = 32768
+    max_seq_len: int = 4096
     max_span_width: int = 16
     dropout: float = 0.1
+    # Attention kernel: "auto" (flash_attention_2 on Ampere+ CUDA if flash_attn
+    # installed, else sdpa), "flash_attention_2", "sdpa", or "eager".
+    attn_implementation: str = "auto"
+    # Optional backbone load dtype: None | "auto" | "bf16" | "fp16" | "fp32".
+    torch_dtype: Optional[str] = None
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> "ModelConfig":

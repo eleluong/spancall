@@ -1,7 +1,4 @@
-"""Unit tests for SpanCall Lean v2.4.1 ModernBERT-large flow."""
-
-import json
-from pathlib import Path
+"""Unit tests for SpanCall ModernBERT-large encoder and LoRA integration."""
 
 import pytest
 import torch
@@ -52,32 +49,5 @@ def test_apply_lora_auto_adapts_modernbert_modules():
     lm = LeanSpanCallModel(encoder=enc, head_dim=16, max_span_width=8)
     n_lora = apply_lora(lm, r=4, alpha=8)
     assert n_lora > 0
-
-
-def test_v2_4_1_notebook_has_modernbert_config_and_isolated_dirs():
-    nb_path = Path(__file__).resolve().parent.parent / "notebooks" / "spancall_lean_v2_4_1_train_eval.ipynb"
-    assert nb_path.is_file()
-    nb = json.loads(nb_path.read_text(encoding="utf-8"))
-    all_src = "\n".join("".join(c.get("source", [])) for c in nb["cells"])
-    assert 'BACKBONE       = "answerdotai/ModernBERT-large"' in all_src
-    assert 'cfg["model"]["backbone_name"] = BACKBONE' in all_src
-    assert "tensorized_lean_v2_4_1" in all_src
-    assert "results_lean_v2_4_1" in all_src
-
-
-def test_v2_5_notebook_is_essential_and_full_data():
-    nb_path = Path(__file__).resolve().parent.parent / "notebooks" / "spancall_lean_v2_5_train_eval.ipynb"
-    assert nb_path.is_file()
-    nb = json.loads(nb_path.read_text(encoding="utf-8"))
-    assert len(nb["cells"]) <= 30
-    all_src = "\n".join("".join(c.get("source", [])) for c in nb["cells"])
-    assert 'BACKBONE       = "answerdotai/ModernBERT-large"' in all_src
-    assert "DATA_FRACTION = 0.5" in all_src
-    assert "TRAIN_FRACTION = 1.0" in all_src
-    assert 'cfg["model"]["backbone_name"] = BACKBONE' in all_src
-    assert "tensorized_lean_v2_5" in all_src
-    assert "results_lean_v2_5" in all_src
-    assert "RUN_LORA_ABLATION" not in all_src
-    assert "RUN_BINARY_TOOL_ABLATION" not in all_src
 
 

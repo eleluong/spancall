@@ -42,8 +42,14 @@ class TestBoilerplateIntegrity(unittest.TestCase):
             SpanCallTransformerEncoder,
             ToolHead,
         )
-        encoder = SpanCallTransformerEncoder()
-        self.assertEqual(encoder.model_name_or_path, "Qwen/Qwen3-Embedding-0.6B")
+        from types import SimpleNamespace
+        import torch.nn as nn
+
+        class _DummyBackbone(nn.Module):
+            config = SimpleNamespace(hidden_size=16)
+
+        encoder = SpanCallTransformerEncoder(backbone=_DummyBackbone())
+        self.assertEqual(encoder.model_name_or_path, "answerdotai/ModernBERT-large")
         self.assertTrue(issubclass(ToolHead, BaseHead))
         self.assertTrue(issubclass(BinaryToolHead, BaseHead))
 
@@ -82,7 +88,7 @@ class TestBoilerplateIntegrity(unittest.TestCase):
     def test_training_config_from_yaml_roundtrip(self):
         from spancall.train import TrainingConfig
         cfg = TrainingConfig.from_yaml("configs/default.yaml")
-        self.assertEqual(cfg.model.backbone_name, "Qwen/Qwen3-Embedding-0.6B")
+        self.assertEqual(cfg.model.backbone_name, "answerdotai/ModernBERT-large")
         self.assertEqual(cfg.optimization.learning_rate_encoder, 3e-5)
         self.assertEqual(cfg.optimization.batch_size, 32)
         self.assertEqual(cfg.optimization.effective_batch_size, 128)

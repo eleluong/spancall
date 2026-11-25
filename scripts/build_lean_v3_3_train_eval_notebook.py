@@ -103,7 +103,7 @@ V1_DATA_DIR       = str(PROJECT_ROOT / "data" / "processed")
 V2_DATA_DIR       = str(PROJECT_ROOT / "data" / "processed_v2")
 EVAL_DIR          = str(PROJECT_ROOT / "data" / "eval_v3_3")
 TENSOR_DIR        = str(PROJECT_ROOT / "data" / "tensorized_lean_v3_3")
-RESULTS_DIR       = str(PROJECT_ROOT / "results_lean_v3_3")
+RESULTS_DIR       = str(PROJECT_ROOT / "results" / "v3_3")
 
 # Max-data 1:1 balanced training knobs
 XLAM_TRAIN_ROWS       = None   # None => use 100% of xlam_train (~69.4k)
@@ -747,14 +747,15 @@ if DOWNLOAD_RESULTS:
 
 
 def _guard() -> Any:
-    """Load ``_guard_code_cells`` from the v2.6 builder (the shared AST scope guard)."""
-    v26 = HERE / "build_lean_v2_6_colab_notebook.py"
-    src = v26.read_text(encoding="utf-8")
-    start = src.index("def _cell_source")
-    end = src.rindex("_guard_code_cells(cells)")
-    ns: Dict[str, Any] = {"__name__": "build_lean_v3_3_guard"}
-    exec(compile(src[start:end], str(v26), "exec"), ns)
-    return ns["_guard_code_cells"]
+    """Return the shared AST & Jupyter scope cell guard."""
+    import sys
+
+    repo_root = str(HERE.parent)
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    from scripts._notebook_guard import guard_code_cells
+
+    return guard_code_cells
 
 
 def _executed_records(out_path: Path) -> Dict[str, Dict[str, Any]]:

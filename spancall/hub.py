@@ -28,10 +28,17 @@ def load_resolver(
     *,
     device: Optional[str] = None,
     token: Optional[str] = None,
+    attn_implementation: Optional[str] = "auto",
+    torch_dtype: Optional[str] = None,
     **resolver_kwargs: Any,
 ) -> Any:
     """Return a ready :class:`~spancall.lean.resolver.LeanResolver` (``two_step``).
 
+    ``attn_implementation`` controls the attention kernel (``"auto"`` uses
+    ``flash_attention_2`` on Ampere+ CUDA when ``flash-attn`` is installed and
+    falls back to PyTorch ``sdpa``; override with ``"flash_attention_2"``,
+    ``"sdpa"``, or ``"eager"``). ``torch_dtype`` accepts ``"auto"``, ``"bf16"``,
+    ``"fp16"``, ``"fp32"``, or ``None``.
     ``resolver_kwargs`` override values from ``resolve_config.json``.
     """
     import torch
@@ -40,7 +47,11 @@ def load_resolver(
     from span_template.sanitize import SPECIAL_MARKER_TOKENS
     from spancall.lean.model import LeanSpanCallModel
     from spancall.lean.resolver import LeanResolver
-    from spancall.model.encoder import SpanCallTransformerEncoder
+    from spancall.model.encoder import (
+        SpanCallTransformerEncoder,
+        resolve_attn_implementation,
+        resolve_torch_dtype,
+    )
 
     with open(_resolve_file(path_or_repo, "resolve_config.json", token), encoding="utf-8") as fh:
         cfg = json.load(fh)
@@ -48,11 +59,26 @@ def load_resolver(
     if not backbone:
         raise KeyError("resolve_config.json has neither 'backbone_name' nor 'backbone'")
 
+    eff_attn = resolve_attn_implementation(
+        attn_implementation if attn_implementation is not None else cfg.get("attn_implementation", "auto"),
+        device=device,
+    )
+    eff_dtype = resolve_torch_dtype(
+        torch_dtype if torch_dtype is not None else cfg.get("torch_dtype"),
+        attn_implementation=eff_attn,
+        device=device,
+    )
+
     try:
         tokenizer = AutoTokenizer.from_pretrained(path_or_repo, token=token)
     except Exception:  # noqa: BLE001 - checkpoint shipped without tokenizer files
         tokenizer = AutoTokenizer.from_pretrained(backbone, use_fast=True)
-    encoder = SpanCallTransformerEncoder(model_name_or_path=backbone, tokenizer=tokenizer)
+    encoder = SpanCallTransformerEncoder(
+        model_name_or_path=backbone,
+        tokenizer=tokenizer,
+        attn_implementation=eff_attn,
+        torch_dtype=eff_dtype,
+    )
     encoder.add_marker_tokens(list(SPECIAL_MARKER_TOKENS))  # idempotent; syncs embedding size
     model = LeanSpanCallModel(
         encoder=encoder,
@@ -67,6 +93,12 @@ def load_resolver(
     model.eval()
     if device:
         model.to(device)
+    # Keep prediction heads (tool_head, pointer_head) in fp32 to preserve the
+    # tight min_joint_margin=0.02 gate calibration; only cast the encoder
+    # backbone when an explicit low-precision dtype is required (e.g. FA2).
+    # LeanResolver automatically casts H to head_p.dtype before scoring heads.
+    if eff_dtype is not None:
+        model.backbone.to(dtype=eff_dtype)
 
     opts = {
         "max_seq_len": cfg.get("max_seq_len"),

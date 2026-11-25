@@ -502,6 +502,8 @@ class LeanResolver(BaseResolver):
             model_name_or_path=cfg.model.backbone_name,
             hidden_dropout_prob=cfg.model.dropout,
             tokenizer=tokenizer,
+            attn_implementation=cfg.model.attn_implementation,
+            torch_dtype=cfg.model.torch_dtype,
         )
         encoder.add_marker_tokens(list(SPECIAL_MARKER_TOKENS))
         model = LeanSpanCallModel(
@@ -775,7 +777,15 @@ class LeanResolver(BaseResolver):
             ids, per_token = tokenize_offset_mapping(output, self.tokenizer, max_len=self.max_seq_len)
             H, _cls_h = self._encode(ids)
         except Exception as exc:
-            reason = f"sanitize: {exc}" if isinstance(exc, SanitizeError) else f"pre_error: {exc}"
+            is_overflow = isinstance(exc, SanitizeError) and (
+                getattr(exc, "code", None) == "overflow" or "overflow" in str(exc).lower()
+            )
+            if is_overflow:
+                reason = f"context_overflow: {exc}"
+            elif isinstance(exc, SanitizeError):
+                reason = f"sanitize: {exc}"
+            else:
+                reason = f"pre_error: {exc}"
             return LeanResolveResult(
                 hit=False,
                 status="abstain",
@@ -787,6 +797,7 @@ class LeanResolver(BaseResolver):
                 # an all-errors ablation arm is unattributable.
                 features={
                     **ctx_features,
+                    "context_overflow_seq": bool(is_overflow),
                     "tool_objective": getattr(self, "tool_objective", "ce"),
                     "tool_call_threshold": (
                         float(self.tool_call_threshold)
@@ -800,6 +811,7 @@ class LeanResolver(BaseResolver):
         choices = self._tool_scores(output, H, per_token)
         features = {
             **ctx_features,
+            "seq_tokens": len(ids),
             "n_candidates": len(candidate_schemas),
             "pre_ms": (t_enc - t0) * 1000,
             "enc_ms": (time.perf_counter() - t_enc) * 1000,

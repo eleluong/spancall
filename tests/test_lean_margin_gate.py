@@ -22,7 +22,7 @@ import pytest
 
 from spancall.lean.resolver import LeanResolver
 
-PREDS = Path("results/lean/12-11-26/preds_eval.jsonl")
+PREDS = Path("results/archive/lean/12-11-26/preds_eval.jsonl")
 
 
 # --------------------------------------------------------------------------- #

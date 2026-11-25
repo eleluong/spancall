@@ -50,7 +50,7 @@ multi_span_tool_calling/
 │   └── eval_v3_3/                 # Frozen Tier 1 Fair Eval & Tier 2 Full Splits + manifest.json (SHA256)
 ├── docs/                          # Architecture, heads, experiments ledger, historical design specs
 ├── research_paper/                # ACL LaTeX paper (main.tex, sections/, figures/, Makefile)
-├── results_lean_v3_3/             # Audited v3.3 predictions, metrics, and LaTeX/MD exports
+├── results/                       # Unified results root (v3_3/, agentic/, archive/)
 ├── span_template/                 # Shared grammar: render, parse, sanitize (R7), template stamp
 │   ├── template.py                #   build_input_multi / resolve_utterance_span / gate_tool_call
 │   ├── parser.py                  #   marker grammar → extraction legend

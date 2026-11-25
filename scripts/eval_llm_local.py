@@ -374,7 +374,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--config", type=str, default=None, help="YAML config file (e.g. configs/llm_eval_v3_3.yaml)")
     p.add_argument("--only", nargs="+", default=None, help="Only run these model slugs from --config")
     p.add_argument("--eval-dir", type=str, default=None, help="Frozen v3.3 eval dir (default: data/eval_v3_3)")
-    p.add_argument("--results-dir", type=str, default=None, help="Results root (default: results_lean_v3_3)")
+    p.add_argument("--results-dir", type=str, default=None, help="Results root (default: results/v3_3)")
     p.add_argument("--splits", nargs="+", default=None, help="Manifest splits to evaluate (default: fair_hermes_eval fair_xlam_eval)")
     # Single-model CLI overrides (used when --config is omitted)
     p.add_argument("--model", type=str, default=None, help="Model ID for OpenAI-compatible API (falls back to --model-env)")
@@ -401,7 +401,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
 
     cfg_eval_dir = "data/eval_v3_3"
-    cfg_results_dir = "results_lean_v3_3"
+    cfg_results_dir = "results/v3_3"
     cfg_splits = ["fair_hermes_eval", "fair_xlam_eval"]
     if args.config:
         with open(args.config, "r", encoding="utf-8") as fh:

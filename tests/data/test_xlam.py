@@ -151,22 +151,3 @@ def test_partition_gt_tool_disjoint_across_shared_candidates(tmp_path: Path) -> 
             seen_gt[gt_name] = sp
 
 
-def test_v2_6_notebook_includes_xlam_mix_and_eval() -> None:
-    nb_path = Path(__file__).resolve().parents[2] / "notebooks" / "spancall_lean_v2_6_train_eval.ipynb"
-    assert nb_path.is_file()
-    nb = json.loads(nb_path.read_text(encoding="utf-8"))
-    # 26 -> 30: the four v2.6 debug cells (4e FP deep-dive, refusal sweep,
-    # 5b per-corpus eval) added during the param-precision investigation.
-    assert len(nb["cells"]) == 30
-    all_src = "\n".join("".join(c.get("source", [])) for c in nb["cells"])
-    assert "summary_report.md" in all_src
-    assert "XLAM_TRAIN_ROWS   = 15000" in all_src
-    assert "XLAM_DEV_ROWS     = 1000" in all_src
-    assert "SINGLE_CALL_ONLY  = True" in all_src
-    assert '["hermes_train.jsonl", "xlam_train.jsonl"]' in all_src
-    assert '["hermes_dev.jsonl", "xlam_dev.jsonl"]' in all_src
-    assert '"xlam_eval"' in all_src
-    assert '"xlam_test_ood_schema"' in all_src
-    assert 'CONFIG_PATH = "configs/colab_lean_v2_6.yaml"' in all_src
-
-

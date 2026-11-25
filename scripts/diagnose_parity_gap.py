@@ -97,7 +97,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="candidate cap; 0 = unlimited (use this to isolate H1 truncation)",
     )
     p.add_argument("--pack-fill", default=DEFAULT_PACK_FILL, choices=("head", "stratified"))
-    p.add_argument("--tokenizer", default="Qwen/Qwen3-Embedding-0.6B")
+    p.add_argument("--tokenizer", default="answerdotai/ModernBERT-large")
     p.add_argument(
         "--all-tools", action="store_true", default=True,
         help="render every ambient tool (resolver behaviour, default)",

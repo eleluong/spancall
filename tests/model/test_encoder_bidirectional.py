@@ -135,15 +135,14 @@ def test_base_encoder_contract_holds() -> None:
     assert issubclass(SpanCallTransformerEncoder, BaseEncoder)
 
 
-def test_default_backbone_is_qwen3_embedding_and_window_is_32k() -> None:
-    """Phase 2 defaults: Qwen3-Embedding-0.6B with a 32k context window."""
+def test_default_backbone_is_modernbert_large_and_window_is_4k() -> None:
+    """Default backbone is ModernBERT-large with a 4096 default sequence cap."""
     cfg = ModelConfig()
-    assert cfg.backbone_name == "Qwen/Qwen3-Embedding-0.6B"
-    assert cfg.max_seq_len == 32768
+    assert cfg.backbone_name == "answerdotai/ModernBERT-large"
+    assert cfg.max_seq_len == 4096
     enc = SpanCallTransformerEncoder
     assert enc.__init__.__defaults__ is not None
-    # model_name_or_path is the first default (== the Qwen embedding backbone).
-    assert enc.__init__.__defaults__[0] == "Qwen/Qwen3-Embedding-0.6B"
+    assert enc.__init__.__defaults__[0] == "answerdotai/ModernBERT-large"
 
 def test_encoder_syncs_tokenizer_model_max_length() -> None:
     """Tokenizer window is forced to the backbone window (no 1e30 sentinel / stale 512)."""

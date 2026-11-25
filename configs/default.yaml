@@ -54,15 +54,20 @@ data:
     id_holdout_ratio: 0.10
 
 model:
-  # Qwen3-0.6B embedding model, 32k context window, run with bidirectional
-  # unmasked attention (encoder.is_causal=False). max_seq_len is the
-  # resolver/trainer's guard, NOT a hardcoded 512 cap; the recent-context
-  # budget (data.recent.*) manages what actually fills the window.
-  backbone_name: "Qwen/Qwen3-Embedding-0.6B"
+  # ModernBERT-large (395M, d=1024, native 8,192 window; v3.3 default 4,096).
+  # max_seq_len is the resolver/trainer guard; data.recent.* budgets what fills
+  # the remaining context window.
+  backbone_name: "answerdotai/ModernBERT-large"
   head_dim: 256
   max_seq_len: 4096
   max_span_width: 16
   dropout: 0.1
+  # Attention kernel: "auto" selects flash_attention_2 on Ampere+ CUDA when
+  # flash-attn is installed and falls back to PyTorch sdpa otherwise.
+  # Override with "flash_attention_2", "sdpa", or "eager" for A/B benchmarks.
+  attn_implementation: "auto"
+  # Optional weight dtype at load time: null | "auto" | "bf16" | "fp16" | "fp32"
+  torch_dtype: null
 
 optimization:
   learning_rate_encoder: 3.0e-5

@@ -90,6 +90,8 @@ def build_encoder(cfg: TrainingConfig, tokenizer: Any):
         model_name_or_path=cfg.model.backbone_name,
         hidden_dropout_prob=cfg.model.dropout,
         tokenizer=tokenizer,
+        attn_implementation=cfg.model.attn_implementation,
+        torch_dtype=cfg.model.torch_dtype,
         **pretrained_kw,
     )
     if tokenizer is not None:

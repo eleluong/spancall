@@ -1054,8 +1054,8 @@ def export_all_results(
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Export all SpanCall v3.3 results altogether with audit verification.")
     p.add_argument("--eval-dir", type=str, default="data/eval_v3_3")
-    p.add_argument("--results-dir", type=str, default="results_lean_v3_3")
-    p.add_argument("--out-dir", type=str, default="results_lean_v3_3/export")
+    p.add_argument("--results-dir", type=str, default="results/v3_3")
+    p.add_argument("--out-dir", type=str, default="results/v3_3/export")
     p.add_argument("--allow-partial", action="store_true",
                    help="Allow incomplete sample_id coverage (stamps audit_status=PARTIAL)")
     p.add_argument("--bootstrap-n", type=int, default=10000,

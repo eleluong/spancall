@@ -1,4 +1,4 @@
-"""Tests for v3.2 Normal vs Complex evaluation partitioning."""
+"""Tests for Normal vs Complex evaluation partitioning."""
 from __future__ import annotations
 
 import json
@@ -176,36 +176,6 @@ def test_eval_param_extraction_lean_decomposed_object_leaves(tmp_path: Path) -> 
     assert comp["tp"] == 1
     assert comp["extraction_f1"] == 1.0
     assert comp["exact_payload_match_F"] == 1.0
-
-
-def test_v3_2_notebook_invariants() -> None:
-    root = Path(__file__).resolve().parents[1]
-    nb_v31 = root / "notebooks" / "spancall_lean_v3_1_train_eval.ipynb"
-    nb_v32 = root / "notebooks" / "spancall_lean_v3_2_train_eval.ipynb"
-    assert nb_v31.is_file()
-    assert nb_v32.is_file()
-
-    with open(nb_v32, encoding="utf-8") as fh:
-        cells = json.load(fh)["cells"]
-    code_blob = "\n".join("".join(c["source"]) for c in cells if c["cell_type"] == "code")
-
-    assert 'EVAL_SPLITS       = ["hermes_eval", "xlam_eval"]' in code_blob
-    assert "ACTIVE_EVAL_SPLITS" in code_blob
-    assert "classify_sample_complexity" in code_blob
-    assert "_eval_complexity_split" in code_blob
-    assert "by_complexity" in code_blob
-    assert "processed_v3_2" in code_blob
-    assert "tensorized_lean_v3_2" in code_blob
-    assert "results_lean_v3_2" in code_blob
-    assert "processed_v3_1" not in code_blob
-
-    # Run the build-time AST & Jupyter scope cell guard on v3.2
-    guard_src = (root / "scripts" / "build_lean_v2_colab_notebook.py").read_text(encoding="utf-8")
-    start = guard_src.index("def _cell_source")
-    end = guard_src.rindex("_guard_code_cells(cells)")
-    ns = {}
-    exec(compile(guard_src[start:end], "guard", "exec"), ns)
-    ns["_guard_code_cells"](cells)
 
 
 
